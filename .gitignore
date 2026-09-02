@@ -1,0 +1,43 @@
+# build output
+build/
+cmake-build-*/
+compile_commands.json
+*.o
+*.so
+*.a
+.cache/
+ccache/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# model weights live in /zfs/swift/models — never in the repo
+*.gguf
+*.safetensors
+*.ftw
+models/
+
+# local scratch
+.env
+*.log
+
+# ---- secrets: never commit ----
+.env.*
+.envrc
+*.key
+*.pem
+*.p12
+*.pfx
+id_ed25519*
+id_rsa*
+*_rsa
+*.age
+secrets/
+.secrets/
+credentials*
+*.credentials
+.netrc
+.opencode/
+

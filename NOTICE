@@ -1,0 +1,21 @@
+MoEArc
+Copyright 2026 Christopher Desrochers
+
+This product includes software developed by the MoEArc authors.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+--------------------------------------------------------------------------
+THIRD-PARTY ATTRIBUTION
+--------------------------------------------------------------------------
+
+Code vendored under third_party/ retains its original copyright and license.
+Each vendored file keeps its upstream header; this NOTICE records provenance.
+
+  third_party/ipex-llm/
+      Intel Extension for PyTorch LLM (ipex-llm), Apache-2.0.
+      Copyright Intel Corporation.
+      Upstream: https://github.com/intel/ipex-llm  (archived 2026-01-28)
+      Status: not yet vendored — see docs/archaeology.md (milestone M0.5).
+      Every lifted kernel must land here with its upstream path and commit
+      hash recorded, and its original header intact.
