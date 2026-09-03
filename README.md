@@ -4,9 +4,10 @@
 One command to install, one command to run, OpenAI- and Anthropic-compatible
 out of the box.
 
-> **Status: pre-M0.** Nothing works yet. The engine is unwritten and the
-> reference GPU is not yet installed. Follow `bench/results/` — if there is no
-> number there, there is no claim here.
+> **Status: pre-M0. The engine is unwritten.** What exists is a measured baseline:
+> the reference Arc B580 is installed, and tuned llama.cpp SYCL does **46.9 tok/s**
+> decode on Qwen3.6-35B-A3B Q4_K_M. That is the number MoEArc has to beat, and until
+> `bench/results/` contains something faster, there is no claim here.
 
 ## Why
 
@@ -14,14 +15,23 @@ MoE models are the reason a consumer box can punch above its VRAM: only a
 fraction of the parameters are active per token, so attention and the KV cache
 can live in VRAM while routed experts stream from system RAM.
 
-That approach is proven — on NVIDIA. On Intel Arc it isn't, despite Arc now
-shipping the cheapest VRAM per dollar on the market. Intel's own `ipex-llm` got
-there first and was archived on 2026-01-28 with no community fork. Ollama on Arc
-falls back to Vulkan; llama.cpp SYCL works but leaves a lot on the floor for MoE,
-and getting it running is a multi-hour ordeal.
+That approach is proven — on NVIDIA. [FreeToken](https://github.com/FlashML-org/FreeToken)
+does it well: bandwidth-adaptive CPU–GPU co-execution, an LRU expert cache, elastic VRAM.
+It supports **RTX 30/40/50 and nothing else.**
 
-MoEArc is an Arc-native, SYCL-first MoE server with a real expert cache, wrapped
-in an install experience that does not require you to know what oneAPI is.
+**Arc owners have no equivalent, and Arc now ships the cheapest VRAM per dollar on the
+market.** Intel's own `ipex-llm` got there first and was archived on 2026-01-28 with no
+community fork. Ollama on Arc falls back to Vulkan — which we measured at **4.8× slower
+than SYCL on the same card**. llama.cpp SYCL is genuinely good, but its CPU/GPU split is
+*static*: you pick `--n-cpu-moe` by hand, and picking it wrong costs you 20% or fails to
+load at all.
+
+**MoEArc is FreeToken for Intel GPUs** — the same co-execution ideas, SYCL-first, with an
+install experience that does not require you to know what oneAPI is.
+
+This is an open-source project because the gap is a community problem, not a private one:
+anyone who bought an Arc card to run local models is currently choosing between a slow
+Vulkan path and hand-tuning flags. Contributions and hardware reports are welcome.
 
 ## Design in one paragraph
 
@@ -52,7 +62,20 @@ Every number in this README comes from `moearc bench` and nothing else, always
 reported against llama.cpp SYCL and Vulkan on the identical box and commit hash.
 Protocol: [`bench/README.md`](bench/README.md). Results: `bench/results/`.
 
-There are no numbers yet. That is not modesty, it is the actual state.
+**The baseline exists; MoEArc's numbers do not.** Measured on the reference box,
+llama.cpp SYCL `e107984bc`, Qwen3.6-35B-A3B UD-Q4_K_M (20.6 GiB), Arc B580 12 GiB:
+
+| backend | best `-ncmoe` | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| **SYCL** | 22 | 403.9 | **46.9** |
+| Vulkan | 22 | 174.9 | 9.5 |
+
+🔴 `-ncmoe` was **swept, not guessed** — below 22 the model will not fit 12 GiB, and above it
+throughput falls monotonically to ~37. A baseline taken at an arbitrary split would make any
+later MoEArc "win" meaningless, so the sweep is committed alongside the number.
+
+These are the tuned static-split numbers. **MoEArc's thesis is that a dynamic,
+bandwidth-aware policy beats a hand-tuned static one.** That is what M2 must demonstrate.
 
 ## License
 

@@ -1,0 +1,23 @@
+backend	device	ncmoe	status	pp_tps	tg_tps
+SYCL	B580(level_zero:0)	0	NO_RESULT		
+SYCL	B580(level_zero:0)	12	NO_RESULT		
+SYCL	B580(level_zero:0)	24	OK	371.76±0.00	45.58±0.00
+SYCL	B580(level_zero:0)	32	OK	315.25±0.00	41.51±0.00
+SYCL	B580(level_zero:0)	40	OK	276.91±0.00	37.74±0.00
+SYCL	B580(level_zero:0)	48	OK	286.39±0.00	37.84±0.00
+Vulkan	B580(Vulkan1)	0	NO_RESULT		
+Vulkan	B580(Vulkan1)	12	NO_RESULT		
+Vulkan	B580(Vulkan1)	24	OK	174.94±0.00	9.46±0.00
+Vulkan	B580(Vulkan1)	32	OK	157.35±0.00	8.91±0.00
+Vulkan	B580(Vulkan1)	40	OK	129.74±0.00	6.96±0.00
+Vulkan	B580(Vulkan1)	48	OK	134.10±0.00	7.01±0.00
+SYCL	B580(level_zero:0)	14	OOM_OR_ABORT		
+SYCL	B580(level_zero:0)	16	OOM_OR_ABORT		
+SYCL	B580(level_zero:0)	18	OOM_OR_ABORT		
+SYCL	B580(level_zero:0)	20	NO_RESULT		
+SYCL	B580(level_zero:0)	22	OK	403.89±0.00	46.91±0.00
+Vulkan	B580(Vulkan1)	14	NO_RESULT		
+Vulkan	B580(Vulkan1)	16	NO_RESULT		
+Vulkan	B580(Vulkan1)	18	NO_RESULT		
+Vulkan	B580(Vulkan1)	20	OK	208.37±0.00	11.17±0.00
+Vulkan	B580(Vulkan1)	22	OK	190.04±0.00	10.50±0.00

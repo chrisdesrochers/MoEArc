@@ -41,3 +41,7 @@ credentials*
 .netrc
 .opencode/
 
+
+# transient sweep run-state (results and log ARE committed as evidence)
+bench/baselines/.sweep.status
+bench/baselines/sweep.log
