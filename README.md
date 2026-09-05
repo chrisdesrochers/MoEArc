@@ -29,6 +29,12 @@ load at all.
 **MoEArc is FreeToken for Intel GPUs** — the same co-execution ideas, SYCL-first, with an
 install experience that does not require you to know what oneAPI is.
 
+**Inspired by, not derived from.** FreeToken proved the shape of the answer on NVIDIA and we
+are grateful for it. MoEArc is an independent implementation in Rust: no FreeToken code is
+vendored, linked, or ported here, and where their design carries NVIDIA-specific constants we
+deliberately do not inherit them. We intend to benchmark honestly against them — see
+`bench/README.md` for what that comparison can and cannot show.
+
 This is an open-source project because the gap is a community problem, not a private one:
 anyone who bought an Arc card to run local models is currently choosing between a slow
 Vulkan path and hand-tuning flags. Contributions and hardware reports are welcome.

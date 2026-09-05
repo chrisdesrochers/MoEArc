@@ -203,6 +203,33 @@ invented `-ncmoe 8`, in a second parameter.
 
 📌 The rule this falls out of: *M0 is llama.cpp at its best, not llama.cpp at a convenient setting.*
 
+## Cross-engine comparison — including FreeToken
+
+We want to be measured against the prior art, not just against ourselves. But the obvious
+comparison is **not available**, and pretending otherwise would produce a dishonest chart.
+
+🔴 **FreeToken and MoEArc cannot be run on the same hardware.** FreeToken is CUDA-only; it
+supports RTX 30/40/50 and nothing else. An attempt to run it on Arc got as far as loading a
+23 GB model and serving `/v1/models` before hanging in `causal_conv1d_varlen` during warmup.
+So there is no same-card head-to-head to be had, and any number putting the two engines
+side by side is comparing two different pieces of silicon.
+
+That leaves three comparisons, in descending order of how much they prove:
+
+1. **MoEArc vs llama.cpp SYCL, same Arc card, same model, same quantisation.** This is the
+   real gate and the only true apples-to-apples number. llama.cpp's CPU/GPU split is static;
+   ours is planned. If we cannot beat a hand-tuned `--n-cpu-moe` on the same hardware, we have
+   not earned our existence.
+2. **MoEArc vs Ollama/Vulkan on the same Arc card.** The path most Arc owners are actually on
+   today, so it is the number that describes what a user gains by switching.
+3. **MoEArc on Arc vs FreeToken's published RTX figures.** Cross-vendor and cross-silicon —
+   informative about whether the *approach* transfers, worthless as a claim about which engine
+   is faster. Any use of it must say so in the same breath, and must state both cards' price
+   and memory bandwidth, since those explain most of any gap.
+
+📌 Rule: **never publish (3) without (1).** A cross-vendor chart with no same-card baseline
+next to it reads as a performance claim regardless of the caveat printed under it.
+
 ## Open gaps
 
 - ⬜ **No Vulkan build yet.** The metrics table requires llama.cpp SYCL **and** Vulkan; only the
