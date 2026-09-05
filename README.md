@@ -4,10 +4,21 @@
 One command to install, one command to run, OpenAI- and Anthropic-compatible
 out of the box.
 
-> **Status: pre-M0. The engine is unwritten.** What exists is a measured baseline:
-> the reference Arc B580 is installed, and tuned llama.cpp SYCL does **46.9 tok/s**
-> decode on Qwen3.6-35B-A3B Q4_K_M. That is the number MoEArc has to beat, and until
-> `bench/results/` contains something faster, there is no claim here.
+> **Status: it generates text, and it is slow.**
+>
+> ✅ MoEArc runs a full forward pass on an Arc B580 and its greedy output matches
+> llama.cpp **token id for token id** — 40/40 on one prompt, 23/23 on another including
+> the end-of-generation token. That is a correctness result, independently re-verified.
+>
+> 🔴 **6.7 tok/s, unoptimised.** llama.cpp does roughly 46 on the same card. The gap is
+> understood, not mysterious: no batched prefill, the router's choice is read back to the
+> host 16 times per token, and the whole model is held resident.
+>
+> 🔴 **That last point matters most: because the model is fully resident, the expert cache
+> is not exercised at all — so this project's central claim is still untested in the
+> engine.** Everything measured about dynamic residency so far comes from simulation over
+> recorded routing traces. Until a run streams experts under a real VRAM budget and beats a
+> tuned static split on the same box, **there is no performance claim here.**
 
 ## Why
 
@@ -64,24 +75,42 @@ game. That is the thesis this project is testing.
 
 ## Benchmarks
 
-Every number in this README comes from `moearc bench` and nothing else, always
-reported against llama.cpp SYCL and Vulkan on the identical box and commit hash.
+Numbers here are reported against llama.cpp on the identical box and commit hash.
 Protocol: [`bench/README.md`](bench/README.md). Results: `bench/results/`.
 
-**The baseline exists; MoEArc's numbers do not.** Measured on the reference box,
-llama.cpp SYCL `e107984bc`, Qwen3.6-35B-A3B UD-Q4_K_M (20.6 GiB), Arc B580 12 GiB:
+⚠️ `moearc bench` does not exist yet; today's figures come from the named tools and examples in
+this repo, each cited in the table below.
 
-| backend | best `-ncmoe` | prefill tok/s | decode tok/s |
-|---|---|---|---|
-| **SYCL** | 22 | 403.9 | **46.9** |
-| Vulkan | 22 | 174.9 | 9.5 |
+### 🔴 The baseline in an earlier version of this file was contaminated
 
-🔴 `-ncmoe` was **swept, not guessed** — below 22 the model will not fit 12 GiB, and above it
-throughput falls monotonically to ~37. A baseline taken at an arbitrary split would make any
-later MoEArc "win" meaningless, so the sweep is committed alongside the number.
+That version quoted **46.9 tok/s** as llama.cpp's tuned SYCL decode. The run it came from is
+marked `CONTAMINATED-DISCARDED` — GPU contention — and its files are deliberately not
+committed. **It should not be quoted, including by us, and it is retracted here.** A clean
+re-run at the swept `-ncmoe 22` is outstanding.
 
-These are the tuned static-split numbers. **MoEArc's thesis is that a dynamic,
-bandwidth-aware policy beats a hand-tuned static one.** That is what M2 must demonstrate.
+The one comparable figure we currently hold is **46.48 tok/s** from `llama-bench` on the
+Vulkan backend, single run, `-r 1`, device not pinned. That is indicative, not a baseline.
+
+### What is measured
+
+| | result | how |
+|---|---|---|
+| **Correctness** | greedy output identical to llama.cpp, **40/40** and **23/23** token ids | re-verified independently against a patched `llama-eval-callback` |
+| **MoEArc decode** | **6.7–6.9 tok/s**, unoptimised, model fully resident | `examples/olmoe_generate` |
+| Numerical agreement | 1−cos **5.68e-3** vs llama.cpp CPU | llama.cpp's *own* Vulkan backend differs from its CPU by **6.81e-3** |
+| Expert miss path | 32.9 / 55.0 / 82.5 tok/s ceilings at 40 / 65.9 / 80.1% hit | `tools/stream_bench.cpp` |
+| Residency, **simulated** | LRU **88.9–95.2%** vs static split 42.5–55.0% | recorded routing traces, `bench/traces/` |
+
+📌 Bit-exactness against llama.cpp is **unavailable by construction**: `ggml-cpu` quantises the
+f32 activation to 8 bits before every K-quant matmul, while MoEArc keeps f32. So the spread was
+measured rather than a tolerance chosen — and llama.cpp's two backends disagree with each other
+more than MoEArc disagrees with either.
+
+### What is not measured
+
+**MoEArc's thesis is that a dynamic, bandwidth-aware policy beats a hand-tuned static one.**
+The simulated hit rates above say it should. **No engine run has demonstrated it**, because
+nothing yet forces experts to stream. That is the next milestone and the only one that matters.
 
 ## License
 
