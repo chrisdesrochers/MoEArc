@@ -113,7 +113,11 @@ fn session() -> Option<&'static Session> {
     static S: OnceLock<Option<Session>> = OnceLock::new();
     S.get_or_init(|| {
         let path = model_path()?;
-        let opts = SessionOptions { n_ctx: Some(N_CTX), residency: Residency::Slots(SHARED_SLOTS) };
+        let opts = SessionOptions {
+            n_ctx: Some(N_CTX),
+            residency: Residency::Slots(SHARED_SLOTS),
+            ..Default::default()
+        };
         match Session::load_with(&path, opts) {
             Ok(s) => Some(s),
             Err(e) => panic!("MOEARC_QWEN3MOE_MODEL is set but the model would not load: {e}"),
@@ -265,7 +269,7 @@ fn every_block_is_tapped_and_none_of_them_is_degenerate() {
 /// one. Returns `None` when the suite is being skipped.
 fn constrained(residency: Residency) -> Option<Session> {
     let path = model_path()?;
-    let opts = SessionOptions { n_ctx: Some(N_CTX), residency };
+    let opts = SessionOptions { n_ctx: Some(N_CTX), residency, ..Default::default() };
     Some(Session::load_with(&path, opts).expect("constrained session would not load"))
 }
 

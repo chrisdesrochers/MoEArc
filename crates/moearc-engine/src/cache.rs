@@ -158,6 +158,16 @@ impl ExpertCache {
         self.slot_of.len()
     }
 
+    /// Whether `e` is in VRAM right now.
+    ///
+    /// 🔴 This exists so a caller can decide what to do with a miss **before** committing to it.
+    /// [`Self::admit`] plans and commits in one step on purpose — a dropped plan would leave the
+    /// map describing a device state that never happened — so a policy that sends some misses
+    /// somewhere other than the bus has to ask first and then admit only what it kept.
+    pub fn resident(&self, e: ExpertRef) -> bool {
+        self.slot_of.contains_key(&e)
+    }
+
     /// Plan and commit the transfers for one step.
     ///
     /// The cache's state is updated as though the returned plan has been executed, because the

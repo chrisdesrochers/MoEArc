@@ -175,13 +175,15 @@ fn main() -> ExitCode {
     };
     let tokens: Vec<u32> = args[5..].iter().filter_map(|s| s.parse().ok()).collect();
 
-    let session = match Session::load_with(&model, SessionOptions { n_ctx, residency }) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("load failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let session =
+        match Session::load_with(&model, SessionOptions { n_ctx, residency, ..Default::default() })
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("load failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
     let info = session.info();
     println!("device        {}", info.device);
     let r = info.residency;

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use moearc_engine::host_experts::HostPolicy;
 use moearc_engine::moe::Residency;
 use moearc_engine::profile;
 use moearc_engine::session::{Session, SessionOptions, StopConditions};
@@ -66,7 +67,20 @@ fn main() -> ExitCode {
     };
     let tokens: Vec<u32> = args[5..].iter().filter_map(|s| s.parse().ok()).collect();
 
-    let session = match Session::load_with(&model, SessionOptions { n_ctx, residency }) {
+    // An environment variable rather than a positional, because every positional after this
+    // point is a token id and an optional one in the middle of them would be ambiguous.
+    let host: HostPolicy = match std::env::var("MOEARC_HOST_EXPERTS") {
+        Ok(v) => match v.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("MOEARC_HOST_EXPERTS: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(_) => HostPolicy::Off,
+    };
+
+    let session = match Session::load_with(&model, SessionOptions { n_ctx, residency, host }) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("load failed: {e}");
@@ -74,6 +88,7 @@ fn main() -> ExitCode {
         }
     };
     println!("device        {}", session.info().device);
+    println!("host experts  {host} on {} threads", session.info().residency.host_threads);
 
     // 🔴 The warm-up is its own generation, and the device-event counters are cleared between
     // the two.
@@ -187,6 +202,25 @@ fn main() -> ExitCode {
             "unattributed",
             (t.seconds - sum) * 1000.0 / measured as f64
         );
+    }
+    if let Ok(r) = session.residency() {
+        if r.host.jobs > 0 {
+            // 🔴 The overlap, stated as one line. `busy` is the pool's own wall time; `wait` is
+            // what the device thread lost to it. They are measured by different clocks on
+            // different threads on purpose — if they were the same measurement the difference
+            // could not exist.
+            let busy = r.host.busy_nanos as f64 / 1e6 / measured as f64;
+            let waited = r.host.wait_nanos as f64 / 1e6 / measured as f64;
+            println!(
+                "\nhost pool: {:.2} ms/step busy, {:.2} ms/step waited for -> {:.0}% of the \
+                 host work was hidden behind device work ({} experts/step over {} jobs/step)",
+                busy,
+                waited,
+                100.0 * (1.0 - (waited / busy).min(1.0)),
+                r.host.experts / measured.max(1) as u64,
+                r.host.jobs / measured.max(1) as u64,
+            );
+        }
     }
     println!(
         "{:<20} {:>10.2}   (session plumbing outside decode)",

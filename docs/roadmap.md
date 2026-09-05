@@ -67,6 +67,15 @@ The CPU is far slower at floating-point than the GPU and it does not matter, bec
 side is compute-bound.** This is the same reason llama.cpp's `--n-cpu-moe` exists, and it is
 why a static split is a real competitor rather than a strawman.
 
+🔴 **Scored 2026-09-05, and the last sentence of that paragraph is wrong.** The host expert
+kernel *is* compute-bound: one core computes an expert at **6.5 GB/s** against the 22.8 GB/s it
+reads memory at, so a single core needs **465 us** for a 3.06 MB expert, not 0.10 ms. The
+conclusion survives anyway, by a different route — **19 threads bring it to ~50 us**, which beats
+the streaming path not by the 3x this arithmetic claimed but by **6–9x**, because the 13.4 GB/s
+above is a *pinned* figure and `stage()` copies out of a memory-mapped file at 6.7–10.5 GB/s.
+The full measurement, and what it is worth in the engine, is in
+`bench/baselines/qwen3-30b-a3b.md`.
+
 ### What this means for the thesis
 
 Our claim has been *dynamic residency beats a static split*. The residency measurements support
@@ -118,11 +127,28 @@ matvecs from 14.8% toward llama.cpp's ~63% of peak. If it reaches even 50%, the 
 from 15.25 ms/token to roughly 10 ms — about **96 tok/s**. Re-measure after; the bottleneck
 will move and the next target should be chosen from the profile, not from this document.
 
-**Stage 2 — build a host-side expert executor.** A quantised matvec on the CPU, multi-threaded
-with core affinity, submitted asynchronously so it overlaps GPU work. Then a per-layer policy
-that chooses between resident, streamed and host-computed. **The policy must be driven by
-measurement, not constants** — the PCIe and DRAM figures above are properties of this machine,
-and a user's box will differ.
+**Stage 2 — build a host-side expert executor. ✅ Built and measured 2026-09-05; the policy
+half is still outstanding.** `crates/moearc-engine/src/host_experts.rs`: Q4_K and Q6_K matvecs on
+the CPU, 19 pinned threads, `submit`/`sync` around the block's device work so the two run at
+once. Measured on Qwen3-30B-A3B, every configuration reproducing identical token ids:
+
+- **Overlap works.** 94% of the host arithmetic runs while the device is busy, by device-event
+  timestamps, and it is worth **+2% at 48% residency rising to +36% at 2%** — because what it
+  hides behind is staging, and staging is what a low-residency step is made of.
+- **The larger effect at high residency is not overlap at all.** A miss routed host-side is never
+  admitted, so it never evicts a resident expert: at 2952 slots the hit rate goes 91.7% → 99.8%
+  and expert traffic falls **46x**.
+- **Throughput stops depending on residency.** Stream-only falls 30 → 7.7 tok/s across the sweep;
+  with a host policy every residency reaches ~29 tok/s or better, peaking at **43.3 against
+  llama.cpp's 50.13** — the gap from 1.7x to 1.16x.
+
+⬜ **Still to do, and it is the half this document asked for:** the three policies measured are
+constants (`off`, `frac:<f>`, `over:<n>`), chosen so the overlap question had a readable answer
+before anything was tuned. **The policy must be driven by measurement, not constants** — the PCIe
+and DRAM figures above are properties of this machine, and a user's box will differ. Two things
+the sweep says such a policy has to handle: it must **switch itself off when the hit rate is
+high** (the mechanism costs 1–4% when it routes almost nothing), and it must **not starve the
+cache** (`frac:1.0` admits nothing, so the pool never fills and its VRAM is wasted).
 
 **Stage 3 — batched prefill.** We have none at all; llama.cpp's 3218 tok/s prefill has no
 counterpart here. This is where GEMM and XMX finally pay, and where cross-layer prefetch is

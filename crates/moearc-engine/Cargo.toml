@@ -39,3 +39,11 @@ required-features = ["gpu"]
 [[example]]
 name = "profile_decode"
 required-features = ["gpu"]
+
+[[example]]
+name = "host_expert_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "hybrid_sweep"
+required-features = ["gpu"]

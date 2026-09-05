@@ -36,6 +36,7 @@ use moearc_kernels::Context;
 use moearc_model::tensors::MappedModel;
 
 use crate::cache::CacheStats;
+use crate::host_experts::HostPolicy;
 use crate::moe::{Config, EngineError, Model, Residency, ResidencyReport, Tap};
 
 /// How to build a session.
@@ -45,6 +46,8 @@ pub struct SessionOptions {
     pub n_ctx: Option<usize>,
     /// How much of the expert bank stays in VRAM.
     pub residency: Residency,
+    /// Which of a block's cache misses are computed on the CPU instead of streamed.
+    pub host: HostPolicy,
 }
 
 /// What a loaded model reports about itself.
@@ -153,13 +156,14 @@ impl Session {
     pub fn load_with(path: &Path, opts: SessionOptions) -> Result<Self, EngineError> {
         let n_ctx = opts.n_ctx;
         let residency = opts.residency;
+        let host = opts.host;
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let (rep_tx, rep_rx) = mpsc::channel::<Reply>();
         let owned: PathBuf = path.to_path_buf();
 
         let thread = std::thread::Builder::new()
             .name("moearc-device".into())
-            .spawn(move || worker(&owned, n_ctx, residency, &cmd_rx, &rep_tx))
+            .spawn(move || worker(&owned, n_ctx, residency, host, &cmd_rx, &rep_tx))
             .map_err(|e| {
                 EngineError::Unsupported(format!("could not start the device thread: {e}"))
             })?;
@@ -417,6 +421,7 @@ fn worker(
     path: &Path,
     n_ctx: Option<usize>,
     residency: Residency,
+    host: HostPolicy,
     rx: &mpsc::Receiver<Command>,
     tx: &mpsc::Sender<Reply>,
 ) {
@@ -437,8 +442,13 @@ fn worker(
     // function returns. That is an incidental property of the current graph — a future decode
     // that returns without a readback would silently remove it — and it is deliberately not what
     // this relies on.
+    //
+    // ⚠️ An `Arc`, since the host expert executor shares it: its worker threads read expert
+    // weights straight out of these pages, and a `&MappedModel` cannot promise a thread the
+    // borrow checker never sees that the mapping outlives it. The drop order above is unchanged
+    // — this binding still holds the last reference and still drops after `ctx`.
     let mapped = match MappedModel::open(path) {
-        Ok(v) => v,
+        Ok(v) => std::sync::Arc::new(v),
         Err(e) => {
             let _ = tx.send(Reply::Failed(EngineError::from(e).to_string()));
             return;
@@ -463,7 +473,7 @@ fn worker(
         },
     };
 
-    let mut model = match Model::new(&ctx, &mapped, n_ctx, residency) {
+    let mut model = match Model::new_hybrid(&ctx, &mapped, n_ctx, residency, host) {
         Ok(m) => m,
         Err(e) => {
             let _ = tx.send(Reply::Failed(e.to_string()));

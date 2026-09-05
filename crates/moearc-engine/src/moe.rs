@@ -126,6 +126,8 @@
 //! `stage` before compute a correctness property of this file rather than an accident of every
 //! call synchronising.
 
+use std::sync::Arc;
+
 use moearc_kernels::{
     Context, DeviceBuffer, KernelError, KvType, MAX_BATCHED_MATS, QuantType, RopeKind,
 };
@@ -134,6 +136,9 @@ use moearc_model::tensors::{ExpertBank, MappedModel, TensorView, names};
 use moearc_model::{ModelError, ModelInfo};
 
 use crate::cache::{CacheError, CacheStats, ExpertCache, Load, Slot, StepPlan};
+use crate::host_experts::{
+    self, BankSpec, BlockSpec, Geometry, HostError, HostExecutor, HostPolicy, HostStats,
+};
 use crate::kv::{KvError, PagedKvCache, SeqId};
 use crate::memory::{self, PlanError};
 use crate::profile;
@@ -161,6 +166,7 @@ pub enum EngineError {
     Kv(KvError),
     Cache(CacheError),
     Plan(PlanError),
+    Host(HostError),
     /// The file is structurally fine but this engine cannot run it.
     Unsupported(String),
 }
@@ -190,6 +196,11 @@ impl From<PlanError> for EngineError {
         Self::Plan(e)
     }
 }
+impl From<HostError> for EngineError {
+    fn from(e: HostError) -> Self {
+        Self::Host(e)
+    }
+}
 
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,6 +210,7 @@ impl std::fmt::Display for EngineError {
             Self::Kv(e) => write!(f, "kv cache: {e}"),
             Self::Cache(e) => write!(f, "expert cache: {e}"),
             Self::Plan(e) => write!(f, "memory plan: {e}"),
+            Self::Host(e) => write!(f, "{e}"),
             Self::Unsupported(m) => write!(f, "unsupported model: {m}"),
         }
     }
@@ -810,6 +822,16 @@ impl StaticSplit {
         self.pinned_filled.len() as u32 + self.ring.len() as u32
     }
 
+    /// Whether this expert is in VRAM right now — the peek [`crate::cache::ExpertCache::resident`]
+    /// provides for the LRU, so the host policy can ask both the same question.
+    fn resident(&self, e: ExpertRef) -> bool {
+        if e.layer < self.resident_blocks {
+            let slot = u32::from(e.layer) * self.n_expert + u32::from(e.expert);
+            return self.pinned_filled[slot as usize];
+        }
+        self.ring.contains(&Some(e))
+    }
+
     fn clear(&mut self) {
         self.pinned_filled.iter_mut().for_each(|f| *f = false);
         self.ring.iter_mut().for_each(|r| *r = None);
@@ -920,6 +942,14 @@ impl Admission {
         }
     }
 
+    /// Whether `e` is resident, asked without committing anything.
+    fn resident(&self, e: ExpertRef) -> bool {
+        match self {
+            Self::Lru(c) => c.resident(e),
+            Self::Static(s) => s.resident(e),
+        }
+    }
+
     fn policy_name(&self) -> &'static str {
         match self {
             Self::Lru(_) => "lru",
@@ -996,6 +1026,10 @@ pub struct State<'c> {
     act: DeviceBuffer<'c>,
     expert_out: DeviceBuffer<'c>,
     ffn: DeviceBuffer<'c>,
+    /// Where the host executor's contribution lands before it is added to `ffn`.
+    cpu_ffn: DeviceBuffer<'c>,
+    /// The compacted router weights for a device batch that is a subset of the router's choice.
+    weights_sub: DeviceBuffer<'c>,
     logits_dev: DeviceBuffer<'c>,
     block_table: DeviceBuffer<'c>,
 
@@ -1013,6 +1047,22 @@ pub struct State<'c> {
 
     idx_host: Vec<u32>,
     w_host: Vec<f32>,
+    /// The block's post-norm activation, on the host, because the CPU experts need it. Only
+    /// filled when a block actually routes something host-side.
+    x_host: Vec<f32>,
+    /// What the host executor returns: the router-weighted sum of its experts' outputs.
+    cpu_out: Vec<f32>,
+    /// `(expert id, router weight)` for the experts this block sends to the CPU, in router
+    /// order.
+    cpu_pick: Vec<(u16, f32)>,
+    /// The experts left for the device, in router order — a *subset* of `wanted` when the host
+    /// executor is on.
+    gpu_wanted: Vec<ExpertRef>,
+    /// Those experts' router weights, compacted to match. 🔴 `moe_combine` reads `weights[m]`
+    /// for the `m`-th matrix it was handed, so a device batch that is a non-prefix subset of the
+    /// router's choice cannot use the router's own weight vector: the scalars would be paired
+    /// with the wrong experts and the output would stay finite and fluent.
+    w_sub: Vec<f32>,
     /// Expert bytes copied host-to-device since the last `reset_traffic`. Counted from the
     /// slices actually uploaded, not from a per-expert constant times a miss count.
     bytes_staged: u64,
@@ -1066,6 +1116,8 @@ impl<'c> State<'c> {
             act: ctx.alloc_n::<f32>(cfg.n_expert_used * cfg.n_ff)?,
             expert_out: ctx.alloc_n::<f32>(cfg.n_expert_used * n_embd)?,
             ffn: ctx.alloc_n::<f32>(n_embd)?,
+            cpu_ffn: ctx.alloc_n::<f32>(n_embd)?,
+            weights_sub: ctx.alloc_n::<f32>(cfg.n_expert_used)?,
             logits_dev: ctx.alloc_n::<f32>(cfg.n_vocab)?,
             block_table: ctx.alloc_n::<u32>(pages)?,
             k_pages,
@@ -1076,6 +1128,11 @@ impl<'c> State<'c> {
             table_host: Vec::new(),
             idx_host: vec![0; cfg.n_expert_used],
             w_host: vec![0.0; cfg.n_expert_used],
+            x_host: vec![0.0; n_embd],
+            cpu_out: vec![0.0; n_embd],
+            cpu_pick: Vec::with_capacity(cfg.n_expert_used),
+            gpu_wanted: Vec::with_capacity(cfg.n_expert_used),
+            w_sub: Vec::with_capacity(cfg.n_expert_used),
             bytes_staged: 0,
             wanted: Vec::with_capacity(cfg.n_expert_used),
             logits: vec![0.0; cfg.n_vocab],
@@ -1109,14 +1166,48 @@ pub struct Model<'c, 'm> {
     pub state: State<'c>,
     pool: ExpertPool<'c>,
     admission: Admission,
+    /// The host-side expert executor, present only when a policy asked for one.
+    host: Option<HostExecutor>,
+    host_policy: HostPolicy,
+    /// Each block's expert geometry, in the shape the executor wants. Built once because it is
+    /// per block and does not change.
+    host_specs: Vec<BlockSpec>,
 }
 
 impl<'c, 'm> Model<'c, 'm> {
+    /// Load with no host executor: every miss is streamed. This is the engine as it was.
     pub fn new(
         ctx: &'c Context,
         model: &'m MappedModel,
         n_ctx: usize,
         residency: Residency,
+    ) -> Result<Self, EngineError> {
+        Self::build(ctx, model, None, n_ctx, residency, HostPolicy::Off)
+    }
+
+    /// Load with a host-side expert executor.
+    ///
+    /// 🔴 The `Arc` is not decoration. The executor's worker threads read expert weights straight
+    /// out of the mapping, so the mapping has to outlive them — and a `&MappedModel` cannot
+    /// express that to threads whose lifetime the borrow checker never sees. Sharing ownership
+    /// does, and [`HostExecutor::drop`] joins the workers before its clone is released.
+    pub fn new_hybrid(
+        ctx: &'c Context,
+        model: &'m Arc<MappedModel>,
+        n_ctx: usize,
+        residency: Residency,
+        host: HostPolicy,
+    ) -> Result<Self, EngineError> {
+        Self::build(ctx, model, Some(Arc::clone(model)), n_ctx, residency, host)
+    }
+
+    fn build(
+        ctx: &'c Context,
+        model: &'m MappedModel,
+        owned: Option<Arc<MappedModel>>,
+        n_ctx: usize,
+        residency: Residency,
+        host_policy: HostPolicy,
     ) -> Result<Self, EngineError> {
         let weights = Weights::upload(ctx, model)?;
         let cfg = &weights.cfg;
@@ -1169,7 +1260,40 @@ impl<'c, 'm> Model<'c, 'm> {
 
         let pool = ExpertPool::new(ctx, weights.slot_bank_bytes, admission.capacity())?;
         let state = State::new(ctx, &weights.cfg, n_ctx)?;
-        Ok(Self { ctx, mapped: model, weights, state, pool, admission })
+
+        let bank = |b: &BankShape| BankSpec { ty: b.ty, n_rows: b.n_rows, n_cols: b.n_cols };
+        let host_specs: Vec<BlockSpec> = weights
+            .blocks
+            .iter()
+            .map(|b| BlockSpec { gate: bank(&b.gate), up: bank(&b.up), down: bank(&b.down) })
+            .collect();
+        let host = match (owned, host_policy.is_off()) {
+            (Some(mapped), false) => Some(HostExecutor::new(
+                mapped,
+                Geometry {
+                    n_block: cfg.n_block,
+                    n_expert: cfg.n_expert,
+                    n_expert_used: cfg.n_expert_used,
+                    n_embd: cfg.n_embd,
+                    n_ff: cfg.n_ff,
+                },
+                &host_specs,
+                host_experts::default_threads(),
+            )?),
+            _ => None,
+        };
+
+        Ok(Self {
+            ctx,
+            mapped: model,
+            weights,
+            state,
+            pool,
+            admission,
+            host,
+            host_policy,
+            host_specs,
+        })
     }
 
     pub fn cfg(&self) -> &Config {
@@ -1189,6 +1313,8 @@ impl<'c, 'm> Model<'c, 'm> {
             expert_bytes: self.weights.expert_bytes,
             stats,
             bytes_staged: self.state.bytes_staged,
+            host_threads: self.host.as_ref().map_or(0, HostExecutor::n_threads),
+            host: self.host.as_ref().map(HostExecutor::stats).unwrap_or_default(),
         }
     }
 
@@ -1201,6 +1327,9 @@ impl<'c, 'm> Model<'c, 'm> {
         match &mut self.admission {
             Admission::Lru(c) => c.reset_stats(),
             Admission::Static(s) => s.stats = CacheStats::default(),
+        }
+        if let Some(h) = &self.host {
+            h.reset_stats();
         }
         self.state.bytes_staged = 0;
     }
@@ -1239,6 +1368,9 @@ impl<'c, 'm> Model<'c, 'm> {
         let w = &self.weights;
         let cfg = &w.cfg;
         let pool = &self.pool;
+        let host = self.host.as_ref();
+        let host_policy = self.host_policy;
+        let host_specs = &self.host_specs;
         let admission = &mut self.admission;
         let st = &mut self.state;
 
@@ -1433,7 +1565,10 @@ impl<'c, 'm> Model<'c, 'm> {
                 // with 16 blocks and a resident pool, correctly measured it at ~13 us. At 48
                 // blocks with a streaming pool it is 30x that, and it is the largest phase in
                 // the step.
-                if st.tap.is_some() {
+                // 🔴 A second consumer, and it is not optional: when part of the block is
+                // computed host-side the CPU has to apply the router's weights itself, and the
+                // device batch that is left needs its own compacted copy of them.
+                if st.tap.is_some() || host.is_some() {
                     ctx.download_slice(&mut st.w_host, &st.weights)?;
                 }
             }
@@ -1445,20 +1580,72 @@ impl<'c, 'm> Model<'c, 'm> {
                 t.items.push((format!("ffn_moe_weights-{bi}"), st.w_host.clone()));
             }
 
+            st.wanted.clear();
+            for e in &st.idx_host {
+                if *e as usize >= cfg.n_expert {
+                    return Err(EngineError::Unsupported(format!(
+                        "the router named expert {e}, past the {} in block {bi}",
+                        cfg.n_expert
+                    )));
+                }
+                st.wanted.push(ExpertRef::new(bi as u16, *e as u16));
+            }
+
+            // ---- the split: which of this block's misses go to the CPU ---------------------
+            //
+            // 🔴 The cache is *asked* with `resident` and only then told with `admit`, and that
+            // order is the correctness of the whole thing. `admit` plans and commits together —
+            // deliberately, see `cache.rs` — so admitting an expert and then declining to stage
+            // it would leave the cache certain of a slot that was never filled, and the next hit
+            // on it would read whatever the slot held before. Only the experts the device is
+            // going to keep are ever admitted.
+            st.cpu_pick.clear();
+            st.gpu_wanted.clear();
+            st.w_sub.clear();
+            if host.is_some() {
+                let _p = profile::scope("moe.host_split");
+                let misses = st.wanted.iter().filter(|e| !admission.resident(**e)).count();
+                let mut budget = host_policy.host_count(misses);
+                for (i, e) in st.wanted.iter().enumerate() {
+                    if budget > 0 && !admission.resident(*e) {
+                        st.cpu_pick.push((e.expert, st.w_host[i]));
+                        budget -= 1;
+                    } else {
+                        st.gpu_wanted.push(*e);
+                        st.w_sub.push(st.w_host[i]);
+                    }
+                }
+            } else {
+                st.gpu_wanted.extend_from_slice(&st.wanted);
+            }
+
+            // 🔴 Submitted BEFORE the staging copies and the expert matvecs are issued, which is
+            // the entire hypothesis. `submit` returns as soon as the job is published; the host
+            // thread then goes on to queue this block's GPU work, and the two run at once. A
+            // `sync` here instead of below would make this substitution rather than overlap, and
+            // `bench/baselines/qwen3-30b-a3b.md` already records what substitution is worth.
+            let job = if st.cpu_pick.is_empty() {
+                None
+            } else {
+                let _p = profile::scope("moe.host_submit");
+                // The router readback a few lines up drained the queue, so this download costs
+                // the copy and not a fence.
+                ctx.download_slice(&mut st.x_host, &st.x)?;
+                let h = host.expect("a non-empty pick implies an executor");
+                Some(h.submit(bi, host_specs[bi], &st.cpu_pick, &st.x_host)?)
+            };
+
+            // The device batch is now a subset of the router's choice, so it needs its own
+            // weight vector. Uploaded here, while the queue is still empty, rather than after
+            // the staging copies this blocking copy would otherwise have to wait for.
+            if !st.cpu_pick.is_empty() {
+                ctx.upload_slice(&st.weights_sub, &st.w_sub)?;
+            }
+
             // Ask the cache what is resident and what must move.
             let plan = {
                 let _p = profile::scope("moe.admit");
-                st.wanted.clear();
-                for e in &st.idx_host {
-                    if *e as usize >= cfg.n_expert {
-                        return Err(EngineError::Unsupported(format!(
-                            "the router named expert {e}, past the {} in block {bi}",
-                            cfg.n_expert
-                        )));
-                    }
-                    st.wanted.push(ExpertRef::new(bi as u16, *e as u16));
-                }
-                admission.admit(&st.wanted)?
+                admission.admit(&st.gpu_wanted)?
             };
 
             // 🔴 Every miss is staged BEFORE anything computes. A matmul against a slot still
@@ -1470,7 +1657,7 @@ impl<'c, 'm> Model<'c, 'm> {
                     st.bytes_staged += stage(ctx, mapped, pool, load.expert, load.into_slot)?;
                 }
             }
-            let slots = plan.slots_for(&st.wanted);
+            let slots = plan.slots_for(&st.gpu_wanted);
             let k = slots.len();
 
             // 🔴 All k experts in one launch per bank, not one launch per expert per bank.
@@ -1495,63 +1682,110 @@ impl<'c, 'm> Model<'c, 'm> {
                 && b.gate.n_rows == b.up.n_rows
                 && b.gate.n_cols == b.up.n_cols
                 && 2 * k <= MAX_BATCHED_MATS;
-            {
-                let _p = profile::scope("moe.expert_matvec");
-                bank_batch(&mut batch, &pool.gate, &slots);
-                if fused {
-                    for &sl in &slots {
-                        batch.push(&pool.up[sl as usize]);
+            // A block can now leave the device nothing to do — `frac:1.0` at a zero hit rate
+            // does exactly that. Zeroing here rather than letting a batch of zero matrices fall
+            // through four kernels keeps every one of them a shape they were tested on.
+            if k == 0 {
+                let _p = profile::scope("moe.combine");
+                ctx.zero(&st.ffn, n_embd)?;
+            } else {
+                {
+                    let _p = profile::scope("moe.expert_matvec");
+                    bank_batch(&mut batch, &pool.gate, &slots);
+                    if fused {
+                        for &sl in &slots {
+                            batch.push(&pool.up[sl as usize]);
+                        }
                     }
-                }
-                ctx.matvec_q_batched(
-                    b.gate.ty,
-                    &st.gate,
-                    &batch,
-                    &st.x,
-                    0,
-                    b.gate.n_rows,
-                    b.gate.n_cols,
-                )?;
-                if !fused {
-                    bank_batch(&mut batch, &pool.up, &slots);
                     ctx.matvec_q_batched(
-                        b.up.ty,
-                        &st.up,
+                        b.gate.ty,
+                        &st.gate,
                         &batch,
                         &st.x,
                         0,
-                        b.up.n_rows,
-                        b.up.n_cols,
+                        b.gate.n_rows,
+                        b.gate.n_cols,
+                    )?;
+                    if !fused {
+                        bank_batch(&mut batch, &pool.up, &slots);
+                        ctx.matvec_q_batched(
+                            b.up.ty,
+                            &st.up,
+                            &batch,
+                            &st.x,
+                            0,
+                            b.up.n_rows,
+                            b.up.n_cols,
+                        )?;
+                    }
+                }
+                {
+                    let _p = profile::scope("moe.swiglu");
+                    if fused {
+                        ctx.swiglu_halves(&st.act, &st.gate, k * cfg.n_ff)?;
+                    } else {
+                        ctx.swiglu(&st.act, &st.gate, &st.up, k * cfg.n_ff)?;
+                    }
+                }
+                {
+                    let _p = profile::scope("moe.expert_down");
+                    bank_batch(&mut batch, &pool.down, &slots);
+                    ctx.matvec_q_batched(
+                        b.down.ty,
+                        &st.expert_out,
+                        &batch,
+                        &st.act,
+                        cfg.n_ff,
+                        b.down.n_rows,
+                        b.down.n_cols,
                     )?;
                 }
-            }
-            {
-                let _p = profile::scope("moe.swiglu");
-                if fused {
-                    ctx.swiglu_halves(&st.act, &st.gate, k * cfg.n_ff)?;
-                } else {
-                    ctx.swiglu(&st.act, &st.gate, &st.up, k * cfg.n_ff)?;
+                {
+                    // Writes rather than accumulates, so there is no zeroing pass ahead of it, and
+                    // it sums the experts in router order — the order the axpy loop it replaces
+                    // used, which the token-for-token assertion against llama.cpp depends on.
+                    let _p = profile::scope("moe.combine");
+                    // 🔴 `st.weights` is the router's own vector, in router order. It is only the
+                    // right one when the device has every expert the router named; when some went
+                    // to the CPU the device's batch is a non-prefix subset and `moe_combine` — which
+                    // pairs `weights[m]` with the `m`-th matrix — would apply the wrong scalar to
+                    // every expert after the first one the host took.
+                    let w = if st.cpu_pick.is_empty() { &st.weights } else { &st.weights_sub };
+                    ctx.moe_combine(&st.ffn, &st.expert_out, w, k, n_embd)?;
                 }
             }
-            {
-                let _p = profile::scope("moe.expert_down");
-                bank_batch(&mut batch, &pool.down, &slots);
-                ctx.matvec_q_batched(
-                    b.down.ty,
-                    &st.expert_out,
-                    &batch,
-                    &st.act,
-                    cfg.n_ff,
-                    b.down.n_rows,
-                    b.down.n_cols,
-                )?;
-            }
-            {
-                // Writes rather than accumulates, so there is no zeroing pass ahead of it, and
-                // it sums the experts in router order — the order the axpy loop it replaces
-                // used, which the token-for-token assertion against llama.cpp depends on.
-                let _p = profile::scope("moe.combine");
-                ctx.moe_combine(&st.ffn, &st.expert_out, &st.weights, k, n_embd)?;
+
+            // ---- collect the host's share ----------------------------------------------------
+            //
+            // Everything above was submitted, not executed: the queue is asynchronous, so by the
+            // time this runs the CPU has had the whole of this block's staging and arithmetic to
+            // work in. `host.wait` against `host.busy` in the residency report is the measurement
+            // of how much of it was actually hidden.
+            if let Some(job) = job {
+                let h = host.expect("a job implies an executor");
+                {
+                    let _p = profile::scope("moe.host_sync");
+                    h.sync(job, &mut st.cpu_out)?;
+                }
+                let _p = profile::scope("moe.host_add");
+                // 🔴 Asynchronous, for the same reason `stage` is, and with the same argument.
+                // A blocking copy here is a fence in the middle of every block: it waits for
+                // this block's staging and matvecs, which are already submitted, and it gets
+                // billed for them. Measured at 520 slots and `frac:0.5`, it was **10.96 ms a
+                // token, 20% of the step** — device time that was going to be paid anyway,
+                // charged to the wrong line and serialising the host behind it.
+                //
+                // The safety condition is that `cpu_out` stay alive and unmodified until the
+                // copy runs. It lives in `State` for the session, and the only thing that
+                // writes it is the *next* block's `sync` — which is downstream of that block's
+                // router readback, a blocking download that drains this copy first. So the copy
+                // has completed before its source is touched again, on the same in-order queue
+                // the rest of this file rests on.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(st.cpu_out.as_ptr().cast::<u8>(), n_embd * 4)
+                };
+                unsafe { ctx.upload_async(&st.cpu_ffn, bytes)? };
+                ctx.add(&st.ffn, &st.ffn, &st.cpu_ffn, n_embd)?;
             }
             tap_record(&mut st.tap, format!("ffn_moe_out-{bi}"), ctx, &st.ffn, n_embd)?;
             {
@@ -1578,6 +1812,24 @@ impl<'c, 'm> Model<'c, 'm> {
     }
 }
 
+/// 🔴 Wait for the queue before any of this model's host memory goes away.
+///
+/// `moe.host_add` submits an **asynchronous** copy whose source is `State::cpu_out`, a plain
+/// `Vec` on the host. `session.rs` solves the same problem for the memory-mapped weights by
+/// declaring the mapping before the `Context`, so the queue's destructor drains before the pages
+/// are unmapped — but `State` lives *inside* this struct, which is declared **after** the
+/// `Context` and therefore drops **before** it. Without this, a copy still in flight would be
+/// reading a freed buffer, and nothing anywhere would report it.
+///
+/// In practice every `decode` ends with a blocking logit readback, so the queue is already empty
+/// by the time this runs. That is exactly the incidental property `session.rs` refuses to rely
+/// on for the same reason, and this does not rely on it either.
+impl Drop for Model<'_, '_> {
+    fn drop(&mut self) {
+        let _ = self.ctx.sync();
+    }
+}
+
 /// What the pool is holding and what it has cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidencyReport {
@@ -1595,6 +1847,10 @@ pub struct ResidencyReport {
     pub stats: CacheStats,
     /// Expert bytes actually copied across the bus.
     pub bytes_staged: u64,
+    /// Worker threads the host executor runs on, or zero when there is none.
+    pub host_threads: usize,
+    /// What it actually did.
+    pub host: HostStats,
 }
 
 impl ResidencyReport {

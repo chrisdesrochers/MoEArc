@@ -252,7 +252,7 @@ fn constrained(residency: Residency) -> Option<Session> {
     let path = PathBuf::from(std::env::var("MOEARC_OLMOE_MODEL").ok()?);
     // 512 tokens is more than this file's prompts need, and it keeps the KV cache small enough
     // that a constrained session can sit alongside the shared fully-resident one.
-    let opts = SessionOptions { n_ctx: Some(512), residency };
+    let opts = SessionOptions { n_ctx: Some(512), residency, ..Default::default() };
     Some(Session::load_with(&path, opts).expect("constrained session would not load"))
 }
 

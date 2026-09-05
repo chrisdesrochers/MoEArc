@@ -180,7 +180,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let opts = SessionOptions { n_ctx: Some(n_ctx), residency };
+        let opts = SessionOptions { n_ctx: Some(n_ctx), residency, ..Default::default() };
         let session = match Session::load_with(&model, opts) {
             Ok(s) => s,
             Err(e) => {

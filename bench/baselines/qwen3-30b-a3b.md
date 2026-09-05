@@ -338,3 +338,168 @@ by staging 1 GiB of experts per token and the lm_head is a smaller share of it.
 
 **Against llama.cpp's 50.13 tok/s the gap is now 1.7x**, from 2.1x this morning. Every point of
 that came from measurement, and two of the three changes attempted today were reverted.
+
+---
+
+## The host expert executor — 2026-09-05, and overlap works
+
+Everything above measures one answer to a cache miss: **ship the expert over PCIe**. This section
+measures the second one — **compute it on the CPU while the GPU is busy** — implemented in
+`crates/moearc-engine/src/host_experts.rs` and wired into `moe.rs`'s decode loop as
+`submit` before the block's device work and `sync` after it.
+
+🔴 **The measurement that looked like it settled this in advance did not.** `llama-bench -ncmoe`
+above shows throughput falling monotonically as layers move to the CPU (50.13 → 33.19). That is
+*substitution* — work taken off the GPU. It says nothing about *overlap*, where the CPU computes
+some of a block's experts while the GPU stages and computes the others. Nobody had measured that
+on this box. It is worth 2% at high residency and **36% at low**, and it is not the larger of the
+two effects the executor turns out to have.
+
+### The host kernels, on their own
+
+`examples/host_expert_bench`, warm pages, Q4_K gate/up and Q6_K down, 3.06 MB an expert:
+
+| | us/expert | GB/s | against |
+| --- | ---: | ---: | --- |
+| one core | 465 | **6.5** | ~22.8 GB/s, one core's memory read (`docs/roadmap.md`) |
+| 19 threads | ~50 | **~55** aggregate | — |
+
+**So the host expert matvec is compute-bound, not memory-bound: 6.5 GB/s a core is 29% of what
+the core can read.** Two things follow. Adding threads still pays — 19 of them reach ~55 GB/s
+aggregate, four times what PCIe delivers out of a memory-mapped file (10.5 GB/s at best,
+measured above) — and the per-thread figure falls from ~6.1 GB/s to ~3.3 as the pool spills off
+this CPU's 8 P-cores onto its 12 E-cores, which is the shape of the scaling curve and not a
+defect.
+
+📌 **A 3.4x correction inside the kernel, and it was one line of shape.** The first version
+accumulated each 32-element group into a single `f32`. A float sum is not associative, so that is
+a serial dependency chain the compiler is **not permitted** to reorder, and it vectorised to
+nothing: **1.96 GB/s a core.** Eight independent accumulators — a reassociation the source
+performs rather than one the compiler assumes — took it to **6.65**. The AVX2/FMA path is
+selected at runtime (`is_x86_feature_detected!`), so a release binary still runs anywhere.
+
+At 50 us an expert, a token's whole 384 experts would take **19.3 ms on the CPU alone — 51.7
+tok/s**, which is the ceiling every row below is bounded by.
+
+### The sweep
+
+`examples/hybrid_sweep`, 128 greedy tokens, `n_ctx = 512`, prompt `def fibonacci(n):`+newline+4
+spaces. **Every one of the 42 rows produced identical token ids, and every one matched llama.cpp
+for all 64 ids the reference holds.**
+
+```sh
+cargo run --release -p moearc-engine --features gpu --example hybrid_sweep -- \
+  <model.gguf> 128 512 2952,2056,1032,520,264,132 \
+  off,frac:0.25,frac:0.5,frac:0.75,frac:0.9,frac:1.0,over:4 \
+  bench/references/qwen3-30b-a3b.fibonacci.ids 750 75698 1445 982 257
+```
+
+A policy names what happens to a block's **misses**: `frac:f` sends `ceil(f * misses)` of them to
+the CPU, `over:n` streams the first `n` and sends the rest.
+
+| slots | % of model | `off` | `frac:0.25` | `frac:0.5` | `frac:0.75` | `frac:1.0` | best |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2952 | 48.0% | 29.96 | 33.44 | 36.79 | **39.12** † | 29.51 | **+31%** † |
+| 2056 | 33.5% | 24.05 | 29.45 | 31.07 | **40.04** | 29.18 | **+66%** |
+| 1032 | 16.8% | 16.22 | 21.41 | 24.39 | **32.65** | 28.95 | **+101%** |
+| 520 | 8.5% | 12.13 | 16.87 | 20.73 | 28.83 | **29.00** | **+139%** |
+| 264 | 4.3% | 7.72 | 11.00 | 18.27 | 27.29 | **29.10** | **+277%** |
+| 132 | 2.1% | 7.77 | 11.03 | 14.35 | 25.82 | **29.00** | **+273%** |
+
+† See the spread note below: this row reads **43.3 (+44%)** in four independent runs and 39.12
+in this one.
+
+**The floor is gone.** Stream-only falls from 30 tok/s to 7.7 as residency drops; with a host
+policy the worst row in the table is 25.8 and every residency reaches **~29 tok/s or better**.
+Throughput is no longer a function of how much of the model fits.
+
+**The peak is 43.3 tok/s against llama.cpp's 50.13**, closing the gap from **1.7x to 1.16x**,
+on a model that needs 17.3 GiB on an 11.3 GiB card.
+
+⚠️ **Run-to-run spread on this box is real and it is not small, and the table's best cell is
+its victim.** `2952 / frac:0.75` reads **43.05, 43.16, 43.78 and 43.35** in four independent
+focused runs and **39.12** inside the 42-configuration sweep the table is taken from — a long
+session, and the low reading. **Take 43.3 as that row's figure**, and treat every single row here
+as ±10%. The *shape* of the table reproduces exactly across every run, and so do the hit rates
+and staged-byte counts, which are deterministic.
+
+### 🔴 Two mechanisms, and the obvious one is not the bigger one
+
+`hybrid_sweep` reports the pool's own wall time (`busy`) and the time the device thread lost
+waiting for it (`wait`). Their difference is overlap, and the counterfactual — what the row would
+do if the same host work were serialised instead of hidden — is arithmetic from the two:
+
+| slots | policy | tok/s | busy ms/tok | wait ms/tok | hidden | tok/s if serialised | **overlap is worth** |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2952 | `frac:0.75` | 43.35 | 4.20 | 3.61 | 14% | 42.26 | **+2.6%** |
+| 2056 | `frac:0.75` | 40.04 | 5.68 | 4.65 | 18% | 38.45 | +4.1% |
+| 1032 | `frac:0.75` | 32.65 | 8.84 | 3.38 | 62% | 27.71 | +17.8% |
+| 520 | `frac:0.75` | 28.83 | 11.89 | 2.44 | 79% | 22.66 | +27.2% |
+| 264 | `frac:0.75` | 27.29 | 14.32 | 2.45 | 83% | 20.61 | **+32.4%** |
+| 132 | `frac:0.75` | 25.82 | 16.21 | 2.37 | 85% | 19.02 | **+35.8%** |
+| 264 | `frac:1.0` | 29.10 | 19.39 | 19.73 | **0%** | 29.10 | 0% |
+
+**Overlap is real, it is large, and it is worth more the less of the model fits** — because what
+it hides behind is *staging*, and staging is what a low-residency step is made of. At `frac:1.0`
+the GPU is left with no expert work at all, `wait` equals `busy`, and the mechanism degenerates
+into exactly the substitution `-ncmoe` performs.
+
+**But at high residency the win is mostly something else.** At 2952 slots, routing 3/4 of the
+misses to the CPU takes the hit rate from **91.7% to 99.8%** and expert traffic from **11,449 MiB
+to 250 MiB** over the same 133 steps — a **46x** reduction. The reason is not the CPU's
+arithmetic: **a miss routed host-side is never admitted, so it never evicts a resident expert.**
+The pool stops churning and settles onto the hot working set while the cold tail goes to the CPU.
+That effect needs no overlap at all, and above ~1000 slots it is most of the gain.
+
+### The device-event profile, which is what settles it
+
+`MOEARC_PROFILE=1 MOEARC_PROFILE_EVENTS=1`, 520 slots, 64 decode steps, queue left asynchronous —
+the instrument built after two host-timer conclusions died in place, pointed at this question:
+
+| | `off` | `frac:0.5` |
+| --- | ---: | ---: |
+| step | 87.40 ms | **53.04 ms** |
+| `moe.stage` | 58.14 ms | **24.07 ms** |
+| tracked device busy | 14.24 ms | 11.65 ms |
+| `moe.host_sync` | — | **0.57 ms** |
+| host pool busy | — | 9.64 ms |
+
+**0.57 ms of waiting for 9.64 ms of work: 94% of the host arithmetic ran while the device was
+busy.** That is the claim, measured by two clocks on two threads rather than inferred from one.
+
+📌 **And one of those 48-per-token phases was a fence nobody needed.** Uploading the CPU's result
+with the blocking `Context::upload` cost **10.96 ms a token, 20% of the step** — not its own
+work, but this block's already-submitted staging, which it waited for and was billed for. The
+same `upload_async`-out-of-a-stable-buffer argument `moe::stage` rests on applies, and the copy
+now uses it: **0.35 ms, and the step 54.83 → 53.04 ms (+3.3%)**. The drain simply moved back to
+`moe.readback` where it belongs.
+
+### What the policies say, including where they misbehave
+
+- 🔴 **`frac:0.9` is `frac:1.0`.** `ceil(0.9 * 8) == 8`, so at a zero hit rate every miss goes
+  host-side, nothing is ever admitted, and the pool — however large — stays empty forever. The
+  rounding makes the knob discontinuous: **`0.75` is the largest fraction that still lets the
+  cache fill** on a model with 8 active experts. Both rows are in the sweep and they are within
+  1% of each other at every residency, which is the evidence.
+- **`over:n` is the same idea from the other end and it is worse here.** `over:1` reaches 32.0
+  tok/s at 2952 (vs 39–43 for `frac:0.75`) and `over:2`/`over:4` do progressively less. Streaming
+  a fixed *count* keeps the eviction pressure that `frac` removes.
+- ⚠️ **The mechanism costs 1–4% when it does nothing.** `over:4` at 2952 routes 0.25 experts a
+  step and still reads −1.7%; at 2056 it routes 1.6 and reads −3.7%. The fixed cost is the extra
+  router-weight readback and the per-block split. A policy that switched itself off when the hit
+  rate is high would recover it; none of the three here does.
+- **The best simple policy on this model is `frac:0.75` above ~1000 slots and `frac:1.0` below
+  it**, and they meet at about 520 — which is also where overlap stops being able to pay, because
+  below it there is not enough device work left to hide behind.
+
+### What is *not* claimed
+
+- **No adaptive policy.** These three are constants, deliberately, so the question "does overlap
+  pay" has a readable answer before anything is tuned. `docs/roadmap.md`'s Stage 2 asks for a
+  measurement-driven policy and that is still outstanding.
+- **The overlap window is one block wide and cannot be widened.** Block *n*'s CPU experts are
+  submitted after its router runs and collected before its residual is updated, because block
+  *n+1*'s attention reads that residual. There is no way to overlap host work for block *n* with
+  device work for block *n+1* in decode — the same serialisation that rules out cross-layer
+  prefetch.
+- **Nothing here is measured on any model but Qwen3-30B-A3B**, and nothing on prefill.
