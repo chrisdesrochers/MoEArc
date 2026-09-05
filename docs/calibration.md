@@ -180,3 +180,42 @@ Arrow Lake iGPU is (`boot_vga=1`) — so the card could be filled safely.
 underflow that reported 17 billion GiB unusable, and a branch that printed "WITHOUT failing"
 directly beneath "stopped: write failed". Both are noted because a self-contradicting report is
 more dangerous than an obviously wrong one — both halves look authoritative.
+
+---
+
+## Measurement: the expert miss-path, per token, on Arc B580 (2026-09-05)
+
+Real geometry (40 blocks, 8 experts active per block = 320 activations/token, 2,039,808 B per
+slot), measured on the card rather than derived.
+
+| hit rate | miss/block | MB/token | one transfer | 40 sequential | penalty |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 40.0% (static split) | 5 | 408.0 | 30.36 ms → **32.9 tok/s** | 30.53 ms → 32.8 tok/s | 1.01× |
+| 65.9% (LRU) | 3 | 244.8 | 18.17 ms → **55.0 tok/s** | 18.45 ms → 54.2 tok/s | 1.02× |
+| 80.1% (Belady) | 2 | 163.2 | 12.12 ms → **82.5 tok/s** | 12.34 ms → 81.0 tok/s | 1.02× |
+
+### The serialisation penalty is ~2%, not 2×
+
+MoE offload has a structural problem: the 40 blocks are strictly sequential, and block N+1's
+router runs on block N's output, so its experts cannot be named — let alone prefetched — until
+N completes. The concern was that fetch and compute would therefore **add** rather than overlap.
+
+On the transfer side that concern is unfounded. Forty sequential per-block fetches cost 1.01–1.02×
+a single bulk transfer of the same total. Each block's fetch is already ~4–10 MB, comfortably
+enough to saturate the link, so per-transfer latency is lost in the noise.
+
+📌 **This lowers the value of speculative expert prefetch considerably.** It was the obvious
+next optimisation; the measurement says there is at most 2% in it on the transfer path. Any
+remaining case for it has to come from overlapping fetch with *compute*, which is a different
+argument and needs compute numbers we do not have.
+
+### Ceilings, and what they rule out
+
+These are still upper bounds: transfer only, no compute, no kernel launch overhead, no attention
+or KV traffic. Real throughput will be lower.
+
+🔴 They also settle a figure that had been floating around: **104 tok/s is not reachable on this
+card with this model.** Even at Belady-optimal residency — an oracle policy that cannot be
+implemented — with zero compute time, the measured ceiling is 82.5 tok/s.
+
+Method: `tools/stream_bench.cpp`. 20 repetitions per configuration after a warm-up transfer.
