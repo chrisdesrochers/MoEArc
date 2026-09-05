@@ -4,21 +4,23 @@
 One command to install, one command to run, OpenAI- and Anthropic-compatible
 out of the box.
 
-> **Status: it generates text, and it is slow.**
+> **Status: the thesis is demonstrated in the engine.**
 >
-> ✅ MoEArc runs a full forward pass on an Arc B580 and its greedy output matches
-> llama.cpp **token id for token id** — 40/40 on one prompt, 23/23 on another including
-> the end-of-generation token. That is a correctness result, independently re-verified.
+> ✅ **Qwen3-30B-A3B — 17.3 GiB of model — runs on an 11.3 GiB Arc B580**, with greedy
+> output matching llama.cpp **token id for token id** (64/64), independently re-verified.
 >
-> 🔴 **6.7 tok/s, unoptimised.** llama.cpp does roughly 46 on the same card. The gap is
-> understood, not mysterious: no batched prefill, the router's choice is read back to the
-> host 16 times per token, and the whole model is held resident.
+> ✅ **Dynamic residency beats a static split at matched capacity: 45.08 vs 13.44 tok/s,
+> and 24× less data across the bus.** Identical output. That is the claim this project
+> exists to make, measured in the engine rather than simulated.
 >
-> 🔴 **That last point matters most: because the model is fully resident, the expert cache
-> is not exercised at all — so this project's central claim is still untested in the
-> engine.** Everything measured about dynamic residency so far comes from simulation over
-> recorded routing traces. Until a run streams experts under a real VRAM budget and beats a
-> tuned static split on the same box, **there is no performance claim here.**
+> ✅ **45.08 tok/s against llama.cpp's 50.13 on the same model and card — 90% of it.**
+> And llama.cpp needs 24 of 48 MoE layers pinned to the CPU permanently to run this model
+> at all; MoEArc decides per block, per token.
+>
+> 🔴 **Not yet:** no batched prefill at all, so there is no counterpart to llama.cpp's
+> 3218 tok/s prefill. Every matvec runs at 25–29% of the card's peak bandwidth against
+> llama.cpp's 63%. And no adaptive residency policy — the numbers above come from constant
+> policies chosen by sweeping, not by the engine deciding for itself.
 
 ## Why
 
@@ -93,13 +95,27 @@ Vulkan backend, single run, `-r 1`, device not pinned. That is indicative, not a
 
 ### What is measured
 
+All figures below are **Qwen3-30B-A3B Q4_K_M (17.3 GiB) on an Arc B580 (11.33 GiB)** unless
+stated. Every row was re-verified independently of the run that produced it, and every
+configuration generates **identical token ids**.
+
 | | result | how |
 |---|---|---|
-| **Correctness** | greedy output identical to llama.cpp, **40/40** and **23/23** token ids | re-verified independently against a patched `llama-eval-callback` |
-| **MoEArc decode** | **6.7–6.9 tok/s**, unoptimised, model fully resident | `examples/olmoe_generate` |
-| Numerical agreement | 1−cos **5.68e-3** vs llama.cpp CPU | llama.cpp's *own* Vulkan backend differs from its CPU by **6.81e-3** |
-| Expert miss path | 32.9 / 55.0 / 82.5 tok/s ceilings at 40 / 65.9 / 80.1% hit | `tools/stream_bench.cpp` |
-| Residency, **simulated** | LRU **88.9–95.2%** vs static split 42.5–55.0% | recorded routing traces, `bench/traces/` |
+| **Correctness** | greedy output identical to llama.cpp, **64/64** token ids | patched `llama-eval-callback`, both its CPU and SYCL backends |
+| **MoEArc decode** | **45.08 tok/s** at 2952 resident slots with `frac:0.75` host routing | `examples/hybrid_sweep` |
+| **vs the static split** | **45.08 vs 13.44 tok/s** at matched capacity, **24× less staged** | same sweep, same slots, same pool |
+| **vs llama.cpp** | 45.08 against its **50.13** — which needs `-ncmoe 24` to run at all | `bench/baselines/qwen3-30b-a3b.md` |
+| **The floor** | stream-only falls to **7.76 tok/s** at 4.3% residency; with host routing, **29.74** | `examples/hybrid_sweep` |
+| Overlap | **94%** of host arithmetic runs while the device is busy | `MOEARC_PROFILE_EVENTS=1` |
+| Numerical agreement | 1−cos **2.37e-3** vs llama.cpp CPU | its *own* Vulkan backend differs from its CPU by more |
+
+### The result that was not predicted
+
+Routing misses to the CPU raises the cache hit rate from **92.2% to 99.6%** and cuts expert
+traffic **24×** — and *not* because of the CPU's arithmetic. **A miss routed host-side is never
+admitted, so it never evicts a resident expert.** The host path works as a pressure-release
+valve on the cache. Above ~1000 slots that is most of the gain, and it is a bigger effect than
+the overlap it was built for.
 
 📌 Bit-exactness against llama.cpp is **unavailable by construction**: `ggml-cpu` quantises the
 f32 activation to 8 bits before every K-quant matmul, while MoEArc keeps f32. So the spread was
@@ -108,9 +124,20 @@ more than MoEArc disagrees with either.
 
 ### What is not measured
 
-**MoEArc's thesis is that a dynamic, bandwidth-aware policy beats a hand-tuned static one.**
-The simulated hit rates above say it should. **No engine run has demonstrated it**, because
-nothing yet forces experts to stream. That is the next milestone and the only one that matters.
+- **Prefill.** There is none. llama.cpp's 3218 tok/s has no counterpart here, and every number
+  above is decode.
+- **Kernel efficiency.** Every matvec sits at 25–29% of the card's 456 GB/s peak where
+  llama.cpp reaches 63%. Two well-argued explanations for that gap were tested this session and
+  **both died when measured in the engine** — see `docs/roadmap.md`.
+- **An adaptive policy.** `frac:0.75` and `frac:1.0` were found by sweeping. The engine does not
+  yet choose for itself, and the mechanism costs 1–4% when it routes almost nothing.
+- **Anything above 17.3 GiB.** A 63.4 GB model is staged for the next test; nothing is claimed
+  about it yet.
+
+📌 **Three findings were retracted during this work** — a fabricated driver-version string, a
+profile that mis-attributed device time under an async queue, and two microbenchmark results
+that did not survive measurement in place. They are documented rather than deleted, because a
+retraction is a claim like any other and this repo has been wrong confidently before.
 
 ## License
 
