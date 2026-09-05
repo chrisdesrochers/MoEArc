@@ -75,6 +75,35 @@ static inline unsigned int ld_u16le(const unsigned char *p) {
 /// lossless conversion and any correct implementation gives the same answer as ggml's
 /// `GGML_FP16_TO_FP32`. Doing it in integer arithmetic avoids depending on how a particular
 /// SYCL backend implements `half`, and works on a device with no native fp16 support.
+/// ⚠️ **Do not replace this with the device's own `half` conversion in the matvec. Measured
+/// slower.** The integer path looks like the expensive option — it has a `while` loop for
+/// subnormals that runs on every block — and an isolated microbenchmark of a Q4_K matvec on this
+/// card agreed, putting `(float) sycl::bit_cast<sycl::half>(h)` 7% ahead and claiming it was the
+/// gate on a further 13% from coalescing.
+///
+/// It does not transfer. Swapping only the four hot-loop call sites in `unit_acc`, measured in
+/// the engine on Qwen3-30B-A3B at 2952 resident slots with `MOEARC_SYNC_EACH=1`, three runs each
+/// and a spread under 0.2%:
+///
+/// ```text
+///                            software f16   device half
+///   moe.expert_matvec  Q4_K      7.42 ms       7.47 ms    +0.7%
+///   moe.expert_down    Q6_K      3.29 ms       3.60 ms    +9.4%
+///   out.matvec         Q6_K      4.02 ms       4.44 ms   +10.4%
+///   decode.total                40.4  ms      41.0  ms    +1.6%
+/// ```
+///
+/// 🔴 Uniformly worse, and worst on the **Q6_K** kernels. The likely reason is that these kernels
+/// are not ALU-bound at all: the integer work here hides under memory latency on a pipe the float
+/// MACs are not using, and moving it onto the float/conversion pipe puts it on the contended one.
+/// (Mechanism is inference; the numbers are measured.)
+///
+/// The wider lesson is the one worth keeping: **a microbenchmark of "the same kernel" is not this
+/// kernel.** The 2x2 that produced the 7% also produced the 21% coalescing figure, so that figure
+/// is unsupported here too until it is measured in place.
+///
+/// Correctness was never the obstacle — over all 65,536 half bit patterns the two differ on 1,022,
+/// every one a signalling NaN, which a GGUF scale is never. It is simply slower.
 static inline float f16_to_f32(unsigned int h) {
     const unsigned int sign = (h & 0x8000u) << 16;
     unsigned int exp = (h >> 10) & 0x1Fu;
