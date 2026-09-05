@@ -10,3 +10,4 @@ pub mod cache;
 pub mod kv;
 pub mod memory;
 pub mod residency;
+pub mod runtime;
