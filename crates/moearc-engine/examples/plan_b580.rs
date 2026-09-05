@@ -20,8 +20,8 @@
 //! experts get chosen is generated, so hit rates describe a plausible shape rather than this
 //! model's actual behaviour. Capturing a real trace is the next task.
 
-use moearc_engine::memory::{plan, Context, DeviceMemory, Headroom, ModelFootprint, Policy};
-use moearc_engine::residency::{simulate, synthetic_trace, Policy as CachePolicy};
+use moearc_engine::memory::{Context, DeviceMemory, Headroom, ModelFootprint, Policy, plan};
+use moearc_engine::residency::{Policy as CachePolicy, simulate, synthetic_trace};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -74,7 +74,10 @@ fn main() {
     println!("Qwen3.6-35B-A3B-UD-Q4_K_M  (geometry measured from the GGUF)");
     println!("  {BLOCKS} blocks x {EXPERTS_PER_BLOCK} experts = {total_slots} residency slots");
     println!("  {ACTIVE_PER_BLOCK} active per block = {active_slots} slots touched per token");
-    println!("  {:.2} MiB per slot (max across blocks; mixed quant)", PER_EXPERT_BYTES as f64 / MIB as f64);
+    println!(
+        "  {:.2} MiB per slot (max across blocks; mixed quant)",
+        PER_EXPERT_BYTES as f64 / MIB as f64
+    );
     println!(
         "  all experts resident: {:.2} GiB measured ({:.2} GiB if sized to the max slot, {:.1}% high)",
         EXPERT_WEIGHTS as f64 / GIB as f64,
