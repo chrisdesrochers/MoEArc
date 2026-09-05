@@ -121,3 +121,62 @@ constant in the table above.
 ⬜ Unresolved: `has_bfloat16_conversions` and `has_subgroup_2d_block_io` also report `False`.
 Whether those are the same defect or genuinely absent on Battlemage is **not yet determined**;
 do not assume either way.
+
+---
+
+## Measurement: allocator overhead on Arc B580 (2026-09-05)
+
+**Question.** `Headroom::PROVISIONAL` holds back 12% of free VRAM. Nobody measured it. How much
+of that is justified by allocator overhead and fragmentation?
+
+**Answer: none of it.** More memory is committable than the driver reports as free.
+
+| | bytes | GiB |
+| --- | ---: | ---: |
+| reported free (`ext_intel_free_memory`) | 12,168,933,376 | 11.33 |
+| committed before the first write failure | 12,418,351,104 | 11.57 |
+| | **+2.05%** | |
+
+Reproducible to the byte across three consecutive runs: 6,088 expert-sized blocks
+(2,039,808 B each, the measured per-expert size of Qwen3.6-35B-A3B-UD-Q4_K_M) every time.
+
+🔴 **This is a floor, not the answer.** It measures allocator overhead and fragmentation only.
+Activation memory, scratch buffers and kernel working sets are **not** included, because we have
+no kernels yet. Headroom above 0% must be justified by those, and this measurement cannot speak
+to them. The 12% placeholder stays until inference can be run and the real high-water mark
+observed.
+
+What it does establish is the shape of the question: the 12% is currently costing ~700 expert
+slots on this card, and **not one byte of it is explained by the allocator**.
+
+### The finding that matters more than the number
+
+**`malloc_device` succeeds far past physical capacity.** A first version of this probe allocated
+expert-sized blocks until failure and "succeeded" 20,001 times — **38 GiB on an 11.33 GiB card**.
+Pages are not committed until touched, so the pointer returns fine and the failure surfaces
+later, elsewhere, as a hang or a device reset rather than an allocation error.
+
+Two consequences:
+
+1. **A cache cannot size itself by allocating until failure on this driver.** It would run past
+   the end of the card. Computing the budget up front is not merely tidier — it is the only
+   method that works here. This is a point in favour of the planner's design, arrived at by
+   accident.
+2. **Allocation success is not evidence of capacity.** Any future probe must write to what it
+   allocates before counting it. Even then the boundary is soft: the failure above appeared on a
+   *write*, 2% past the reported free figure.
+
+### Method
+
+`tools/vram_probe.cpp` (SYCL, built with `icpx -fsycl`). Allocates expert-sized blocks, writes
+`0x5A` over each one with `q.memset(...).wait_and_throw()` to force commitment, counts only
+blocks that survive the write, and stops at 120% of reported free so an over-committing
+allocator cannot run the driver into a reset.
+
+Run with nothing else on the GPU. The B580 is not the display device on this machine — the
+Arrow Lake iGPU is (`boot_vga=1`) — so the card could be filled safely.
+
+⚠️ Two bugs were found in the probe itself before the number above was trusted: an unsigned
+underflow that reported 17 billion GiB unusable, and a branch that printed "WITHOUT failing"
+directly beneath "stopped: write failed". Both are noted because a self-contradicting report is
+more dangerous than an obviously wrong one — both halves look authoritative.
