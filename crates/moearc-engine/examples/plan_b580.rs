@@ -44,12 +44,20 @@ fn main() {
     // mean would fit more slots and then overrun VRAM the first time a heavy expert routed in.
     const PER_EXPERT_BYTES: u64 = 2_039_808;
 
-    // 🔴 Provisional: awaiting expert_weights_bytes from moearc-model. Taking the total weight
-    // figure minus an upper-bound estimate of expert bytes understates dense weights, which
-    // makes the plan optimistic in the same direction as the free-memory assumption above.
+    // Measured by moearc-model, summed from the tensor index rather than derived.
+    //
+    // 🔴 An earlier version of this example computed dense weights as total minus
+    // (per_expert_bytes x slots) and got 1.15 GiB. The measured figure is 2.38 GiB. The
+    // difference is precisely the phantom weight created by applying the Q6_K maximum to the
+    // 37 Q5_K blocks: the naive product is 20.89 GB against a measured 19.57 GB, 6.74% high.
+    // Because dense weights come off the top of the budget, understating them made the whole
+    // plan optimistic. Sum the real tensors; do not derive.
     const TOTAL_WEIGHTS: u64 = 22_123_538_944;
+    const EXPERT_WEIGHTS: u64 = 19_568_525_312; // 88.5% of the file
+    const DENSE_WEIGHTS: u64 = 2_555_013_632; //  11.5%, incl. router and shared experts
+    let dense_weights = DENSE_WEIGHTS;
     let expert_bytes_upper = total_slots * PER_EXPERT_BYTES;
-    let dense_weights = TOTAL_WEIGHTS.saturating_sub(expert_bytes_upper);
+    debug_assert_eq!(TOTAL_WEIGHTS, EXPERT_WEIGHTS + DENSE_WEIGHTS);
 
     // Only 10 of 40 blocks carry a KV cache: qwen35moe is a hybrid, full_attention_interval=4,
     // and the other 30 blocks are recurrent. Using block_count here would overstate KV by 4x.
@@ -67,9 +75,16 @@ fn main() {
     println!("  {BLOCKS} blocks x {EXPERTS_PER_BLOCK} experts = {total_slots} residency slots");
     println!("  {ACTIVE_PER_BLOCK} active per block = {active_slots} slots touched per token");
     println!("  {:.2} MiB per slot (max across blocks; mixed quant)", PER_EXPERT_BYTES as f64 / MIB as f64);
-    println!("  all experts resident would need {:.1} GiB", expert_bytes_upper as f64 / GIB as f64);
-    println!("  dense weights ~{:.2} GiB, KV {KV_BYTES_PER_TOKEN} B/token (10 of 40 blocks)",
-             dense_weights as f64 / GIB as f64);
+    println!(
+        "  all experts resident: {:.2} GiB measured ({:.2} GiB if sized to the max slot, {:.1}% high)",
+        EXPERT_WEIGHTS as f64 / GIB as f64,
+        expert_bytes_upper as f64 / GIB as f64,
+        100.0 * (expert_bytes_upper as f64 / EXPERT_WEIGHTS as f64 - 1.0)
+    );
+    println!(
+        "  dense weights {:.2} GiB (router + shared experts, always resident), KV {KV_BYTES_PER_TOKEN} B/token (10 of 40 blocks)",
+        dense_weights as f64 / GIB as f64
+    );
     println!();
 
     // ---- Plan against several cards ---------------------------------------------------
