@@ -53,6 +53,8 @@ static constexpr int Q8_0_BYTES = 34;
 
 // GGUF type ids, from `gguf-py/gguf/constants.py`, `class GGMLQuantizationType(IntEnum)`.
 // The same ids the `moearc-model` crate's `quant` table carries.
+static constexpr unsigned int GGML_TYPE_F32 = 0;
+static constexpr unsigned int GGML_TYPE_F16 = 1;
 static constexpr unsigned int GGML_TYPE_Q8_0 = 8;
 static constexpr unsigned int GGML_TYPE_Q4_K = 12;
 static constexpr unsigned int GGML_TYPE_Q5_K = 13;
@@ -98,6 +100,61 @@ static inline float f16_to_f32(unsigned int h) {
     }
     return sycl::bit_cast<float>(bits);
 }
+
+/// IEEE-754 binary32 to binary16, round-to-nearest-even.
+///
+/// The inverse of `f16_to_f32`, and the harder direction: it is lossy, so the rounding rule is
+/// part of the contract. ggml uses the hardware `_cvtss_sh` where F16C exists, which is RNE, so
+/// RNE is what this implements — ties to even, subnormals rounded rather than flushed, overflow
+/// to infinity rather than wrapping. `tests/gguf_crosscheck.rs` checks it against
+/// `ggml_fp32_to_fp16_row` over every f16 bit pattern and a sweep of hard f32 cases, so the
+/// claim is verified rather than asserted.
+static inline unsigned short f32_to_f16(float f) {
+    const unsigned int x = sycl::bit_cast<unsigned int>(f);
+    const unsigned int sign = (x >> 16) & 0x8000u;
+    const unsigned int e32 = (x >> 23) & 0xFFu;
+    unsigned int mant = x & 0x7FFFFFu;
+
+    if (e32 == 0xFFu) {  // inf or NaN: keep NaN-ness, and never let a NaN collapse to infinity
+        return (unsigned short) (sign | 0x7C00u | (mant ? (0x200u | (mant >> 13)) : 0u));
+    }
+
+    int exp = (int) e32 - 127 + 15;
+    if (exp >= 0x1F) return (unsigned short) (sign | 0x7C00u);  // overflow
+    if (exp <= 0) {
+        if (exp < -10) return (unsigned short) sign;  // underflows past the last subnormal
+        // Subnormal: restore the implicit bit and shift down to a multiple of 2^-24.
+        mant |= 0x800000u;
+        const int shift = 14 - exp;  // 14..24
+        const unsigned int t = mant >> shift;
+        const unsigned int rem = mant & ((1u << shift) - 1u);
+        const unsigned int half = 1u << (shift - 1);
+        // A carry out of the mantissa lands in the exponent field on its own, which is exactly
+        // right: the value rounds up to the smallest normal.
+        return (unsigned short) (sign | (t + ((rem > half || (rem == half && (t & 1u))) ? 1u : 0u)));
+    }
+
+    unsigned int t = mant >> 13;
+    const unsigned int rem = mant & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (t & 1u))) {
+        if (++t == 0x400u) {  // mantissa carried; bump the exponent and renormalise
+            t = 0;
+            if (++exp >= 0x1F) return (unsigned short) (sign | 0x7C00u);
+        }
+    }
+    return (unsigned short) (sign | ((unsigned int) exp << 10) | t);
+}
+
+/// One element of an unquantised f32 "block". A block of one, so the format table below can
+/// treat f32 and f16 tensors exactly like quantised ones and every consumer — dequantise,
+/// matvec, embedding lookup — works on all six formats with no special case.
+static inline float f32_elem(const unsigned char *blk, int) {
+    return sycl::bit_cast<float>((unsigned int) blk[0] | ((unsigned int) blk[1] << 8)
+                                 | ((unsigned int) blk[2] << 16) | ((unsigned int) blk[3] << 24));
+}
+
+/// One element of an f16 "block" of one.
+static inline float f16_elem(const unsigned char *blk, int) { return f16_to_f32(ld_u16le(blk)); }
 
 /// The 6-bit scale/min unpacker shared by Q4_K and Q5_K.
 ///
@@ -236,9 +293,11 @@ static inline float q80_elem(const unsigned char *blk, int i) {
     return (float) q * d;
 }
 
-/// Bytes one block of `type_id` occupies, or 0 if this file cannot dequantise that type.
+/// Bytes one block of `type_id` occupies, or 0 if this file cannot read that type.
 static inline int block_bytes(unsigned int type_id) {
     switch (type_id) {
+        case GGML_TYPE_F32: return 4;
+        case GGML_TYPE_F16: return 2;
         case GGML_TYPE_Q8_0: return Q8_0_BYTES;
         case GGML_TYPE_Q4_K: return Q4_K_BYTES;
         case GGML_TYPE_Q5_K: return Q5_K_BYTES;
@@ -248,9 +307,52 @@ static inline int block_bytes(unsigned int type_id) {
 }
 
 /// Elements one block of `type_id` expands to. Not a constant across formats: the K-quants pack
-/// 256 elements per super-block, Q8_0 packs 32.
+/// 256 elements per super-block, Q8_0 packs 32, and f32/f16 are blocks of one.
 static inline int block_elems(unsigned int type_id) {
-    return type_id == GGML_TYPE_Q8_0 ? QK8_0 : QK_K;
+    switch (type_id) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16: return 1;
+        case GGML_TYPE_Q8_0: return QK8_0;
+        default: return QK_K;
+    }
+}
+
+/// One element of a block of any supported format.
+///
+/// The single dispatch point. Every consumer of a weight — the expansion kernel, both matvecs,
+/// the embedding gather — goes through here, so none of them can hold a different opinion about
+/// what a byte means. `type_id` is uniform across a launch, so the switch costs nothing per
+/// element beyond what the compiler hoists out of the loop.
+static inline float elem_at(unsigned int type_id, const unsigned char *blk, int i) {
+    switch (type_id) {
+        case GGML_TYPE_F32: return f32_elem(blk, i);
+        case GGML_TYPE_F16: return f16_elem(blk, i);
+        case GGML_TYPE_Q8_0: return q80_elem(blk, i);
+        case GGML_TYPE_Q4_K: return q4k_elem(blk, i);
+        case GGML_TYPE_Q5_K: return q5k_elem(blk, i);
+        default: return q6k_elem(blk, i);  // Q6_K; block_bytes rejected everything else
+    }
+}
+
+/// Read one element of a KV cache page, which is stored as f32 or f16.
+///
+/// f16 halves the cache's footprint and its bandwidth, and the KV cache is the largest thing on
+/// the card after the weights. The precision cost lands on attention scores, which are about to
+/// go through a softmax that is far less sensitive than a weight would be — which is why
+/// llama.cpp's own flash-attention path casts K and V to f16 unconditionally.
+static inline float kv_load(const void *base, unsigned long i, unsigned int kv_type) {
+    if (kv_type == GGML_TYPE_F16) {
+        return f16_to_f32(static_cast<const unsigned short *>(base)[i]);
+    }
+    return static_cast<const float *>(base)[i];
+}
+
+static inline void kv_store(void *base, unsigned long i, float v, unsigned int kv_type) {
+    if (kv_type == GGML_TYPE_F16) {
+        static_cast<unsigned short *>(base)[i] = f32_to_f16(v);
+    } else {
+        static_cast<float *>(base)[i] = v;
+    }
 }
 
 // Work-group width for the row-per-group reductions (matvec, rmsnorm, softmax). 32 is a
@@ -372,15 +474,7 @@ int moearc_dequant(moearc_ctx *c, unsigned int type_id, float *dst, const void *
             const size_t g = it[0];
             const size_t b = g / be;
             const int i = (int) (g % be);
-            const unsigned char *blk = base + b * (size_t) bb;
-            float v;
-            switch (type_id) {
-                case GGML_TYPE_Q4_K: v = q4k_elem(blk, i); break;
-                case GGML_TYPE_Q5_K: v = q5k_elem(blk, i); break;
-                case GGML_TYPE_Q6_K: v = q6k_elem(blk, i); break;
-                default: v = q80_elem(blk, i); break;  // Q8_0; block_bytes rejected everything else
-            }
-            dst[g] = v;
+            dst[g] = elem_at(type_id, base + b * (size_t) bb, i);
         }).wait_and_throw();
         return OK;
     } catch (...) { return ERR; }
@@ -425,14 +519,7 @@ int moearc_matvec_q(moearc_ctx *c, unsigned int type_id, float *out, const void 
                        const unsigned char *blk = base + (row * nb + b) * (size_t) bb;
                        const float *xs = x + b * be;
                        for (int i = 0; i < be; ++i) {
-                           float v;
-                           switch (type_id) {
-                               case GGML_TYPE_Q4_K: v = q4k_elem(blk, i); break;
-                               case GGML_TYPE_Q5_K: v = q5k_elem(blk, i); break;
-                               case GGML_TYPE_Q6_K: v = q6k_elem(blk, i); break;
-                               default: v = q80_elem(blk, i); break;  // Q8_0
-                           }
-                           acc += v * xs[i];
+                           acc += elem_at(type_id, blk, i) * xs[i];
                        }
                    }
                    const float total = reduce_over_group(it.get_group(), acc, sycl::plus<float>());
@@ -536,34 +623,56 @@ int moearc_swiglu(moearc_ctx *c, float *out, const float *gate, const float *up,
     } catch (...) { return ERR; }
 }
 
-// Row-wise softmax, max-subtracted. The subtraction is not an optimisation: attention logits
-// and router logits both reach magnitudes where a bare exp overflows to inf and the row comes
-// back as NaN.
-int moearc_softmax(moearc_ctx *c, float *out, const float *x, unsigned long n_rows,
-                   unsigned long n_cols) {
+// Row-wise softmax of `x * scale + mask`, max-subtracted.
+//
+// This is `ggml_soft_max_ext(a, mask, scale, 0.0f)` — the operation llama.cpp's attention
+// actually uses, not a bare softmax. Both extras are load-bearing: `scale` folds in the
+// 1/sqrt(head_dim) that would otherwise need its own pass over the scores, and `mask` is how
+// causality is expressed. A causal mask holds 0 where a key is visible and -inf where it is
+// not, so the softmax assigns it exactly zero weight.
+//
+// `mask` may be null, and with `scale = 1` this degenerates to the plain row softmax the
+// router uses.
+//
+// The max subtraction is not an optimisation. Attention logits and router logits both reach
+// magnitudes where a bare exp overflows to inf and the whole row comes back NaN.
+//
+// 🔴 A fully-masked row is a real possibility (a padded batch slot) and would divide by zero.
+// The sum is clamped to the smallest normal f32 first, which turns that row into zeros rather
+// than NaNs — a NaN would propagate through the rest of the network and destroy every other
+// row's output too.
+int moearc_softmax(moearc_ctx *c, float *out, const float *x, const float *mask,
+                   unsigned long n_rows, unsigned long n_cols, float scale) {
     if (!c || !out || !x) return ERR;
     if (n_cols == 0) return ERR_ARG;
     if (n_rows == 0) return OK;
     try {
+        const bool have_mask = mask != nullptr;
         c->q.parallel_for(
                nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}},
                [=](nd_item<1> it) {
                    const size_t row = it.get_group(0);
                    const size_t lid = it.get_local_id(0);
                    const float *xr = x + row * n_cols;
+                   const float *mr = have_mask ? mask + row * n_cols : nullptr;
                    float *outr = out + row * n_cols;
 
                    float mx = -3.402823466e+38f;  // -FLT_MAX; a valid identity for max
-                   for (size_t i = lid; i < n_cols; i += WG) mx = sycl::fmax(mx, xr[i]);
+                   for (size_t i = lid; i < n_cols; i += WG) {
+                       const float v = xr[i] * scale + (have_mask ? mr[i] : 0.0f);
+                       mx = sycl::fmax(mx, v);
+                   }
                    mx = reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
 
                    float sum = 0.0f;
-                   for (size_t i = lid; i < n_cols; i += WG) sum += sycl::exp(xr[i] - mx);
+                   for (size_t i = lid; i < n_cols; i += WG) {
+                       sum += sycl::exp(xr[i] * scale + (have_mask ? mr[i] : 0.0f) - mx);
+                   }
                    sum = reduce_over_group(it.get_group(), sum, sycl::plus<float>());
 
-                   const float inv = 1.0f / sum;
+                   const float inv = 1.0f / sycl::fmax(sum, 1.175494351e-38f);
                    for (size_t i = lid; i < n_cols; i += WG) {
-                       outr[i] = sycl::exp(xr[i] - mx) * inv;
+                       outr[i] = sycl::exp(xr[i] * scale + (have_mask ? mr[i] : 0.0f) - mx) * inv;
                    }
                })
             .wait_and_throw();
@@ -709,5 +818,208 @@ int moearc_topk_router(moearc_ctx *c, unsigned int *idx, float *weights, const f
         return OK;
     } catch (...) { return ERR; }
 }
+
+// ---- elementwise --------------------------------------------------------------------
+// The residual stream's two operators. Trivial individually; named here because a transformer
+// block is mostly these and getting one of them backwards is invisible until the output is
+// subtly wrong.
+int moearc_add(moearc_ctx *c, float *out, const float *a, const float *b, unsigned long n) {
+    if (!c || !out || !a || !b) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] = a[it[0]] + b[it[0]]; })
+            .wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+int moearc_mul(moearc_ctx *c, float *out, const float *a, const float *b, unsigned long n) {
+    if (!c || !out || !a || !b) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] = a[it[0]] * b[it[0]]; })
+            .wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// out += alpha * x, accumulating in place.
+//
+// This is the MoE combine, and it is why it exists as its own kernel rather than as an `add`
+// after a `scale`. Each of the k active experts produces a vector that must be folded into one
+// running total with its router weight; doing that as scale-then-add would allocate and write a
+// full intermediate per expert, k times per token per layer.
+int moearc_axpy(moearc_ctx *c, float *out, const float *x, float alpha, unsigned long n) {
+    if (!c || !out || !x) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] += alpha * x[it[0]]; })
+            .wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// f32 -> f16, the write side of the half-precision path.
+//
+// The read side needs no kernel of its own: f16 is a format in the table above, so
+// `moearc_dequant` with `GGML_TYPE_F16` already expands one.
+int moearc_quantize_f16(moearc_ctx *c, void *dst, const float *src, unsigned long n) {
+    if (!c || !dst || !src) return ERR;
+    if (n == 0) return OK;
+    try {
+        auto *d = static_cast<unsigned short *>(dst);
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { d[it[0]] = f32_to_f16(src[it[0]]); })
+            .wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// ---- embedding lookup ----------------------------------------------------------------
+// Gather `n_tokens` rows out of a token-embedding table and expand them to f32.
+//
+// A gather and a dequantisation fused, because the table is the single largest tensor in a
+// small MoE and expanding it would be absurd: OLMoE's `token_embd.weight` is 50k x 2048 in
+// Q4_K, so materialising it as f32 costs 412 MB to read one row of 8 KB.
+//
+// 🔴 The table's format is not assumed. It is Q4_K in OLMoE and Q8_0 in the Qwen3.6 file, and
+// `type_id` comes from the GGUF tensor header rather than from a constant here.
+//
+// Rows must begin on a block boundary, which is exactly ggml's own requirement that the
+// fastest-varying dimension be a multiple of the block size.
+int moearc_embed_rows(moearc_ctx *c, unsigned int type_id, float *out, const void *table,
+                      const unsigned int *token_ids, unsigned long n_tokens,
+                      unsigned long n_embd) {
+    if (!c || !out || !table || !token_ids) return ERR;
+    const int bb = block_bytes(type_id);
+    if (bb == 0) return ERR_ARG;
+    const int be = block_elems(type_id);
+    if (n_embd == 0 || n_embd % (unsigned long) be != 0) return ERR_ARG;
+    if (n_tokens == 0) return OK;
+    try {
+        const unsigned long row_bytes = (n_embd / be) * (unsigned long) bb;
+        const auto *base = static_cast<const unsigned char *>(table);
+        c->q.parallel_for(range<1>{n_tokens * n_embd}, [=](id<1> it) {
+            const size_t g = it[0];
+            const size_t t = g / n_embd;
+            const size_t i = g % n_embd;
+            const unsigned char *row = base + (size_t) token_ids[t] * row_bytes;
+            out[g] = elem_at(type_id, row + (i / be) * (size_t) bb, (int) (i % be));
+        }).wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// ---- paged KV cache ------------------------------------------------------------------
+// Write one token's K and V into the slot the cache allocator handed out.
+//
+// The page layout is `[page][slot][kv_head][head_dim]`, head_dim contiguous. That ordering is
+// chosen for the read side: attention walks keys in time order within a head, so keeping a
+// whole head's vector contiguous makes each step one coalesced run rather than a stride.
+//
+// `page_id` and `slot` come straight from `PagedKvCache::append` in `moearc-engine`; nothing
+// here decides placement. Keeping the allocator on the host and off the device is what makes
+// it testable without a GPU — see the note at the top of `moearc-engine/src/kv.rs`.
+int moearc_kv_append(moearc_ctx *c, void *k_pages, void *v_pages, const float *k, const float *v,
+                     unsigned int page_id, unsigned int slot, unsigned long n_kv_heads,
+                     unsigned long head_dim, unsigned long page_tokens, unsigned int kv_type) {
+    if (!c || !k_pages || !v_pages || !k || !v) return ERR;
+    if (kv_type != GGML_TYPE_F32 && kv_type != GGML_TYPE_F16) return ERR_ARG;
+    if (page_tokens == 0 || slot >= page_tokens) return ERR_ARG;
+    if (n_kv_heads == 0 || head_dim == 0) return ERR_ARG;
+    try {
+        const unsigned long n = n_kv_heads * head_dim;
+        const unsigned long base = ((unsigned long) page_id * page_tokens + slot) * n;
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) {
+            const size_t i = it[0];
+            kv_store(k_pages, base + i, k[i], kv_type);
+            kv_store(v_pages, base + i, v[i], kv_type);
+        }).wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// ---- attention -----------------------------------------------------------------------
+// Single-query attention over a paged KV cache: softmax(scale * q.K^T) . V, one token in.
+//
+// 🔴 What "causal" means here, precisely. This is the decode shape — one query, which is the
+// newest token, whose K and V have already been appended. Every one of the `n_kv` cached keys
+// is therefore at or before the query, so the causal mask is satisfied by the loop bound and
+// no mask tensor is needed. That is a property of single-query decode, not a shortcut: for a
+// multi-token prefill the mask is genuinely necessary, and `moearc_softmax`'s `mask` argument
+// is what supplies it. This kernel is not a prefill kernel and does not pretend to be one.
+//
+// 🔴 The keys are read through `block_table`, not from a contiguous run. Logical key `j` lives
+// in page `block_table[j / page_tokens]` at slot `j % page_tokens`, and those pages are
+// scattered across the pool in whatever order the allocator handed them out. A kernel that
+// assumed contiguity would work perfectly on a freshly started sequence and corrupt every
+// sequence that outlived a neighbour.
+//
+// GQA: query head `h` reads KV head `h / (n_heads / n_kv_heads)`. OLMoE sets `n_kv_heads ==
+// n_heads`, so the model this is being built for exercises only the identity case; the
+// grouped case is implemented and is tested against the CPU reference on synthetic shapes, but
+// it has not been run against a real grouped-query model.
+//
+// The softmax is computed online — running max, running denominator, running weighted sum —
+// which is the flash-attention accumulation. Here it is not for speed but because the
+// alternative is a scratch buffer of `n_kv` scores per head, and `n_kv` is the context length.
+//
+// 🔴 Unoptimised: one work-group of `head_dim` lanes per head, one whole-group reduction per
+// cached key. There is no tiling, no shared memory staging of K, and no vectorised load.
+int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_pages,
+                       const void *v_pages, const unsigned int *block_table,
+                       unsigned long n_heads, unsigned long n_kv_heads, unsigned long head_dim,
+                       unsigned long n_kv, unsigned long page_tokens, float scale,
+                       unsigned int kv_type) {
+    if (!c || !out || !q || !k_pages || !v_pages || !block_table) return ERR;
+    if (kv_type != GGML_TYPE_F32 && kv_type != GGML_TYPE_F16) return ERR_ARG;
+    if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_kv == 0 || page_tokens == 0)
+        return ERR_ARG;
+    if (n_heads % n_kv_heads != 0) return ERR_ARG;
+    // One lane per channel of the head, so the accumulator lives in registers. 1024 is the
+    // smallest maximum work-group size any conformant device may report.
+    if (head_dim > 1024) return ERR_ARG;
+    try {
+        const unsigned long group = n_heads / n_kv_heads;
+        const unsigned long kv_row = n_kv_heads * head_dim;
+        c->q.parallel_for(
+               nd_range<1>{range<1>{n_heads * head_dim}, range<1>{head_dim}},
+               [=](nd_item<1> it) {
+                   const size_t h = it.get_group(0);
+                   const size_t d = it.get_local_id(0);
+                   const size_t kvh = h / group;
+                   const float qv = q[h * head_dim + d];
+
+                   float m = -3.402823466e+38f;  // running max of the scores seen so far
+                   float l = 0.0f;               // running softmax denominator
+                   float acc = 0.0f;             // running sum of p_j * V_j, this lane's channel
+
+                   for (size_t j = 0; j < n_kv; ++j) {
+                       const size_t page = block_table[j / page_tokens];
+                       const size_t slot = j % page_tokens;
+                       const unsigned long base =
+                           (page * page_tokens + slot) * kv_row + kvh * head_dim;
+
+                       const float kd = kv_load(k_pages, base + d, kv_type);
+                       const float s =
+                           reduce_over_group(it.get_group(), qv * kd, sycl::plus<float>()) * scale;
+
+                       // Rescale what has accumulated so far to the new maximum, then fold in
+                       // this key. On the first step `m` is -FLT_MAX and `corr` underflows to
+                       // zero, which correctly discards the empty accumulator.
+                       const float m_new = sycl::fmax(m, s);
+                       const float corr = sycl::exp(m - m_new);
+                       const float p = sycl::exp(s - m_new);
+                       l = l * corr + p;
+                       acc = acc * corr + p * kv_load(v_pages, base + d, kv_type);
+                       m = m_new;
+                   }
+
+                   out[h * head_dim + d] = acc / l;
+               })
+            .wait_and_throw();
+        return OK;
+    } catch (...) { return ERR; }
+}
+
 
 }  // extern "C"

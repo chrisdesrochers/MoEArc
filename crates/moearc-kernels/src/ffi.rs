@@ -93,8 +93,76 @@ unsafe extern "C" {
         c: *mut MoearcCtx,
         out: *mut c_float,
         x: *const c_float,
+        mask: *const c_float,
         n_rows: c_ulong,
         n_cols: c_ulong,
+        scale: c_float,
+    ) -> c_int;
+    pub fn moearc_add(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        a: *const c_float,
+        b: *const c_float,
+        n: c_ulong,
+    ) -> c_int;
+    pub fn moearc_mul(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        a: *const c_float,
+        b: *const c_float,
+        n: c_ulong,
+    ) -> c_int;
+    pub fn moearc_axpy(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        x: *const c_float,
+        alpha: c_float,
+        n: c_ulong,
+    ) -> c_int;
+    pub fn moearc_quantize_f16(
+        c: *mut MoearcCtx,
+        dst: *mut c_void,
+        src: *const c_float,
+        n: c_ulong,
+    ) -> c_int;
+    pub fn moearc_embed_rows(
+        c: *mut MoearcCtx,
+        type_id: c_uint,
+        out: *mut c_float,
+        table: *const c_void,
+        token_ids: *const c_uint,
+        n_tokens: c_ulong,
+        n_embd: c_ulong,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub fn moearc_kv_append(
+        c: *mut MoearcCtx,
+        k_pages: *mut c_void,
+        v_pages: *mut c_void,
+        k: *const c_float,
+        v: *const c_float,
+        page_id: c_uint,
+        slot: c_uint,
+        n_kv_heads: c_ulong,
+        head_dim: c_ulong,
+        page_tokens: c_ulong,
+        kv_type: c_uint,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub fn moearc_attn_decode(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        q: *const c_float,
+        k_pages: *const c_void,
+        v_pages: *const c_void,
+        block_table: *const c_uint,
+        n_heads: c_ulong,
+        n_kv_heads: c_ulong,
+        head_dim: c_ulong,
+        n_kv: c_ulong,
+        page_tokens: c_ulong,
+        scale: c_float,
+        kv_type: c_uint,
     ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     pub fn moearc_rope(

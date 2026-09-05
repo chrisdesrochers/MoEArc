@@ -63,6 +63,11 @@ pub fn synth_blocks(ty: QuantType, nblocks: usize, rng: &mut Rng) -> Vec<u8> {
             QuantType::Q6K => blk[208..210].copy_from_slice(&scale_bits(rng).to_le_bytes()),
             // Q8_0 carries one delta and nothing else.
             QuantType::Q80 => blk[0..2].copy_from_slice(&scale_bits(rng).to_le_bytes()),
+            // f32 and f16 are blocks of one, so the "payload" is the value itself and random
+            // bytes would be NaN or infinity often enough to make every comparison meaningless.
+            QuantType::F32 => blk[0..4].copy_from_slice(&rng.unit().to_le_bytes()),
+            QuantType::F16 => blk[0..2]
+                .copy_from_slice(&moearc_kernels::reference::f32_to_f16(rng.unit()).to_le_bytes()),
             QuantType::Q4K | QuantType::Q5K => {
                 blk[0..2].copy_from_slice(&scale_bits(rng).to_le_bytes());
                 blk[2..4].copy_from_slice(&scale_bits(rng).to_le_bytes());

@@ -37,7 +37,7 @@ pub mod reference;
 use std::ffi::CStr;
 use std::os::raw::c_int;
 
-pub use reference::{QK_K, QK8_0, QuantType, RopeKind};
+pub use reference::{KvType, QK_K, QK8_0, QuantType, RopeKind};
 
 /// A GPU context: a SYCL queue and the device it targets.
 pub struct Context {
@@ -410,7 +410,7 @@ impl Context {
         check(rc, "swiglu")
     }
 
-    /// Row-wise softmax, max-subtracted.
+    /// Row-wise softmax, max-subtracted, unmasked and unscaled.
     pub fn softmax(
         &self,
         out: &DeviceBuffer<'_>,
@@ -418,18 +418,7 @@ impl Context {
         n_rows: usize,
         n_cols: usize,
     ) -> Result<(), KernelError> {
-        x.require("softmax input", n_rows * n_cols * 4)?;
-        out.require("softmax output", n_rows * n_cols * 4)?;
-        let rc = unsafe {
-            ffi::moearc_softmax(
-                self.raw,
-                out.ptr.cast(),
-                x.ptr.cast(),
-                n_rows as ffi::c_ulong,
-                n_cols as ffi::c_ulong,
-            )
-        };
-        check(rc, "softmax")
+        self.softmax_ext(out, x, None, n_rows, n_cols, 1.0)
     }
 
     /// Rotary position embedding over `[n_tokens][n_heads][head_dim]`, head_dim contiguous.
@@ -509,6 +498,255 @@ impl Context {
             )
         };
         check(rc, "top-k router")
+    }
+
+    /// Row-wise softmax of `x * scale + mask` — `ggml_soft_max_ext` with no ALiBi.
+    ///
+    /// `mask` is additive and holds `f32::NEG_INFINITY` where a key must not be seen; that is
+    /// how a causal mask is expressed, and [`reference::causal_mask`] builds one. Passing
+    /// `None` and `scale = 1.0` gives the plain row softmax the router uses — see
+    /// [`Context::softmax`].
+    ///
+    /// A fully-masked row comes back as zeros rather than NaN. That matters more than it
+    /// sounds: one NaN row would propagate through every later matmul and destroy the whole
+    /// batch, not just the row that was empty.
+    pub fn softmax_ext(
+        &self,
+        out: &DeviceBuffer<'_>,
+        x: &DeviceBuffer<'_>,
+        mask: Option<&DeviceBuffer<'_>>,
+        n_rows: usize,
+        n_cols: usize,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        x.require("softmax input", n_rows * n_cols * 4)?;
+        out.require("softmax output", n_rows * n_cols * 4)?;
+        if let Some(m) = mask {
+            m.require("softmax mask", n_rows * n_cols * 4)?;
+        }
+        let rc = unsafe {
+            ffi::moearc_softmax(
+                self.raw,
+                out.ptr.cast(),
+                x.ptr.cast(),
+                mask.map_or(std::ptr::null(), |m| m.ptr.cast()),
+                n_rows as ffi::c_ulong,
+                n_cols as ffi::c_ulong,
+                scale,
+            )
+        };
+        check(rc, "softmax")
+    }
+
+    /// `out[i] = a[i] + b[i]` — the residual add.
+    pub fn add(
+        &self,
+        out: &DeviceBuffer<'_>,
+        a: &DeviceBuffer<'_>,
+        b: &DeviceBuffer<'_>,
+        n: usize,
+    ) -> Result<(), KernelError> {
+        a.require("add lhs", n * 4)?;
+        b.require("add rhs", n * 4)?;
+        out.require("add output", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_add(self.raw, out.ptr.cast(), a.ptr.cast(), b.ptr.cast(), n as ffi::c_ulong)
+        };
+        check(rc, "add")
+    }
+
+    /// `out[i] = a[i] * b[i]`.
+    pub fn mul(
+        &self,
+        out: &DeviceBuffer<'_>,
+        a: &DeviceBuffer<'_>,
+        b: &DeviceBuffer<'_>,
+        n: usize,
+    ) -> Result<(), KernelError> {
+        a.require("mul lhs", n * 4)?;
+        b.require("mul rhs", n * 4)?;
+        out.require("mul output", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_mul(self.raw, out.ptr.cast(), a.ptr.cast(), b.ptr.cast(), n as ffi::c_ulong)
+        };
+        check(rc, "mul")
+    }
+
+    /// `out[i] += alpha * x[i]`, in place — the MoE combine.
+    ///
+    /// Each active expert's output is folded into one running total with its router weight.
+    /// Doing that as a scale followed by an add would write a full intermediate vector per
+    /// expert, `k` times per token per layer, for no reason.
+    pub fn axpy(
+        &self,
+        out: &DeviceBuffer<'_>,
+        x: &DeviceBuffer<'_>,
+        alpha: f32,
+        n: usize,
+    ) -> Result<(), KernelError> {
+        x.require("axpy input", n * 4)?;
+        out.require("axpy accumulator", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_axpy(self.raw, out.ptr.cast(), x.ptr.cast(), alpha, n as ffi::c_ulong)
+        };
+        check(rc, "axpy")
+    }
+
+    /// Convert `n` f32 to f16 on the device, round-to-nearest-even.
+    ///
+    /// The read side needs no counterpart: f16 is a [`QuantType`], so [`Context::dequant`]
+    /// already expands one and [`Context::matvec_q`] already consumes one.
+    pub fn quantize_f16(
+        &self,
+        dst: &DeviceBuffer<'_>,
+        src: &DeviceBuffer<'_>,
+        n: usize,
+    ) -> Result<(), KernelError> {
+        src.require("f16 conversion input", n * 4)?;
+        dst.require("f16 conversion output", n * 2)?;
+        let rc = unsafe {
+            ffi::moearc_quantize_f16(self.raw, dst.ptr, src.ptr.cast(), n as ffi::c_ulong)
+        };
+        check(rc, "f16 conversion")
+    }
+
+    /// Gather token rows out of an embedding table and expand them to f32.
+    ///
+    /// 🔴 `ty` comes from the GGUF tensor header, never from an assumption. The table is Q4_K in
+    /// OLMoE and Q8_0 in the Qwen3.6 file; hard-coding either would silently misread the other.
+    ///
+    /// `token_ids` is a device buffer of `u32`. Out-of-range ids are **not** checked — the
+    /// kernel would read outside the table. The caller holds the vocabulary size and is the only
+    /// party that can check cheaply.
+    pub fn embed_rows(
+        &self,
+        ty: QuantType,
+        out: &DeviceBuffer<'_>,
+        table: &DeviceBuffer<'_>,
+        token_ids: &DeviceBuffer<'_>,
+        n_tokens: usize,
+        n_embd: usize,
+    ) -> Result<(), KernelError> {
+        if n_embd % ty.block_elems() != 0 {
+            return Err(KernelError::BadArgument("n_embd is not a whole number of blocks"));
+        }
+        token_ids.require("token ids", n_tokens * 4)?;
+        out.require("embedding output", n_tokens * n_embd * 4)?;
+        let rc = unsafe {
+            ffi::moearc_embed_rows(
+                self.raw,
+                ty.type_id(),
+                out.ptr.cast(),
+                table.ptr,
+                token_ids.ptr.cast(),
+                n_tokens as ffi::c_ulong,
+                n_embd as ffi::c_ulong,
+            )
+        };
+        check(rc, "embedding lookup")
+    }
+
+    /// Write one token's K and V into the page slot the cache allocator handed out.
+    ///
+    /// `page_id` and `slot` are exactly what `moearc_engine::kv::PagedKvCache::append` returns.
+    /// The layout written is `[page][slot][kv_head][head_dim]`, which is what
+    /// [`Context::attn_decode`] reads and what [`reference::kv_index`] computes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append(
+        &self,
+        k_pages: &DeviceBuffer<'_>,
+        v_pages: &DeviceBuffer<'_>,
+        k: &DeviceBuffer<'_>,
+        v: &DeviceBuffer<'_>,
+        page_id: u32,
+        slot: u32,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_tokens: usize,
+        kv: KvType,
+    ) -> Result<(), KernelError> {
+        let row = n_kv_heads * head_dim;
+        k.require("key vector", row * 4)?;
+        v.require("value vector", row * 4)?;
+        let need = (page_id as usize * page_tokens + slot as usize + 1) * row * kv.elem_bytes();
+        k_pages.require("key pages", need)?;
+        v_pages.require("value pages", need)?;
+        let rc = unsafe {
+            ffi::moearc_kv_append(
+                self.raw,
+                k_pages.ptr,
+                v_pages.ptr,
+                k.ptr.cast(),
+                v.ptr.cast(),
+                page_id,
+                slot as std::os::raw::c_uint,
+                n_kv_heads as ffi::c_ulong,
+                head_dim as ffi::c_ulong,
+                page_tokens as ffi::c_ulong,
+                kv.type_id(),
+            )
+        };
+        check(rc, "KV append")
+    }
+
+    /// Single-query attention over the paged KV cache: `softmax(scale * q.K^T) . V`.
+    ///
+    /// 🔴 This is the **decode** shape and only that: one query token, whose own K and V have
+    /// already been appended. Every cached key is then at or before the query, so causality is
+    /// the loop bound `j < n_kv` and no mask tensor is involved. A multi-token prefill genuinely
+    /// needs the mask, and [`Context::softmax_ext`] is where that lives — this kernel does not
+    /// cover prefill and does not pretend to.
+    ///
+    /// Keys are reached through `block_table`, which maps a sequence's logical page index to a
+    /// physical page. The pages are not contiguous and must not be assumed to be: a sequence
+    /// that outlives a neighbour gets whatever the allocator has free.
+    ///
+    /// GQA is implemented — query head `h` reads KV head `h / (n_heads / n_kv_heads)` — but the
+    /// model this targets sets `n_kv_heads == n_heads`, so only synthetic shapes have exercised
+    /// the grouped case.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode(
+        &self,
+        out: &DeviceBuffer<'_>,
+        q: &DeviceBuffer<'_>,
+        k_pages: &DeviceBuffer<'_>,
+        v_pages: &DeviceBuffer<'_>,
+        block_table: &DeviceBuffer<'_>,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_kv: usize,
+        page_tokens: usize,
+        scale: f32,
+        kv: KvType,
+    ) -> Result<(), KernelError> {
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(KernelError::BadArgument("n_heads is not a multiple of n_kv_heads"));
+        }
+        if page_tokens == 0 {
+            return Err(KernelError::BadArgument("page_tokens must be non-zero"));
+        }
+        q.require("query", n_heads * head_dim * 4)?;
+        out.require("attention output", n_heads * head_dim * 4)?;
+        block_table.require("block table", n_kv.div_ceil(page_tokens) * 4)?;
+        let rc = unsafe {
+            ffi::moearc_attn_decode(
+                self.raw,
+                out.ptr.cast(),
+                q.ptr.cast(),
+                k_pages.ptr,
+                v_pages.ptr,
+                block_table.ptr.cast(),
+                n_heads as ffi::c_ulong,
+                n_kv_heads as ffi::c_ulong,
+                head_dim as ffi::c_ulong,
+                n_kv as ffi::c_ulong,
+                page_tokens as ffi::c_ulong,
+                scale,
+                kv.type_id(),
+            )
+        };
+        check(rc, "paged attention")
     }
 }
 

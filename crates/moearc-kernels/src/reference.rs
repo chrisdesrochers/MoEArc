@@ -21,6 +21,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum QuantType {
+    /// Not quantised at all — a "block" of one element. Present so that f32 tensors (norm
+    /// weights, the router's `ffn_gate_inp`) go through the same code path as quantised ones.
+    F32 = 0,
+    /// Half precision, also a block of one. This is the read side of the f16 path: the KV
+    /// cache and any f16 weight expand through the same `dequant` entry point.
+    F16 = 1,
     /// The legacy 8-bit format: 32 elements, one f16 delta, no minimum. A Q4_K_M quantisation
     /// of Qwen3 holds 251 of these against 80 Q4_K, 37 Q5_K and 4 Q6_K, so it is not optional.
     Q80 = 8,
@@ -43,6 +49,8 @@ impl QuantType {
     /// `128 + 64 + 16 + 2`.
     pub const fn block_bytes(self) -> usize {
         match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
             Self::Q80 => 34,
             Self::Q4K => 144,
             Self::Q5K => 176,
@@ -54,6 +62,7 @@ impl QuantType {
     /// Q8_0 packs 32 — so anything sizing a buffer must ask rather than assume `QK_K`.
     pub const fn block_elems(self) -> usize {
         match self {
+            Self::F32 | Self::F16 => 1,
             Self::Q80 => QK8_0,
             Self::Q4K | Self::Q5K | Self::Q6K => QK_K,
         }
@@ -67,6 +76,8 @@ impl QuantType {
     /// Resolve a GGUF type id, or `None` if this crate cannot expand it.
     pub const fn from_type_id(id: u32) -> Option<Self> {
         match id {
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
             8 => Some(Self::Q80),
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
@@ -136,6 +147,8 @@ pub fn dequant(ty: QuantType, src: &[u8], nblocks: usize) -> Vec<f32> {
         let blk = &src[b * bb..(b + 1) * bb];
         let y = &mut out[b * be..(b + 1) * be];
         match ty {
+            QuantType::F32 => y[0] = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]),
+            QuantType::F16 => y[0] = ld_f16(blk, 0),
             QuantType::Q80 => dequant_block_q8_0(blk, y),
             QuantType::Q4K => dequant_block_q4_k(blk, y),
             QuantType::Q5K => dequant_block_q5_k(blk, y),
@@ -311,17 +324,55 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
 
 /// Row-wise softmax, max-subtracted, summed in `f64`.
 pub fn softmax(x: &[f32], n_rows: usize, n_cols: usize) -> Vec<f32> {
+    softmax_ext(x, None, n_rows, n_cols, 1.0)
+}
+
+/// `softmax(x * scale + mask)` — `ggml_soft_max_ext` with no ALiBi.
+///
+/// The mask is additive and holds `-inf` where a key must not be seen, which is how causality
+/// is expressed. Summed in `f64`; the GPU sums in `f32`.
+pub fn softmax_ext(
+    x: &[f32],
+    mask: Option<&[f32]>,
+    n_rows: usize,
+    n_cols: usize,
+    scale: f32,
+) -> Vec<f32> {
     assert_eq!(x.len(), n_rows * n_cols);
+    if let Some(m) = mask {
+        assert_eq!(m.len(), n_rows * n_cols);
+    }
+    let at = |i: usize| x[i] * scale + mask.map_or(0.0, |m| m[i]);
     let mut out = vec![0.0f32; x.len()];
     for r in 0..n_rows {
-        let row = &x[r * n_cols..(r + 1) * n_cols];
-        let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f64 = row.iter().map(|v| f64::from((v - mx).exp())).sum();
-        for (c, v) in row.iter().enumerate() {
-            out[r * n_cols + c] = (f64::from((v - mx).exp()) / sum) as f32;
+        let lo = r * n_cols;
+        let mx = (lo..lo + n_cols).map(at).fold(f32::NEG_INFINITY, f32::max);
+        let sum: f64 = (lo..lo + n_cols).map(|i| f64::from((at(i) - mx).exp())).sum();
+        // A fully-masked row would divide by zero and poison everything downstream with NaN;
+        // clamping to the smallest normal f32 makes it come back as zeros instead. The kernel
+        // does the same.
+        let denom = sum.max(f64::from(f32::MIN_POSITIVE));
+        for c in 0..n_cols {
+            out[lo + c] = (f64::from((at(lo + c) - mx).exp()) / denom) as f32;
         }
     }
     out
+}
+
+/// An additive causal mask for `n_q` queries against `n_kv` keys, the queries being the last
+/// `n_q` of them. Zero where a key is visible, `-inf` where it is not.
+pub fn causal_mask(n_q: usize, n_kv: usize) -> Vec<f32> {
+    assert!(n_kv >= n_q);
+    let first = n_kv - n_q;
+    let mut m = vec![0.0f32; n_q * n_kv];
+    for i in 0..n_q {
+        for j in 0..n_kv {
+            if j > first + i {
+                m[i * n_kv + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    m
 }
 
 /// Which pairs of channels RoPE rotates together.
@@ -421,6 +472,231 @@ pub fn topk_router(
         wts.extend(w);
     }
     (idx, wts)
+}
+
+/// IEEE-754 binary32 to binary16, round-to-nearest-even.
+///
+/// Written out for the same reason [`f16_to_f32`] is: Rust has no stable `f16`, and the
+/// rounding rule is part of the contract rather than an implementation detail. ggml rounds with
+/// the hardware `_cvtss_sh`, which is RNE, so RNE is what this does — ties to even, subnormals
+/// rounded rather than flushed to zero, overflow to infinity, and a NaN that stays a NaN.
+pub fn f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let e32 = (x >> 23) & 0xFF;
+    let mut mant = x & 0x007F_FFFF;
+
+    if e32 == 0xFF {
+        // Preserve NaN-ness: collapsing a NaN to infinity would turn a loud failure quiet.
+        let payload = if mant != 0 { 0x0200 | (mant >> 13) as u16 } else { 0 };
+        return sign | 0x7C00 | payload;
+    }
+
+    let mut exp = e32 as i32 - 127 + 15;
+    if exp >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        mant |= 0x0080_0000;
+        let shift = 14 - exp; // 14..=24
+        let t = mant >> shift;
+        let rem = mant & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        let round = u32::from(rem > half || (rem == half && t & 1 == 1));
+        // A carry out of the mantissa lands in the exponent field by itself, which is exactly
+        // right: the value rounds up to the smallest normal.
+        return sign | (t + round) as u16;
+    }
+
+    let mut t = mant >> 13;
+    let rem = mant & 0x1FFF;
+    if rem > 0x1000 || (rem == 0x1000 && t & 1 == 1) {
+        t += 1;
+        if t == 0x400 {
+            t = 0;
+            exp += 1;
+            if exp >= 0x1F {
+                return sign | 0x7C00;
+            }
+        }
+    }
+    sign | ((exp as u16) << 10) | t as u16
+}
+
+/// `out[i] = a[i] + b[i]` — the residual add.
+pub fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+
+/// `out[i] = a[i] * b[i]`.
+pub fn mul(a: &[f32], b: &[f32]) -> Vec<f32> {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| x * y).collect()
+}
+
+/// `out[i] += alpha * x[i]` — the MoE combine, folding one expert's output into the total.
+pub fn axpy(out: &mut [f32], x: &[f32], alpha: f32) {
+    assert_eq!(out.len(), x.len());
+    for (o, v) in out.iter_mut().zip(x) {
+        *o += alpha * v;
+    }
+}
+
+/// Gather and expand `token_ids.len()` rows of an embedding table.
+pub fn embed_rows(ty: QuantType, table: &[u8], token_ids: &[u32], n_embd: usize) -> Vec<f32> {
+    let be = ty.block_elems();
+    assert_eq!(n_embd % be, 0, "an embedding row must be a whole number of {be}-element blocks");
+    let row_bytes = (n_embd / be) * ty.block_bytes();
+    let mut out = Vec::with_capacity(token_ids.len() * n_embd);
+    for &t in token_ids {
+        let off = t as usize * row_bytes;
+        out.extend(dequant(ty, &table[off..off + row_bytes], n_embd / be));
+    }
+    out
+}
+
+/// How a KV cache page stores its numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvType {
+    F32,
+    /// Half the footprint and half the bandwidth, at the cost of ~3 decimal digits on each
+    /// cached key and value. The reference models that loss rather than ignoring it.
+    F16,
+}
+
+impl KvType {
+    /// The GGUF type id that crosses the C ABI.
+    pub const fn type_id(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+        }
+    }
+
+    /// Bytes one cached number occupies.
+    pub const fn elem_bytes(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
+        }
+    }
+
+    /// The value that actually lands in the cache — for f16, after a round trip through the
+    /// narrower format.
+    pub fn store(self, v: f32) -> f32 {
+        match self {
+            Self::F32 => v,
+            Self::F16 => f16_to_f32(f32_to_f16(v)),
+        }
+    }
+}
+
+/// Index of channel `d` of head `h` at (`page`, `slot`) in a KV page pool.
+///
+/// The layout is `[page][slot][kv_head][head_dim]`, head_dim contiguous. Written once, here, so
+/// the kernel and the reference cannot disagree about it — a layout mismatch between writer and
+/// reader is silent and produces plausible-looking garbage.
+pub fn kv_index(
+    page: u32,
+    slot: u32,
+    head: usize,
+    d: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    page_tokens: usize,
+) -> usize {
+    ((page as usize * page_tokens + slot as usize) * n_kv_heads + head) * head_dim + d
+}
+
+/// Write one token's K and V into a page slot.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append(
+    k_pages: &mut [f32],
+    v_pages: &mut [f32],
+    k: &[f32],
+    v: &[f32],
+    page_id: u32,
+    slot: u32,
+    n_kv_heads: usize,
+    head_dim: usize,
+    page_tokens: usize,
+    kv: KvType,
+) {
+    assert_eq!(k.len(), n_kv_heads * head_dim);
+    assert_eq!(v.len(), n_kv_heads * head_dim);
+    for h in 0..n_kv_heads {
+        for d in 0..head_dim {
+            let i = kv_index(page_id, slot, h, d, n_kv_heads, head_dim, page_tokens);
+            k_pages[i] = kv.store(k[h * head_dim + d]);
+            v_pages[i] = kv.store(v[h * head_dim + d]);
+        }
+    }
+}
+
+/// Single-query attention over a paged KV cache: `softmax(scale * q.K^T) . V`.
+///
+/// 🔴 Deliberately not written the way the kernel is. This materialises every score, takes the
+/// maximum, exponentiates, and divides — the textbook two-pass softmax — in `f64`. The kernel
+/// accumulates online in `f32`, rescaling as the running maximum moves. The two agree
+/// mathematically and are different programs, which is the only reason comparing them means
+/// anything.
+///
+/// Causality is the loop bound: `n_kv` counts the keys at or before the query, which for decode
+/// is every key in the cache including the query's own, already appended.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_decode(
+    q: &[f32],
+    k_pages: &[f32],
+    v_pages: &[f32],
+    block_table: &[u32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_kv: usize,
+    page_tokens: usize,
+    scale: f32,
+) -> Vec<f32> {
+    assert_eq!(q.len(), n_heads * head_dim);
+    assert!(n_kv > 0 && n_heads % n_kv_heads == 0);
+    assert!(block_table.len() >= n_kv.div_ceil(page_tokens));
+    let group = n_heads / n_kv_heads;
+    let mut out = vec![0.0f32; n_heads * head_dim];
+
+    for h in 0..n_heads {
+        let kvh = h / group;
+        let qh = &q[h * head_dim..(h + 1) * head_dim];
+
+        let scores: Vec<f64> = (0..n_kv)
+            .map(|j| {
+                let page = block_table[j / page_tokens];
+                let slot = (j % page_tokens) as u32;
+                let base = kv_index(page, slot, kvh, 0, n_kv_heads, head_dim, page_tokens);
+                let dot: f64 =
+                    (0..head_dim).map(|d| f64::from(qh[d]) * f64::from(k_pages[base + d])).sum();
+                dot * f64::from(scale)
+            })
+            .collect();
+
+        let mx = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+        let denom: f64 = exps.iter().sum();
+
+        for d in 0..head_dim {
+            let mut acc = 0.0f64;
+            for (j, e) in exps.iter().enumerate() {
+                let page = block_table[j / page_tokens];
+                let slot = (j % page_tokens) as u32;
+                let base = kv_index(page, slot, kvh, 0, n_kv_heads, head_dim, page_tokens);
+                acc += e * f64::from(v_pages[base + d]);
+            }
+            out[h * head_dim + d] = (acc / denom) as f32;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
