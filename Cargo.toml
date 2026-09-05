@@ -6,6 +6,7 @@ members = [
     "crates/moearc-model",
     "crates/moearc-cli",
     "crates/moearc-kernels",
+    "crates/moearc-server",
 ]
 
 [workspace.package]
