@@ -44,4 +44,8 @@ credentials*
 
 # transient sweep run-state (results and log ARE committed as evidence)
 bench/baselines/.sweep.status
+bench/baselines/.m0.status
 bench/baselines/sweep.log
+
+# rust build output
+target/
