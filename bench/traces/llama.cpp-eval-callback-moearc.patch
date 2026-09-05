@@ -1,0 +1,286 @@
+diff --git a/examples/eval-callback/eval-callback.cpp b/examples/eval-callback/eval-callback.cpp
+index 4ce8d600b..cfffdcefe 100644
+--- a/examples/eval-callback/eval-callback.cpp
++++ b/examples/eval-callback/eval-callback.cpp
+@@ -2,12 +2,247 @@
+ #include "common.h"
+ #include "debug.h"
+ #include "log.h"
++#include "sampling.h"
+ #include "llama.h"
+ 
+ #include <clocale>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
+ #include <string>
+ #include <vector>
+ 
++// ---------------------------------------------------------------------------
++// MoEArc expert-routing capture.
++//
++// Enabled only when MOEARC_TRACE_OUT is set; otherwise this file behaves exactly
++// as it did upstream. When enabled it installs its own ggml eval callback that
++// records the contents of every `ffn_moe_topk-<il>` tensor, runs a prefill and
++// then a real token-by-token decode loop, and writes two NDJSON files:
++//   $MOEARC_TRACE_OUT.prefill.ndjson
++//   $MOEARC_TRACE_OUT.decode.ndjson
++//
++// Extra env vars:
++//   MOEARC_TRACE_META  - raw JSON fragment spliced into the header line
++//   MOEARC_TEXT_OUT    - if set, the generated text is written there
++// ---------------------------------------------------------------------------
++
++static std::vector<std::string> * g_sink   = nullptr;
++static const char *               g_phase  = "prefill";
++static int                        g_step   = 0;
++static int                        g_pos    = 0;
++static int                        g_last_layer = -1;
++static std::map<int, std::vector<std::pair<int, int>>> g_rows;
++static std::vector<uint8_t>       g_buf;
++static int                        g_n_expert_used  = 0;   // measured: ne[0] of ffn_moe_topk
++static int                        g_n_layers_routed = 0;  // measured: distinct MoE layers seen
++
++static void moearc_flush_ubatch() {
++    if (g_sink != nullptr) {
++        for (const auto & kv : g_rows) {
++            std::string line;
++            line.reserve(16 + kv.second.size() * 8);
++            char head[128];
++            snprintf(head, sizeof(head), "{\"step\":%d,\"phase\":\"%s\",\"pos\":%d,\"e\":[",
++                     g_step, g_phase, g_pos + kv.first);
++            line += head;
++            for (size_t i = 0; i < kv.second.size(); ++i) {
++                char pair[32];
++                snprintf(pair, sizeof(pair), "%s%d,%d",
++                         i == 0 ? "" : ",", kv.second[i].first, kv.second[i].second);
++                line += pair;
++            }
++            line += "]}";
++            g_sink->push_back(line);
++            g_step++;
++        }
++    }
++    g_pos += (int) g_rows.size();
++    g_rows.clear();
++    g_last_layer = -1;
++}
++
++static bool moearc_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
++    (void) user_data;
++
++    const bool is_topk = strncmp(t->name, "ffn_moe_topk-", 13) == 0;
++
++    if (ask) {
++        return is_topk;   // only this tensor's data is ever needed
++    }
++    if (!is_topk) {
++        return true;
++    }
++
++    GGML_ASSERT(t->type == GGML_TYPE_I32);
++    GGML_ASSERT(t->ne[2] == 1 && t->ne[3] == 1);
++
++    const int layer = atoi(t->name + 13);
++    if (layer + 1 > g_n_layers_routed) {
++        g_n_layers_routed = layer + 1;
++    }
++    g_n_expert_used = (int) t->ne[0];
++
++    const uint8_t * data;
++    if (ggml_backend_buffer_is_host(t->buffer)) {
++        data = (const uint8_t *) t->data;
++    } else {
++        const size_t n_bytes = ggml_nbytes(t);
++        g_buf.resize(n_bytes);
++        ggml_backend_tensor_get(t, g_buf.data(), 0, n_bytes);
++        data = g_buf.data();
++    }
++
++    // Layers arrive in increasing order within one ubatch; a non-increasing layer
++    // index means a new ubatch has started, so close the previous one out.
++    if (layer <= g_last_layer) {
++        moearc_flush_ubatch();
++    }
++    g_last_layer = layer;
++
++    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
++        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
++            const int32_t e = *(const int32_t *) (data + i1 * t->nb[1] + i0 * t->nb[0]);
++            g_rows[(int) i1].emplace_back(layer, (int) e);
++        }
++    }
++
++    return true;
++}
++
++static bool moearc_write(const std::string & path,
++                         const std::string & header,
++                         const std::vector<std::string> & lines) {
++    FILE * f = fopen(path.c_str(), "w");
++    if (f == nullptr) {
++        LOG_ERR("failed to open %s for writing\n", path.c_str());
++        return false;
++    }
++    fprintf(f, "%s\n", header.c_str());
++    for (const auto & l : lines) {
++        fprintf(f, "%s\n", l.c_str());
++    }
++    fclose(f);
++    return true;
++}
++
++static bool run_moearc_capture(llama_context * ctx, common_params & params, const std::string & prefix) {
++    const llama_model * model = llama_get_model(ctx);
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    const bool add_bos = llama_vocab_get_add_bos(vocab);
++
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
++    if (tokens.empty()) {
++        LOG_ERR("%s : no input tokens\n", __func__);
++        return false;
++    }
++    LOG_INF("moearc: prompt tokens = %zu, n_predict = %d\n", tokens.size(), params.n_predict);
++
++    std::vector<std::string> prefill_lines;
++    std::vector<std::string> decode_lines;
++
++    // ---- prefill -----------------------------------------------------------
++    g_sink = &prefill_lines;
++    g_phase = "prefill";
++    g_step = 0;
++    g_pos = 0;
++    g_last_layer = -1;
++    g_rows.clear();
++
++    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
++        LOG_ERR("%s : prefill failed\n", __func__);
++        return false;
++    }
++    moearc_flush_ubatch();
++
++    // ---- decode ------------------------------------------------------------
++    g_sink = &decode_lines;
++    g_phase = "decode";
++    g_step = 0;
++    g_pos = (int) tokens.size();
++    g_last_layer = -1;
++    g_rows.clear();
++
++    struct common_sampler * smpl = common_sampler_init(model, params.sampling);
++    if (smpl == nullptr) {
++        LOG_ERR("%s : failed to init sampler\n", __func__);
++        return false;
++    }
++    for (const auto tok : tokens) {
++        common_sampler_accept(smpl, tok, false);
++    }
++
++    std::string text;
++    bool hit_eog = false;
++    int n_decoded = 0;
++
++    for (int i = 0; i < params.n_predict; ++i) {
++        const llama_token id = common_sampler_sample(smpl, ctx, -1);
++        common_sampler_accept(smpl, id, true);
++
++        if (llama_vocab_is_eog(vocab, id)) {
++            hit_eog = true;
++            LOG_INF("moearc: end-of-generation sampled after %d decode steps\n", n_decoded);
++            break;
++        }
++        text += common_token_to_piece(ctx, id);
++
++        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(&id), 1))) {
++            LOG_ERR("%s : decode failed at step %d\n", __func__, i);
++            break;
++        }
++        moearc_flush_ubatch();
++        n_decoded++;
++
++        if (n_decoded % 50 == 0) {
++            LOG_INF("moearc: %d decode steps captured\n", n_decoded);
++        }
++    }
++    common_sampler_free(smpl);
++
++    const char * meta = getenv("MOEARC_TRACE_META");
++
++    char tail[2048];
++    snprintf(tail, sizeof(tail),
++             "\"n_layer\":%d,\"n_layers_routed\":%d,\"n_expert_used\":%d,"
++             "\"n_prompt_tokens\":%d,\"n_prefill_steps\":%zu,\"n_decode_steps\":%zu,"
++             "\"hit_eog\":%s,%s}",
++             (int) llama_model_n_layer(model),
++             g_n_layers_routed,
++             g_n_expert_used,
++             (int) tokens.size(),
++             prefill_lines.size(),
++             decode_lines.size(),
++             hit_eog ? "true" : "false",
++             meta ? meta : "\"meta\":null");
++
++    const std::string hdr_prefill =
++        std::string("{\"format\":\"moearc-trace-v1\",\"phase\":\"prefill\",") + tail;
++    const std::string hdr_decode =
++        std::string("{\"format\":\"moearc-trace-v1\",\"phase\":\"decode\",") + tail;
++
++    bool ok = true;
++    ok &= moearc_write(prefix + ".prefill.ndjson", hdr_prefill, prefill_lines);
++    ok &= moearc_write(prefix + ".decode.ndjson",  hdr_decode,  decode_lines);
++
++    const char * text_out = getenv("MOEARC_TEXT_OUT");
++    if (text_out != nullptr) {
++        FILE * f = fopen(text_out, "w");
++        if (f != nullptr) {
++            fwrite(text.data(), 1, text.size(), f);
++            fclose(f);
++        }
++    }
++
++    LOG_INF("moearc: wrote %zu prefill steps and %zu decode steps to %s.{prefill,decode}.ndjson\n",
++            prefill_lines.size(), decode_lines.size(), prefix.c_str());
++
++    g_sink = nullptr;
++    return ok;
++}
++
+ static bool run(llama_context * ctx, const common_params & params) {
+     const llama_model * model = llama_get_model(ctx);
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+@@ -47,13 +282,20 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    const char * trace_out = getenv("MOEARC_TRACE_OUT");
++
+     llama_backend_init();
+     llama_numa_init(params.numa);
+ 
+     // pass the callback to the backend scheduler
+     // it will be executed for each node during the graph computation
+-    params.cb_eval = common_debug_cb_eval;
+-    params.cb_eval_user_data = &cb_data;
++    if (trace_out != nullptr) {
++        params.cb_eval = moearc_cb_eval;
++        params.cb_eval_user_data = nullptr;
++    } else {
++        params.cb_eval = common_debug_cb_eval;
++        params.cb_eval_user_data = &cb_data;
++    }
+     params.warmup = false;
+ 
+     // init
+@@ -74,7 +316,9 @@ int main(int argc, char ** argv) {
+         LOG_INF("\n");
+     }
+ 
+-    bool OK = run(ctx, params);
++    bool OK = trace_out != nullptr
++        ? run_moearc_capture(ctx, params, std::string(trace_out))
++        : run(ctx, params);
+     if (!OK) {
+         return 1;
+     }

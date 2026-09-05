@@ -98,6 +98,125 @@ impl Trace {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reading a captured trace
+// ---------------------------------------------------------------------------
+
+/// A trace read from a capture file, with its provenance header preserved verbatim.
+///
+/// The header is kept as the raw JSON line rather than parsed into fields. Two reasons: adding
+/// a field to the capture tool must never break this loader, and a result is only citable if
+/// the exact provenance that came with it survives intact — model, quantisation, prompt,
+/// llama.cpp commit and capture date.
+#[derive(Debug, Clone)]
+pub struct LoadedTrace {
+    pub header: String,
+    pub trace: Trace,
+}
+
+/// Why a capture file could not be read.
+#[derive(Debug)]
+pub enum TraceLoadError {
+    Io(std::io::Error),
+    /// The file was empty, so there is not even a header.
+    MissingHeader,
+    /// The first line is not a `moearc-trace-v1` header.
+    UnknownFormat(String),
+    /// A step line could not be read. Malformed input is refused rather than skipped: a trace
+    /// that silently drops steps would understate every miss count computed from it.
+    MalformedStep {
+        line: usize,
+        reason: &'static str,
+    },
+    /// A header with no step lines after it.
+    NoSteps,
+}
+
+impl std::fmt::Display for TraceLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "reading trace file: {e}"),
+            Self::MissingHeader => write!(f, "trace file is empty: no header line"),
+            Self::UnknownFormat(got) => {
+                write!(f, "not a moearc-trace-v1 file; first line begins: {got}")
+            }
+            Self::MalformedStep { line, reason } => {
+                write!(f, "malformed step on line {line}: {reason}")
+            }
+            Self::NoSteps => write!(f, "trace file has a header but no step lines"),
+        }
+    }
+}
+
+impl std::error::Error for TraceLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// The key holding a step's activations. See `bench/traces/README.md` for the full format.
+const EXPERTS_KEY: &str = "\"e\":[";
+
+impl Trace {
+    /// Read a trace from an NDJSON capture file.
+    ///
+    /// Line 1 is a header object; every line after it is one decode (or prefill) step. Only the
+    /// `"e"` array is read from a step — a flat list of `layer, expert, layer, expert, …`. The
+    /// parser is hand-rolled rather than using `serde_json` so that the simulation half of the
+    /// crate keeps no runtime dependencies at all.
+    pub fn from_ndjson_file<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<LoadedTrace, TraceLoadError> {
+        let text = std::fs::read_to_string(path).map_err(TraceLoadError::Io)?;
+        Self::from_ndjson_str(&text)
+    }
+
+    /// Parse a trace already in memory. See [`Trace::from_ndjson_file`].
+    pub fn from_ndjson_str(text: &str) -> Result<LoadedTrace, TraceLoadError> {
+        let mut lines = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+
+        let (_, header) = lines.next().ok_or(TraceLoadError::MissingHeader)?;
+        if !header.contains("\"format\":\"moearc-trace-v1\"") {
+            return Err(TraceLoadError::UnknownFormat(header.chars().take(60).collect()));
+        }
+
+        let mut steps: Vec<Vec<ExpertRef>> = Vec::new();
+        for (idx, line) in lines {
+            let lineno = idx + 1;
+            let bad = |reason| TraceLoadError::MalformedStep { line: lineno, reason };
+
+            let start = line.find(EXPERTS_KEY).ok_or_else(|| bad("no \"e\":[...] field"))?
+                + EXPERTS_KEY.len();
+            let rest = &line[start..];
+            let end = rest.find(']').ok_or_else(|| bad("unterminated \"e\" array"))?;
+
+            let body = rest[..end].trim();
+            let mut flat: Vec<u16> = Vec::new();
+            if !body.is_empty() {
+                for tok in body.split(',') {
+                    let v: u16 = tok
+                        .trim()
+                        .parse()
+                        .map_err(|_| bad("expected a non-negative integer below 65536"))?;
+                    flat.push(v);
+                }
+            }
+            if flat.len() % 2 != 0 {
+                return Err(bad("odd number of integers; expected layer,expert pairs"));
+            }
+            steps.push(flat.chunks_exact(2).map(|c| ExpertRef::new(c[0], c[1])).collect());
+        }
+
+        if steps.is_empty() {
+            return Err(TraceLoadError::NoSteps);
+        }
+        Ok(LoadedTrace { header: header.to_string(), trace: Trace { steps } })
+    }
+}
+
 /// A residency policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
@@ -324,7 +443,11 @@ fn choose_victim(
     step_idx: usize,
     policy: Policy,
 ) -> Option<ExpertRef> {
-    let candidates = resident.iter().copied().filter(|r| !pinned.contains(r));
+    // `pinned` is sorted and deduplicated by the caller, so a binary search is exactly
+    // equivalent to `contains` here — and necessary: at the capacities a real card gives
+    // (thousands of slots) a linear scan of the pin list inside a scan of the resident set
+    // makes a full-length trace take hours instead of seconds.
+    let candidates = resident.iter().copied().filter(|r| pinned.binary_search(r).is_err());
     match policy {
         Policy::Lru => candidates.min_by_key(|e| last_used.get(e).copied().unwrap_or(0)),
         Policy::Lfu => candidates.min_by_key(|e| use_count.get(e).copied().unwrap_or(0)),
@@ -595,5 +718,87 @@ mod tests {
         assert_eq!(t.demands(), 10 * 4 * 2);
         assert_eq!(t.peak_step_demand(), 8);
         assert!(t.working_set() <= 32);
+    }
+
+    const SAMPLE: &str = concat!(
+        "{\"format\":\"moearc-trace-v1\",\"phase\":\"decode\",\"n_layer\":2}\n",
+        "{\"step\":0,\"phase\":\"decode\",\"pos\":5,\"e\":[0,7,0,9,1,3]}\n",
+        "{\"step\":1,\"phase\":\"decode\",\"pos\":6,\"e\":[0,7,1,3,1,4]}\n"
+    );
+
+    #[test]
+    fn a_capture_file_round_trips_into_a_trace() {
+        let loaded = Trace::from_ndjson_str(SAMPLE).unwrap();
+        assert!(loaded.header.contains("moearc-trace-v1"), "header must be kept verbatim");
+        assert_eq!(loaded.trace.steps.len(), 2);
+        assert_eq!(
+            loaded.trace.steps[0],
+            vec![ExpertRef::new(0, 7), ExpertRef::new(0, 9), ExpertRef::new(1, 3)]
+        );
+        assert_eq!(loaded.trace.demands(), 6);
+        assert_eq!(loaded.trace.working_set(), 4);
+        assert_eq!(loaded.trace.peak_step_demand(), 3);
+    }
+
+    #[test]
+    fn a_loaded_trace_simulates_like_any_other() {
+        let t = Trace::from_ndjson_str(SAMPLE).unwrap().trace;
+        let r = simulate(&t, 8, Policy::Lru, MIB).unwrap();
+        assert_eq!(r.demands, 6);
+        assert_eq!(r.compulsory_misses, 4, "four distinct experts, each fetched once");
+        assert_eq!(r.hits, 2, "(0,7) and (1,3) recur on the second step");
+    }
+
+    #[test]
+    fn a_malformed_step_is_refused_rather_than_skipped() {
+        // Silently dropping a step would understate every miss count taken from the trace.
+        let odd = concat!("{\"format\":\"moearc-trace-v1\"}\n", "{\"step\":0,\"e\":[0,7,1]}\n");
+        let e = Trace::from_ndjson_str(odd).unwrap_err();
+        assert!(matches!(e, TraceLoadError::MalformedStep { line: 2, .. }), "{e}");
+        assert!(e.to_string().contains("layer,expert pairs"));
+
+        let junk = concat!("{\"format\":\"moearc-trace-v1\"}\n", "{\"step\":0,\"e\":[0,x]}\n");
+        assert!(matches!(
+            Trace::from_ndjson_str(junk).unwrap_err(),
+            TraceLoadError::MalformedStep { .. }
+        ));
+
+        let no_field = concat!("{\"format\":\"moearc-trace-v1\"}\n", "{\"step\":0}\n");
+        assert!(matches!(
+            Trace::from_ndjson_str(no_field).unwrap_err(),
+            TraceLoadError::MalformedStep { .. }
+        ));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_trace_is_rejected_by_its_header() {
+        assert!(matches!(Trace::from_ndjson_str("").unwrap_err(), TraceLoadError::MissingHeader));
+        assert!(matches!(
+            Trace::from_ndjson_str("{\"hello\":1}\n").unwrap_err(),
+            TraceLoadError::UnknownFormat(_)
+        ));
+        assert!(matches!(
+            Trace::from_ndjson_str("{\"format\":\"moearc-trace-v1\"}\n").unwrap_err(),
+            TraceLoadError::NoSteps
+        ));
+    }
+
+    #[test]
+    fn the_real_captured_trace_loads_and_has_the_shape_the_model_implies() {
+        // Guards the committed capture against silent corruption, and pins the two facts the
+        // whole residency argument rests on: 40 routed layers, 8 experts each.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../bench/traces/qwen35moe-prose.decode.ndjson"
+        );
+        let Ok(loaded) = Trace::from_ndjson_file(path) else {
+            // The trace is committed, but do not fail a checkout that omitted it.
+            eprintln!("skipping: {path} not present");
+            return;
+        };
+        assert!(loaded.header.contains("Qwen3.6-35B-A3B"));
+        assert_eq!(loaded.trace.steps.len(), 1024);
+        assert!(loaded.trace.steps.iter().all(|s| s.len() == 320), "40 layers x 8 experts");
+        assert!(loaded.trace.working_set() <= 40 * 256);
     }
 }

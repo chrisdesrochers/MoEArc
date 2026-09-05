@@ -219,3 +219,61 @@ card with this model.** Even at Belady-optimal residency — an oracle policy th
 implemented — with zero compute time, the measured ceiling is 82.5 tok/s.
 
 Method: `tools/stream_bench.cpp`. 20 repetitions per configuration after a warm-up transfer.
+
+---
+
+## 🔴 CORRECTION: real routing is far more cacheable than the synthetic stand-in (2026-09-05)
+
+Three real decode traces were captured from Qwen3.6-35B-A3B (1,024 tokens each, prose / code /
+reasoning prompts). They overturn the hit rates every earlier ceiling on this page was built on.
+
+| at 3,976 slots | static | **LRU** | optimal |
+| --- | ---: | ---: | ---: |
+| synthetic (what we had) | 40.0% | **65.9%** | 80.1% |
+| real — prose | 55.0% | **95.2%** | 97.3% |
+| real — code | 42.5% | **88.9%** | 94.5% |
+| real — reasoning | 42.5% | **89.1%** | 94.6% |
+
+The synthetic generator understated LRU by **23 to 29 points**. Every transfer ceiling derived
+from it was correspondingly pessimistic:
+
+| | hit rate | MB/token | tok/s (transfer only) |
+| --- | ---: | ---: | ---: |
+| LRU, synthetic | 65.9% | 222.6 | 60.2 |
+| LRU, real (code) | 88.9% | 72.5 | **184.9** |
+| LRU, real (prose) | 95.2% | 31.3 | **427.7** |
+
+### What this retracts
+
+An earlier entry concluded that **104 tok/s is not reachable on this card with this model**.
+**That conclusion is withdrawn.** It was correct arithmetic over a hit rate that turned out to
+be wrong by a wide margin. On the transfer path, real routing clears 104 tok/s comfortably —
+the miss traffic falls from 223 MB per token to 31–73 MB.
+
+📌 The lesson is about the synthetic generator, not about the card. Its `skew` parameter was an
+input we chose, and the answer followed from it. **A simulation calibrated against nothing
+measures the calibration.** It stays in the codebase for policy experiments, and its results
+are no longer quotable as predictions.
+
+### What this does NOT establish
+
+These remain **transfer-only** ceilings: no matmul, no attention, no KV traffic, no kernel
+launch overhead. With misses down to 31–73 MB per token, **compute is now the binding
+constraint, not the bus** — which is a different engineering problem than the one this project
+started on, and one we have no measurements for. MoEArc still cannot generate a token.
+
+### Also measured, and useful
+
+- **Content changes locality substantially.** Prose touches 6,725 distinct experts over 1,024
+  tokens; code and reasoning touch ~8,720 — 30% more of the model for the same token count, and
+  LRU is 6 points worse there. **A prose-only benchmark would overstate any residency policy.**
+- **Skew is real but moderate**: the top 10% of touched experts take 44.5–50.8% of activations
+  against 10% for uniform.
+- **Routing breadth varies by depth, not by block type.** Distinct experts per block spans
+  119–256; blocks 0–6 are broad, block 12 onward much narrower. A uniform per-block VRAM budget
+  is the wrong shape. Notably the hybrid's 10 attention blocks and 30 recurrent blocks route
+  *indistinguishably*.
+- ⚠️ **An artifact worth knowing**: at ≥7,680 slots the static split *appears* to beat LRU. That
+  is because `StaticSplit` is charged no compulsory misses while LRU pays a fetch on first touch
+  of every expert. It is an accounting asymmetry in the incumbent's favour, not a result — which
+  also means the real static→LRU gap is if anything understated above.
