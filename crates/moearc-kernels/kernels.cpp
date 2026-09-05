@@ -542,6 +542,88 @@ static void matvec_q_submit(queue &q, float *out, const void *w, const float *x,
         });
 }
 
+/// Matrices one batched launch can cover.
+///
+/// The array below is captured into the kernel by value, so this bounds a kernel argument
+/// rather than an allocation: 32 pointers is 256 bytes, well inside what Level Zero will take.
+/// A caller with more matrices than this is refused rather than silently truncated.
+static constexpr int MAX_BATCHED_MATS = 32;
+
+/// The weight matrices of one batched launch, as a value the kernel can carry.
+///
+/// 🔴 By value on purpose. The alternative — a table in device memory — would have to be
+/// uploaded before every launch, and `moearc_copy_h2d` waits, which on an in-order queue drains
+/// everything already submitted. Passing the pointers as a kernel argument is ordered by
+/// construction: there is no table for the kernel to race.
+struct mat_table {
+    const unsigned char *p[MAX_BATCHED_MATS];
+};
+
+/// The same product as `matvec_q_submit`, over `n_mat` matrices of one shape and type, in one
+/// launch.
+///
+/// 🔴 This exists because of *parallelism*, not because of launch overhead. One expert's matvec
+/// on this model is 1024 rows of 2048 columns — 32768 work-items, which is roughly one pass over
+/// a B580's resident thread capacity. A kernel one wave deep has no second wave to run while the
+/// first waits on memory, so it spends its life on load latency: measured, an expert matvec
+/// moved 1.18 MB in 12 us, which is 98 GB/s on a card that reaches 456. Eight experts in one
+/// launch is eight waves, and the tail of one hides under the head of the next.
+///
+/// `x_stride` is in elements. Zero means every matrix reads the same activation vector, which is
+/// what the gate and up projections do; the down projection passes `n_ff` because each expert
+/// consumes its own.
+template <unsigned int TY>
+static void matvec_q_batched_submit(queue &q, float *out, mat_table w, unsigned int n_mat,
+                                    const float *x, unsigned long x_stride,
+                                    unsigned long n_rows, unsigned long n_cols) {
+    constexpr int BB = const_block_bytes<TY>();
+    constexpr int UPB = units_per_block<TY>();
+    const unsigned long nb = n_cols / (unsigned long) (UPB * 32);
+    const unsigned long units = nb * (unsigned long) UPB;
+    const unsigned long row_bytes = nb * (unsigned long) BB;
+    const unsigned long per_mat = (n_rows + MATVEC_ROWS - 1) / (unsigned long) MATVEC_ROWS;
+    const unsigned long groups = per_mat * (unsigned long) n_mat;
+    q.parallel_for(
+        nd_range<1>{range<1>{groups * (MATVEC_ROWS * WG)}, range<1>{MATVEC_ROWS * WG}},
+        [=](nd_item<1> it) [[sycl::reqd_sub_group_size(WG)]] {
+            const auto sg = it.get_sub_group();
+            const size_t g = it.get_group(0);
+            // The matrix index is uniform across the work-group, so the indirection into the
+            // captured table is one load per group rather than one per lane.
+            const size_t mat = g / per_mat;
+            const size_t row = (g - mat * per_mat) * MATVEC_ROWS + sg.get_group_linear_id();
+            const size_t lane = sg.get_local_linear_id();
+            const bool live = row < n_rows;
+            const unsigned char *rowp = w.p[mat] + (live ? row : 0) * row_bytes;
+            const float *xs = x + mat * x_stride;
+            float acc = 0.0f;
+            for (size_t u = lane; u < units; u += WG) {
+                unit_acc<TY>(acc, rowp + (u / UPB) * (size_t) BB, xs + u * 32, (int) (u % UPB));
+            }
+            const float total = reduce_over_group(sg, acc, sycl::plus<float>());
+            if (lane == 0 && live) out[mat * n_rows + row] = total;
+        });
+}
+
+/// The unhoisted path: one element at a time through `elem_at`, for the formats that have no
+/// 32-element unit to hoist anything out of (f16, f32). Shared by the single and batched entry
+/// points so the two cannot drift.
+static void matvec_generic_submit(queue &q, unsigned int type_id, int bb, float *out,
+                                  const void *w, const float *x, unsigned long n_rows,
+                                  unsigned long n_cols) {
+    const auto *base = static_cast<const unsigned char *>(w);
+    q.parallel_for(nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}}, [=](nd_item<1> it) {
+        const size_t row = it.get_group(0);
+        const size_t lid = it.get_local_id(0);
+        float acc = 0.0f;
+        for (size_t i = lid; i < n_cols; i += WG) {
+            acc += elem_at(type_id, base + (row * n_cols + i) * (size_t) bb, 0) * x[i];
+        }
+        const float total = reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+        if (lid == 0) out[row] = total;
+    });
+}
+
 extern "C" {
 
 struct moearc_ctx {
@@ -705,26 +787,12 @@ int moearc_matvec_q(moearc_ctx *c, unsigned int type_id, float *out, const void 
             case GGML_TYPE_Q8_0:
                 matvec_q_submit<GGML_TYPE_Q8_0>(c->q, out, w, x, n_rows, n_cols);
                 break;
-            default: {
+            default:
                 // f32 and f16 are "blocks" of one element, so there is no unit to hoist
                 // anything out of and no constraint that `n_cols` be a multiple of 32. One
                 // element per step, straight through `elem_at`.
-                const auto *base = static_cast<const unsigned char *>(w);
-                c->q.parallel_for(
-                    nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}}, [=](nd_item<1> it) {
-                        const size_t row = it.get_group(0);
-                        const size_t lid = it.get_local_id(0);
-                        float acc = 0.0f;
-                        for (size_t i = lid; i < n_cols; i += WG) {
-                            acc += elem_at(type_id, base + (row * n_cols + i) * (size_t) bb, 0)
-                                   * x[i];
-                        }
-                        const float total =
-                            reduce_over_group(it.get_group(), acc, sycl::plus<float>());
-                        if (lid == 0) out[row] = total;
-                    });
+                matvec_generic_submit(c->q, type_id, bb, out, w, x, n_rows, n_cols);
                 break;
-            }
         }
         return OK;
     } catch (...) { return ERR; }
@@ -750,6 +818,94 @@ int moearc_matvec_f32(moearc_ctx *c, float *out, const float *w, const float *x,
                    const float total = reduce_over_group(it.get_group(), acc, sycl::plus<float>());
                    if (lid == 0) out[row] = total;
                });
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// The same product over several weight matrices at once.
+//
+// `w` is a host array of `n_mat` device pointers, one weight matrix each, all of `type_id` and
+// all `n_rows` x `n_cols`. Matrix `m` writes `out[m * n_rows .. (m+1) * n_rows]` and reads
+// `x + m * x_stride`; `x_stride == 0` shares one activation vector between all of them.
+//
+// This is the MoE FFN's shape. The router names k experts and each is a matrix of its own, so
+// the unbatched version is k launches of a kernel that is one wave deep — see
+// `matvec_q_batched_submit` for what that costs.
+int moearc_matvec_q_batched(moearc_ctx *c, unsigned int type_id, float *out,
+                            const void *const *w, unsigned int n_mat, const float *x,
+                            unsigned long x_stride, unsigned long n_rows,
+                            unsigned long n_cols) {
+    if (!c || !out || !w || !x) return ERR;
+    if (n_mat == 0 || n_rows == 0) return OK;
+    if (n_mat > (unsigned int) MAX_BATCHED_MATS) return ERR_ARG;
+    const int bb = block_bytes(type_id);
+    if (bb == 0) return ERR_ARG;
+    const int be = block_elems(type_id);
+    if (n_cols % (unsigned long) be != 0) return ERR_ARG;
+    mat_table t{};
+    for (unsigned int i = 0; i < n_mat; ++i) {
+        if (!w[i]) return ERR;
+        t.p[i] = static_cast<const unsigned char *>(w[i]);
+    }
+    // Every unused entry aims at matrix 0. Nothing reads them — `mat < n_mat` by construction —
+    // but a table of uninitialised pointers is a bad thing to hand a kernel.
+    for (int i = (int) n_mat; i < MAX_BATCHED_MATS; ++i) t.p[i] = t.p[0];
+    try {
+        switch (type_id) {
+            case GGML_TYPE_Q4_K:
+                matvec_q_batched_submit<GGML_TYPE_Q4_K>(c->q, out, t, n_mat, x, x_stride, n_rows,
+                                                        n_cols);
+                break;
+            case GGML_TYPE_Q5_K:
+                matvec_q_batched_submit<GGML_TYPE_Q5_K>(c->q, out, t, n_mat, x, x_stride, n_rows,
+                                                        n_cols);
+                break;
+            case GGML_TYPE_Q6_K:
+                matvec_q_batched_submit<GGML_TYPE_Q6_K>(c->q, out, t, n_mat, x, x_stride, n_rows,
+                                                        n_cols);
+                break;
+            case GGML_TYPE_Q8_0:
+                matvec_q_batched_submit<GGML_TYPE_Q8_0>(c->q, out, t, n_mat, x, x_stride, n_rows,
+                                                        n_cols);
+                break;
+            default:
+                // No unit structure to batch over; issue the generic path per matrix. Correct,
+                // and no slower than the unbatched call it replaces.
+                for (unsigned int m = 0; m < n_mat; ++m) {
+                    matvec_generic_submit(c->q, type_id, bb, out + (size_t) m * n_rows, t.p[m],
+                                          x + (size_t) m * x_stride, n_rows, n_cols);
+                }
+                break;
+        }
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// The MoE combine: out[i] = sum over m of weights[m] * parts[m * n + i].
+//
+// One launch in place of the k `moearc_axpy` calls it replaces, and `moearc_zero` with them —
+// this writes rather than accumulates, so the destination does not have to be cleared first.
+//
+// 🔴 The accumulation runs m ascending from 0.0f, which is exactly the order a zero followed by
+// k axpys visited. Floating-point addition is not associative and this model's greedy output is
+// asserted token for token against llama.cpp's, so the order is a correctness property, not a
+// detail.
+//
+// `weights` is read on the device. It is the router's own output, still where `moearc_topk_router`
+// left it, so nothing has to travel to the host and back for the combine to know its scalars.
+int moearc_moe_combine(moearc_ctx *c, float *out, const float *parts, const float *weights,
+                       unsigned int n_mat, unsigned long n) {
+    if (!c || !out || !parts || !weights) return ERR;
+    if (n == 0) return OK;
+    if (n_mat > (unsigned int) MAX_BATCHED_MATS) return ERR_ARG;
+    try {
+        const unsigned int k = n_mat;
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) {
+            const size_t i = it[0];
+            float acc = 0.0f;
+            for (unsigned int m = 0; m < k; ++m) acc += weights[m] * parts[(size_t) m * n + i];
+            out[i] = acc;
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -818,6 +974,25 @@ int moearc_swiglu(moearc_ctx *c, float *out, const float *gate, const float *up,
         c->q.parallel_for(range<1>{n}, [=](id<1> it) {
             const float g = gate[it[0]];
             out[it[0]] = (g / (1.0f + sycl::exp(-g))) * up[it[0]];
+        });
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// `silu(gu[i]) * gu[n + i]` — the same activation as `moearc_swiglu`, for the case where both
+// halves came out of one launch and are laid end to end in one buffer.
+//
+// It exists so the gate and up projections can be batched together: they read the same
+// activation vector and differ only in their weights, so k experts x 2 banks is one launch of
+// 2k matrices — but one launch writes one buffer, and the halves of that buffer are what this
+// reads. The arithmetic is `moearc_swiglu`'s, term for term.
+int moearc_swiglu_halves(moearc_ctx *c, float *out, const float *gu, unsigned long n) {
+    if (!c || !out || !gu) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) {
+            const float g = gu[it[0]];
+            out[it[0]] = (g / (1.0f + sycl::exp(-g))) * gu[n + it[0]];
         });
         return OK;
     } catch (...) { return ERR; }

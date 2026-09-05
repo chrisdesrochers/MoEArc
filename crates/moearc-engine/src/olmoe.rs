@@ -46,6 +46,31 @@
 //! sized to the largest that bank reaches in any block — this file quantises `ffn_down_exps` at
 //! Q6_K in 8 of 16 blocks and Q4_K in the rest, and a slot has to hold either.
 //!
+//! # The expert FFN, in three launches
+//!
+//! The router names `n_expert_used` experts and each has three weight matrices, so the obvious
+//! shape is a launch per expert per bank — 384 of them a token on this model, plus a SwiGLU and
+//! an axpy each — 656 launches a token in all. That is now **four a block**, 64 a token: the
+//! gate and up projections of every active expert in one, a SwiGLU over all of them, the down
+//! projections in a second matvec, and a weighted combine that replaces both the zeroing pass
+//! and the run of axpys. (Five, in a block whose gate and up banks are quantised differently and
+//! so cannot share a launch. No block of this file is.)
+//!
+//! 🔴 The reason is **parallelism, not launch count**. A submission costs 1.6 us, which against a
+//! 13 ms token is a rounding error. What matters is that one expert's gate matvec is 1024 rows —
+//! roughly one pass over a B580's resident threads — and a kernel one wave deep has no second
+//! wave to run while the first waits on memory. Measured on this file: the expert FFN fell from
+//! 8.39 ms a token to 3.83, and decode went from 63.8 tok/s to 76.7, with every greedy token id
+//! unchanged.
+//!
+//! What batching did **not** do is saturate the card. The expert matvecs move 465 MiB a token,
+//! at 68 GB/s before and 133 GB/s after, against a peak of 456 GB/s — so they are still under a
+//! third of what the memory system will give. Two experiments that did *not* help are worth
+//! knowing about before anyone repeats them: carrying two or four rows per lane so a lane loads
+//! the activation once and spends it several times (neutral at two, 4% worse at four — the lost
+//! waves cost exactly what the saved loads bought), and widening or narrowing the rows a
+//! work-group covers (within 4% across 2, 4, 8 and 16).
+//!
 //! # What is still slow, and known to be
 //!
 //! Three things, all deliberate and all measured — run the `olmoe_profile` example for the
@@ -66,7 +91,9 @@
 //! `stage` before compute a correctness property of this file rather than an accident of every
 //! call synchronising.
 
-use moearc_kernels::{Context, DeviceBuffer, KernelError, KvType, QuantType, RopeKind};
+use moearc_kernels::{
+    Context, DeviceBuffer, KernelError, KvType, MAX_BATCHED_MATS, QuantType, RopeKind,
+};
 use moearc_model::gguf::Value;
 use moearc_model::tensors::{ExpertBank, MappedModel, TensorView, names};
 use moearc_model::{ModelError, ModelInfo};
@@ -213,6 +240,15 @@ impl Config {
 
         let n_expert = need("expert_count")? as usize;
         let n_expert_used = need("expert_used_count")? as usize;
+        // The expert FFN issues one batched launch per bank, and the kernel carries its weight
+        // pointers as an argument. Refusing here is the alternative to silently computing the
+        // first `MAX_BATCHED_MATS` experts and dropping the rest.
+        if n_expert_used > MAX_BATCHED_MATS {
+            return Err(EngineError::Unsupported(format!(
+                "{n_expert_used} active experts; a batched expert matvec covers at most \
+                 {MAX_BATCHED_MATS}"
+            )));
+        }
         if n_expert_used == 0 || n_expert_used > n_expert {
             return Err(EngineError::Unsupported(format!(
                 "{n_expert_used} experts used of {n_expert}"
@@ -735,6 +771,9 @@ pub struct State<'c> {
     router: DeviceBuffer<'c>,
     idx: DeviceBuffer<'c>,
     weights: DeviceBuffer<'c>,
+    /// The expert FFN's intermediates, `n_expert_used` of each laid end to end: every active
+    /// expert's gate, up, activation and output vector, produced by one launch apiece rather
+    /// than one launch per expert.
     gate: DeviceBuffer<'c>,
     up: DeviceBuffer<'c>,
     act: DeviceBuffer<'c>,
@@ -801,10 +840,10 @@ impl<'c> State<'c> {
             router: ctx.alloc_n::<f32>(cfg.n_expert)?,
             idx: ctx.alloc_n::<u32>(cfg.n_expert_used)?,
             weights: ctx.alloc_n::<f32>(cfg.n_expert_used)?,
-            gate: ctx.alloc_n::<f32>(cfg.n_ff)?,
-            up: ctx.alloc_n::<f32>(cfg.n_ff)?,
-            act: ctx.alloc_n::<f32>(cfg.n_ff)?,
-            expert_out: ctx.alloc_n::<f32>(n_embd)?,
+            gate: ctx.alloc_n::<f32>(2 * cfg.n_expert_used * cfg.n_ff)?,
+            up: ctx.alloc_n::<f32>(cfg.n_expert_used * cfg.n_ff)?,
+            act: ctx.alloc_n::<f32>(cfg.n_expert_used * cfg.n_ff)?,
+            expert_out: ctx.alloc_n::<f32>(cfg.n_expert_used * n_embd)?,
             ffn: ctx.alloc_n::<f32>(n_embd)?,
             logits_dev: ctx.alloc_n::<f32>(cfg.n_vocab)?,
             block_table: ctx.alloc_n::<u32>(pages)?,
@@ -1024,6 +1063,9 @@ impl<'c, 'm> Model<'c, 'm> {
             ctx.embed_rows(w.token_embd.ty, &st.h, &w.token_embd.buf, &st.tok, 1, n_embd)?;
         }
 
+        // Reused by every block: `slots.len()` pool buffers, one per active expert.
+        let mut batch: Vec<&DeviceBuffer<'c>> = Vec::with_capacity(cfg.n_expert_used);
+
         for (bi, b) in w.blocks.iter().enumerate() {
             // ---- attention -------------------------------------------------------------
             {
@@ -1174,31 +1216,87 @@ impl<'c, 'm> Model<'c, 'm> {
                 }
             }
             let slots = plan.slots_for(&st.wanted);
+            let k = slots.len();
 
+            // 🔴 All k experts in one launch per bank, not one launch per expert per bank.
+            //
+            // The reason is parallelism, not launch count. One expert's gate matvec is 1024
+            // rows, which on a B580 is about one pass over the card's resident threads — a
+            // kernel one wave deep, with no second wave to run while the first waits on memory.
+            // Measured on this model it moved 1.18 MB in 12 us: 98 GB/s against a 456 GB/s
+            // peak. Eight experts in one launch is eight waves deep.
+            //
+            // The weights come from `slots`, which is the cache's answer for the experts the
+            // router named, in router order — so `st.weights`, still holding the router's own
+            // probabilities on the device, lines up with them index for index and the combine
+            // below needs nothing from the host.
+            //
+            // Gate and up read the *same* activation vector and differ only in their weights, so
+            // when they share a shape and a type they are 2k matrices of one launch rather than
+            // two launches of k. `fused` is checked per block because a GGUF may quantise the
+            // two banks differently, and this file already sees a model whose blocks disagree
+            // with each other about the down bank.
+            let fused = b.gate.ty == b.up.ty
+                && b.gate.n_rows == b.up.n_rows
+                && b.gate.n_cols == b.up.n_cols
+                && 2 * k <= MAX_BATCHED_MATS;
             {
-                let _p = profile::scope("moe.zero");
-                ctx.zero(&st.ffn, n_embd)?;
+                let _p = profile::scope("moe.expert_matvec");
+                bank_batch(&mut batch, &pool.gate, &slots);
+                if fused {
+                    for &sl in &slots {
+                        batch.push(&pool.up[sl as usize]);
+                    }
+                }
+                ctx.matvec_q_batched(
+                    b.gate.ty,
+                    &st.gate,
+                    &batch,
+                    &st.x,
+                    0,
+                    b.gate.n_rows,
+                    b.gate.n_cols,
+                )?;
+                if !fused {
+                    bank_batch(&mut batch, &pool.up, &slots);
+                    ctx.matvec_q_batched(
+                        b.up.ty,
+                        &st.up,
+                        &batch,
+                        &st.x,
+                        0,
+                        b.up.n_rows,
+                        b.up.n_cols,
+                    )?;
+                }
             }
-            for (j, &slot) in slots.iter().enumerate() {
-                let weight = st.w_host[j];
-                let sl = slot as usize;
-                {
-                    let _p = profile::scope("moe.expert_matvec");
-                    matvec_bank(ctx, &st.gate, &pool.gate[sl], &b.gate, &st.x)?;
-                    matvec_bank(ctx, &st.up, &pool.up[sl], &b.up, &st.x)?;
+            {
+                let _p = profile::scope("moe.swiglu");
+                if fused {
+                    ctx.swiglu_halves(&st.act, &st.gate, k * cfg.n_ff)?;
+                } else {
+                    ctx.swiglu(&st.act, &st.gate, &st.up, k * cfg.n_ff)?;
                 }
-                {
-                    let _p = profile::scope("moe.swiglu");
-                    ctx.swiglu(&st.act, &st.gate, &st.up, cfg.n_ff)?;
-                }
-                {
-                    let _p = profile::scope("moe.expert_down");
-                    matvec_bank(ctx, &st.expert_out, &pool.down[sl], &b.down, &st.act)?;
-                }
-                {
-                    let _p = profile::scope("moe.axpy");
-                    ctx.axpy(&st.ffn, &st.expert_out, weight, n_embd)?;
-                }
+            }
+            {
+                let _p = profile::scope("moe.expert_down");
+                bank_batch(&mut batch, &pool.down, &slots);
+                ctx.matvec_q_batched(
+                    b.down.ty,
+                    &st.expert_out,
+                    &batch,
+                    &st.act,
+                    cfg.n_ff,
+                    b.down.n_rows,
+                    b.down.n_cols,
+                )?;
+            }
+            {
+                // Writes rather than accumulates, so there is no zeroing pass ahead of it, and
+                // it sums the experts in router order — the order the axpy loop it replaces
+                // used, which the token-for-token assertion against llama.cpp depends on.
+                let _p = profile::scope("moe.combine");
+                ctx.moe_combine(&st.ffn, &st.expert_out, &st.weights, k, n_embd)?;
             }
             tap_record(&mut st.tap, format!("ffn_moe_out-{bi}"), ctx, &st.ffn, n_embd)?;
             {
@@ -1291,18 +1389,20 @@ fn stage(
     Ok(moved)
 }
 
-/// `out = W . x` for an expert staged into a pool slot.
+/// Point `dst` at the pool buffers `slots` names.
 ///
-/// The slot may be larger than this block's expert — it is sized for the largest block — which
-/// `matvec_q` tolerates: it checks the buffer is big enough, not that it is exact.
-fn matvec_bank(
-    ctx: &Context,
-    out: &DeviceBuffer<'_>,
-    w: &DeviceBuffer<'_>,
-    shape: &BankShape,
-    x: &DeviceBuffer<'_>,
-) -> Result<(), KernelError> {
-    ctx.matvec_q(shape.ty, out, w, x, shape.n_rows, shape.n_cols)
+/// The scratch is reused rather than collected fresh because this runs three times per block
+/// per token. It cannot live in [`State`]: its elements borrow the expert pool, which is a
+/// sibling field, so it is a local of `decode` instead. A slot may be larger than the block's expert — it is sized for the largest block
+/// — which the batched matvec tolerates: it checks each buffer is big enough, not that it is
+/// exact.
+fn bank_batch<'a, 'c>(
+    dst: &mut Vec<&'a DeviceBuffer<'c>>,
+    bank: &'a [DeviceBuffer<'c>],
+    slots: &[Slot],
+) {
+    dst.clear();
+    dst.extend(slots.iter().map(|&sl| &bank[sl as usize]));
 }
 
 /// `out = W . x`, dispatching on how the weight is stored.

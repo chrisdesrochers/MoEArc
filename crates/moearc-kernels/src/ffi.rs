@@ -61,6 +61,26 @@ unsafe extern "C" {
         n_rows: c_ulong,
         n_cols: c_ulong,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub fn moearc_matvec_q_batched(
+        c: *mut MoearcCtx,
+        type_id: c_uint,
+        out: *mut c_float,
+        w: *const *const c_void,
+        n_mat: c_uint,
+        x: *const c_float,
+        x_stride: c_ulong,
+        n_rows: c_ulong,
+        n_cols: c_ulong,
+    ) -> c_int;
+    pub fn moearc_moe_combine(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        parts: *const c_float,
+        weights: *const c_float,
+        n_mat: c_uint,
+        n: c_ulong,
+    ) -> c_int;
     pub fn moearc_matvec_f32(
         c: *mut MoearcCtx,
         out: *mut c_float,
@@ -89,6 +109,12 @@ unsafe extern "C" {
         out: *mut c_float,
         gate: *const c_float,
         up: *const c_float,
+        n: c_ulong,
+    ) -> c_int;
+    pub fn moearc_swiglu_halves(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        gu: *const c_float,
         n: c_ulong,
     ) -> c_int;
     pub fn moearc_softmax(

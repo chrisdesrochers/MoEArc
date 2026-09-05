@@ -475,3 +475,179 @@ fn a_k_larger_than_the_router_supports_is_refused() {
     let err = ctx.topk_router(&idx, &w, &logits, 1, 16, 64, true).unwrap_err();
     assert!(matches!(err, KernelError::BadArgument(_)), "expected a refusal, got {err:?}");
 }
+
+// =======================================================================================
+// 9. The batched MoE path
+// =======================================================================================
+//
+// These assert **bit-identity**, not a tolerance, and that is the point of them. The batched
+// matvec is the unbatched one with a matrix index folded into the group id: a row's lanes cover
+// the same units in the same order and reduce over the same 32-lane tree. Any change to the
+// work split would move the last bits, so an exact comparison is the assertion that says the
+// arithmetic did not move. The engine's greedy output is checked token for token against
+// llama.cpp, and that check is only meaningful if the ops underneath it are stable.
+
+#[test]
+fn a_batched_matvec_is_bit_identical_to_the_calls_it_replaces() {
+    if !gpu_available() {
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    // 37 rows: not a multiple of the eight a work-group covers, so the tail rows a batched
+    // launch has to mask off are exercised rather than assumed.
+    const ROWS: usize = 37;
+    const COLS: usize = 1024;
+    const MATS: usize = 5;
+
+    for ty in ALL_TYPES {
+        let nb = COLS / ty.block_elems();
+        let mut rng = Rng::new(0x0BA7_C4ED ^ u64::from(ty.type_id()));
+        let x = rng.vec_unit(COLS);
+        let dx = ctx.alloc_n::<f32>(COLS).unwrap();
+        ctx.upload_slice(&dx, &x).unwrap();
+
+        let mut dws = Vec::new();
+        let mut want = Vec::new();
+        for _ in 0..MATS {
+            let w = synth_blocks(ty, ROWS * nb, &mut rng);
+            let dw = ctx.alloc(w.len()).unwrap();
+            ctx.upload_slice(&dw, &w).unwrap();
+            let one = ctx.alloc_n::<f32>(ROWS).unwrap();
+            ctx.matvec_q(ty, &one, &dw, &dx, ROWS, COLS).unwrap();
+            let mut got = vec![0.0f32; ROWS];
+            ctx.download_slice(&mut got, &one).unwrap();
+            want.extend(got);
+            dws.push(dw);
+        }
+
+        let refs: Vec<&_> = dws.iter().collect();
+        let dout = ctx.alloc_n::<f32>(MATS * ROWS).unwrap();
+        ctx.matvec_q_batched(ty, &dout, &refs, &dx, 0, ROWS, COLS).unwrap();
+        let mut got = vec![0.0f32; MATS * ROWS];
+        ctx.download_slice(&mut got, &dout).unwrap();
+        assert_eq!(got, want, "{ty:?}: batching changed the answer");
+        assert!(want.iter().any(|v| v.abs() > 0.0), "{ty:?}: the reference matvec is all zeros");
+    }
+}
+
+#[test]
+fn a_batched_matvec_gives_each_matrix_its_own_activation_when_strided() {
+    if !gpu_available() {
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    const ROWS: usize = 20;
+    const COLS: usize = 512;
+    const MATS: usize = 4;
+    let ty = QuantType::Q4K;
+    let nb = COLS / ty.block_elems();
+    let mut rng = Rng::new(0x0573_1DED);
+
+    // One activation vector per matrix, laid end to end — the down projection's shape, where
+    // each expert consumes the output of its own SwiGLU.
+    let xs = rng.vec_unit(MATS * COLS);
+    let dxs = ctx.alloc_n::<f32>(MATS * COLS).unwrap();
+    ctx.upload_slice(&dxs, &xs).unwrap();
+    let dx1 = ctx.alloc_n::<f32>(COLS).unwrap();
+
+    let mut dws = Vec::new();
+    let mut want = Vec::new();
+    for m in 0..MATS {
+        let w = synth_blocks(ty, ROWS * nb, &mut rng);
+        let dw = ctx.alloc(w.len()).unwrap();
+        ctx.upload_slice(&dw, &w).unwrap();
+        ctx.upload_slice(&dx1, &xs[m * COLS..(m + 1) * COLS]).unwrap();
+        let one = ctx.alloc_n::<f32>(ROWS).unwrap();
+        ctx.matvec_q(ty, &one, &dw, &dx1, ROWS, COLS).unwrap();
+        let mut got = vec![0.0f32; ROWS];
+        ctx.download_slice(&mut got, &one).unwrap();
+        want.extend(got);
+        dws.push(dw);
+    }
+
+    let refs: Vec<&_> = dws.iter().collect();
+    let dout = ctx.alloc_n::<f32>(MATS * ROWS).unwrap();
+    ctx.matvec_q_batched(ty, &dout, &refs, &dxs, COLS, ROWS, COLS).unwrap();
+    let mut got = vec![0.0f32; MATS * ROWS];
+    ctx.download_slice(&mut got, &dout).unwrap();
+    assert_eq!(got, want, "a strided activation reached the wrong matrix");
+}
+
+#[test]
+fn more_matrices_than_one_launch_takes_is_refused_rather_than_truncated() {
+    if !gpu_available() {
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    const COLS: usize = 256;
+    let ty = QuantType::Q4K;
+    let dw = ctx.alloc(ty.block_bytes()).unwrap();
+    let dx = ctx.alloc_n::<f32>(COLS).unwrap();
+    let refs: Vec<&_> = std::iter::repeat_n(&dw, moearc_kernels::MAX_BATCHED_MATS + 1).collect();
+    let dout = ctx.alloc_n::<f32>(refs.len()).unwrap();
+    let err = ctx.matvec_q_batched(ty, &dout, &refs, &dx, 0, 1, COLS).unwrap_err();
+    assert!(matches!(err, KernelError::BadArgument(_)), "expected a refusal, got {err:?}");
+}
+
+#[test]
+fn the_moe_combine_is_bit_identical_to_a_zero_and_a_run_of_axpys() {
+    if !gpu_available() {
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    const N: usize = 2048;
+    const MATS: usize = 8;
+    let mut rng = Rng::new(0xC0B_1EED);
+    let parts = rng.vec_unit(MATS * N);
+    let weights = rng.vec_unit(MATS);
+
+    let dparts = ctx.alloc_n::<f32>(MATS * N).unwrap();
+    let dweights = ctx.alloc_n::<f32>(MATS).unwrap();
+    let dpart1 = ctx.alloc_n::<f32>(N).unwrap();
+    let dacc = ctx.alloc_n::<f32>(N).unwrap();
+    ctx.upload_slice(&dparts, &parts).unwrap();
+    ctx.upload_slice(&dweights, &weights).unwrap();
+
+    // The path it replaces: clear the accumulator, then fold each part in, in order.
+    ctx.zero(&dacc, N).unwrap();
+    for (m, &w) in weights.iter().enumerate() {
+        ctx.upload_slice(&dpart1, &parts[m * N..(m + 1) * N]).unwrap();
+        ctx.axpy(&dacc, &dpart1, w, N).unwrap();
+    }
+    let mut want = vec![0.0f32; N];
+    ctx.download_slice(&mut want, &dacc).unwrap();
+
+    let dout = ctx.alloc_n::<f32>(N).unwrap();
+    ctx.moe_combine(&dout, &dparts, &dweights, MATS, N).unwrap();
+    let mut got = vec![0.0f32; N];
+    ctx.download_slice(&mut got, &dout).unwrap();
+    assert_eq!(got, want, "the combine sums the experts in a different order");
+}
+
+#[test]
+fn swiglu_over_two_halves_matches_swiglu_over_two_buffers() {
+    if !gpu_available() {
+        return;
+    }
+    let ctx = Context::new().unwrap();
+    const N: usize = 4096;
+    let mut rng = Rng::new(0x9A7E_D000);
+    let gu = rng.vec_unit(2 * N);
+
+    let dgu = ctx.alloc_n::<f32>(2 * N).unwrap();
+    let dg = ctx.alloc_n::<f32>(N).unwrap();
+    let du = ctx.alloc_n::<f32>(N).unwrap();
+    ctx.upload_slice(&dgu, &gu).unwrap();
+    ctx.upload_slice(&dg, &gu[..N]).unwrap();
+    ctx.upload_slice(&du, &gu[N..]).unwrap();
+
+    let da = ctx.alloc_n::<f32>(N).unwrap();
+    let db = ctx.alloc_n::<f32>(N).unwrap();
+    ctx.swiglu(&da, &dg, &du, N).unwrap();
+    ctx.swiglu_halves(&db, &dgu, N).unwrap();
+    let mut want = vec![0.0f32; N];
+    let mut got = vec![0.0f32; N];
+    ctx.download_slice(&mut want, &da).unwrap();
+    ctx.download_slice(&mut got, &db).unwrap();
+    assert_eq!(got, want, "the halved SwiGLU is not the same activation");
+}

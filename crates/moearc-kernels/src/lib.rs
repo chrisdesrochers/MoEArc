@@ -117,6 +117,14 @@ impl std::fmt::Display for KernelError {
 
 impl std::error::Error for KernelError {}
 
+/// Weight matrices one [`Context::matvec_q_batched`] launch covers.
+///
+/// The kernel carries the pointers as an argument rather than reading them from a device table,
+/// so this bounds a kernel argument — 32 pointers, 256 bytes. It also bounds a MoE model's
+/// active expert count, which is why the engine checks it at load and refuses rather than
+/// truncates.
+pub const MAX_BATCHED_MATS: usize = 32;
+
 /// An owned device buffer.
 pub struct DeviceBuffer<'a> {
     ptr: *mut std::os::raw::c_void,
@@ -369,6 +377,105 @@ impl Context {
         self.finish(rc, "quantised matvec")
     }
 
+    /// The same product over several weight matrices of one shape and type, in one launch.
+    ///
+    /// Matrix `m` writes `out[m * n_rows ..]` and reads `x[m * x_stride ..]`; `x_stride == 0`
+    /// shares one activation vector between every matrix, which is what a MoE gate or up
+    /// projection wants. The weights are a slice of buffers rather than one buffer because
+    /// that is how the expert pool holds them — a slot per expert, allocated separately.
+    ///
+    /// 🔴 The reason to prefer this over a loop of [`Context::matvec_q`] is **parallelism, not
+    /// launch count**. One expert's matvec fills a B580's resident threads roughly once, and a
+    /// kernel one wave deep has nothing to run while it waits on memory. See the note on
+    /// `matvec_q_batched_submit` in `kernels.cpp` for the measurement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_q_batched(
+        &self,
+        ty: QuantType,
+        out: &DeviceBuffer<'_>,
+        w: &[&DeviceBuffer<'_>],
+        x: &DeviceBuffer<'_>,
+        x_stride: usize,
+        n_rows: usize,
+        n_cols: usize,
+    ) -> Result<(), KernelError> {
+        if n_cols % ty.block_elems() != 0 {
+            return Err(KernelError::BadArgument("n_cols is not a whole number of blocks"));
+        }
+        let n_mat = w.len();
+        if n_mat == 0 || n_rows == 0 {
+            return Ok(());
+        }
+        if n_mat > MAX_BATCHED_MATS {
+            return Err(KernelError::BadArgument("more matrices than one batched launch takes"));
+        }
+        let need_w = n_rows * (n_cols / ty.block_elems()) * ty.block_bytes();
+        for b in w {
+            b.require("weight matrix", need_w)?;
+        }
+        let span = if x_stride == 0 { n_cols } else { (n_mat - 1) * x_stride + n_cols };
+        x.require("activation vector", span * 4)?;
+        out.require("matvec output", n_mat * n_rows * 4)?;
+        let mut ptrs: [*const std::os::raw::c_void; MAX_BATCHED_MATS] =
+            [std::ptr::null(); MAX_BATCHED_MATS];
+        for (slot, b) in ptrs.iter_mut().zip(w) {
+            *slot = b.ptr.cast_const();
+        }
+        let rc = unsafe {
+            ffi::moearc_matvec_q_batched(
+                self.raw,
+                ty.type_id(),
+                out.ptr.cast(),
+                ptrs.as_ptr(),
+                n_mat as std::os::raw::c_uint,
+                x.ptr.cast(),
+                x_stride as ffi::c_ulong,
+                n_rows as ffi::c_ulong,
+                n_cols as ffi::c_ulong,
+            )
+        };
+        self.finish(rc, "batched quantised matvec")
+    }
+
+    /// The MoE combine: `out[i] = sum over m of weights[m] * parts[m * n + i]`.
+    ///
+    /// Replaces a [`Context::zero`] and `n_mat` [`Context::axpy`] calls with one launch.
+    /// `weights` lives on the device — it is the router's own output — so the scalars never
+    /// travel to the host.
+    ///
+    /// 🔴 The sum runs `m` ascending from zero, matching the order the axpy loop it replaces
+    /// visited. That is deliberate: the engine's greedy output is asserted token for token
+    /// against llama.cpp's, and float addition is not associative.
+    pub fn moe_combine(
+        &self,
+        out: &DeviceBuffer<'_>,
+        parts: &DeviceBuffer<'_>,
+        weights: &DeviceBuffer<'_>,
+        n_mat: usize,
+        n: usize,
+    ) -> Result<(), KernelError> {
+        if n == 0 {
+            return Ok(());
+        }
+        if n_mat > MAX_BATCHED_MATS {
+            return Err(KernelError::BadArgument("more parts than one combine takes"));
+        }
+        parts.require("combine parts", n_mat * n * 4)?;
+        weights.require("combine weights", n_mat * 4)?;
+        out.require("combine output", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_moe_combine(
+                self.raw,
+                out.ptr.cast(),
+                parts.ptr.cast(),
+                weights.ptr.cast(),
+                n_mat as std::os::raw::c_uint,
+                n as ffi::c_ulong,
+            )
+        };
+        self.finish(rc, "moe combine")
+    }
+
     /// The same product against unquantised f32 weights.
     pub fn matvec_f32(
         &self,
@@ -463,6 +570,25 @@ impl Context {
             )
         };
         self.finish(rc, "swiglu")
+    }
+
+    /// SwiGLU over the two halves of one buffer: `out[i] = silu(gu[i]) * gu[n + i]`.
+    ///
+    /// The same arithmetic as [`Context::swiglu`], for the case where the gate and up
+    /// projections were computed by a single [`Context::matvec_q_batched`] launch and therefore
+    /// share a destination.
+    pub fn swiglu_halves(
+        &self,
+        out: &DeviceBuffer<'_>,
+        gu: &DeviceBuffer<'_>,
+        n: usize,
+    ) -> Result<(), KernelError> {
+        gu.require("swiglu gate and up", 2 * n * 4)?;
+        out.require("swiglu output", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_swiglu_halves(self.raw, out.ptr.cast(), gu.ptr.cast(), n as ffi::c_ulong)
+        };
+        self.finish(rc, "swiglu halves")
     }
 
     /// Row-wise softmax, max-subtracted, unmasked and unscaled.

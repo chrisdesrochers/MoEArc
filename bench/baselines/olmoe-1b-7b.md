@@ -14,16 +14,23 @@ have manufactured a win out of nothing.
 | --- | ---: | ---: |
 | llama.cpp **SYCL** | 3218.22 ± 48.99 | **283.31 ± 0.49** |
 | llama.cpp **Vulkan** | 3761.69 ± 53.40 | 133.55 ± 0.16 |
-| **MoEArc** | *(no batched prefill)* | **64.62** |
+| **MoEArc** | *(no batched prefill)* | **77.00** |
 
 ## 🔴 Read this before quoting MoEArc's number
 
-MoEArc is **4.4× slower than llama.cpp SYCL** and **2.1× slower than its Vulkan backend** on
+MoEArc is **3.7× slower than llama.cpp SYCL** and **1.7× slower than its Vulkan backend** on
 this model, on this card, today.
 
-That is after a 10× improvement in one session (6.25 → 64.62 tok/s). The improvement is real
-and independently verified with token ids unchanged. **It does not make MoEArc competitive.**
-The gap moved from roughly 45× to 4.4×; it did not close.
+That is after two sessions of work: 6.25 → 64.62 → 77.00 tok/s, a 12× improvement, every step
+independently verified with token ids unchanged. **It does not make MoEArc competitive.** The
+gap moved from roughly 45× to 3.7×; it did not close.
+
+⚠️ **Two numbers, and they measure different things.** 77.00 is *steady state* — warm cache,
+warm-up tokens discarded, which is what `llama-bench`'s `tg128` also reports and therefore the
+only fair comparison. `olmoe_generate` on a **cold pool**, which includes staging the model,
+measures **55.25**. A served request meets a warm cache; the first one after a load does not.
+Quoting the steady-state figure against a cold-start figure would be exactly the
+apples-to-oranges error this file exists to prevent.
 
 📌 Two honest caveats, in both directions:
 
@@ -37,11 +44,15 @@ The gap moved from roughly 45× to 4.4×; it did not close.
 
 Device-side, 19.09 ms/token, cold pool:
 
-| phase | share |
-| --- | ---: |
-| expert matvecs | 37.8% |
-| expert staging (H2D) | 24.8% |
-| dense matvecs | 17.8% |
-| everything else | 19.6% |
+| phase | ms/token | achieved bandwidth |
+| --- | ---: | ---: |
+| expert matvecs (gate+up, down) | 3.58 | 136 GB/s — **29.9% of peak** |
+| dense matvecs (qkv, proj, head) | ~3.0 | |
+| everything else | ~6.2 | |
 
-Staging falls to ~1 ms/token once warm, so it is warm-up cost rather than a fixed one.
+🔴 **The remaining 3.7× is now a specific, identified cause rather than a mystery.** Each lane
+covers a contiguous 32-element unit, so the activation load `x[u*32 + l]` is strided by 128
+bytes across the sub-group — fully uncoalesced. And the activation is f32 while the weights are
+4-bit, so the kernel issues roughly **7 bytes of activation load for every byte of weight**.
+llama.cpp quantises the activation to Q8_K before the dot product and moves about 3× fewer
+bytes for the same arithmetic. That is the gap.
