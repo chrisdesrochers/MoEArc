@@ -81,11 +81,15 @@ pub enum Headroom {
 }
 
 impl Headroom {
-    /// 🔴 **Provisional.** Activations, scratch buffers and allocator fragmentation are not
-    /// modelled, so we hold back a flat fraction instead. 12% is a placeholder chosen to be
-    /// conservative, **not a measured value**, and it is expected to be replaced per device by
-    /// calibration — see `docs/calibration.md`. It is deliberately not borrowed from another
-    /// runtime's tuning.
+    /// 🔴 **Provisional, and it reaches the user.** Activations, scratch buffers and allocator
+    /// fragmentation are not modelled, so a flat fraction is held back instead. 12% is a
+    /// placeholder chosen to be conservative — **not a measured value**, and not borrowed from
+    /// another runtime's tuning either.
+    ///
+    /// It is not a small effect: on a 11.33 GiB card it withholds 1.36 GiB, roughly 700 expert
+    /// slots. Every plan built on it is only as good as this guess, which is why it is named,
+    /// printed in the rationale, and first on the calibration list. Measure it per device
+    /// before quoting any number that depends on it — see `docs/calibration.md`.
     pub const PROVISIONAL: Self = Self::Fraction(0.12);
 
     fn reserve_from(self, free: u64) -> u64 {
@@ -107,8 +111,24 @@ pub struct Policy {
     /// Memory to leave unallocated.
     pub headroom: Headroom,
     /// Tokens per KV page. Purely an internal granularity.
+    ///
+    /// 🔴 The default of 256 is **chosen, not measured**. Page size trades allocator
+    /// bookkeeping against internal fragmentation — a half-used page wastes up to
+    /// `page_tokens - 1` tokens of KV — and the right value depends on kernel access patterns
+    /// we have not written yet. It is on the calibration list.
     pub page_tokens: u32,
     /// Context length reserved before experts are placed.
+    ///
+    /// 🔴 The default of 2048 is a **product judgement, not a measurement**: it is a guess at
+    /// the shortest context at which a server is still worth starting. It is also load-bearing
+    /// in a way that is easy to miss. With [`Bias::Experts`], expert slots absorb everything
+    /// above this floor, and whenever the bytes left over are worth less than a single KV page
+    /// the planned context lands on this number *exactly*. That is the common case rather than
+    /// an edge one: it holds whenever experts are small relative to a page, which is true of
+    /// the reference model (1.95 MiB experts against a 5 MiB page). When it happens the result
+    /// is a restatement of the policy rather than a capacity, and
+    /// [`Reason::ContextAtPolicyFloor`] says so in the output. Callers who want a real context
+    /// should ask for one with [`Context::Tokens`].
     ///
     /// This is a *floor taken off the top*, not a check applied at the end. Expert residency
     /// is greedy, and greedy fill will otherwise consume the entire card and leave a few
@@ -160,6 +180,9 @@ pub enum Reason {
     ContextLimitedByMemory { tokens: u32, requested: u32 },
     /// Experts were given up to satisfy the requested context.
     ExpertsYieldedToContext { resident: u32, would_have_been: u32 },
+    /// Context came out exactly at the policy floor, so it reflects the policy rather than
+    /// what the card could serve.
+    ContextAtPolicyFloor { tokens: u32 },
     /// Bytes left unspent after rounding to whole pages and slots.
     Slack { bytes: u64 },
 }
@@ -191,6 +214,12 @@ impl fmt::Display for Reason {
                 f,
                 "gave up {} expert slots to reach the requested context ({resident} resident)",
                 would_have_been - resident
+            ),
+            Self::ContextAtPolicyFloor { tokens } => write!(
+                f,
+                "context is {tokens} tokens because that is the configured minimum, not \
+                 because it is all that fits — experts took the rest; ask for a specific \
+                 context to trade slots for it"
             ),
             Self::Slack { bytes } => write!(f, "{} unallocated after rounding", gib(*bytes)),
         }
@@ -471,6 +500,12 @@ pub fn plan(
             rationale.push(Reason::ContextLimitedByMemory { tokens: served, requested: t });
         }
     }
+    // Say so when the answer is the policy talking back. Without this the floor is
+    // indistinguishable from a measured capacity in the output, which is how an invented
+    // constant ends up quoted as a result.
+    if kv_pages == min_pages && min_pages > 0 {
+        rationale.push(Reason::ContextAtPolicyFloor { tokens: kv_pages * policy.page_tokens });
+    }
     rationale.push(Reason::Slack { bytes: usable - expert_bytes - kv_bytes });
 
     Ok(Allocation {
@@ -629,6 +664,41 @@ mod tests {
             plan(card(12 * GIB), &zero, &Policy::default(), Context::Largest),
             Err(PlanError::InvalidModel(_))
         ));
+    }
+
+    #[test]
+    fn a_context_that_is_merely_the_floor_says_so() {
+        // The condition is narrower than "the card is small", and getting it wrong once
+        // already produced an overstated claim. Greedy residency drives context onto the floor
+        // only when the bytes left over after filling whole expert slots are worth less than
+        // one KV page. That happens when experts are small relative to a page -- which is the
+        // real case: the reference model's experts are 1.95 MiB against a 5 MiB page, so the
+        // slack can never buy a page back. With large experts the leftover does buy pages and
+        // context rises above the floor, which is why the shared fixture cannot show this.
+        let m = ModelFootprint {
+            dense_weights_bytes: GIB,
+            per_expert_bytes: 2 * MIB,
+            total_experts: 8192,
+            active_experts: 320,
+            kv_bytes_per_token: 20_480,
+        };
+        let p = Policy::default();
+        let a = plan(card(11 * GIB), &m, &p, Context::Largest).unwrap();
+        assert_eq!(
+            a.context_tokens, p.min_context_tokens,
+            "expected the floor; got {} tokens",
+            a.context_tokens
+        );
+        assert!(
+            a.rationale.iter().any(|r| matches!(r, Reason::ContextAtPolicyFloor { .. })),
+            "floor-limited context must be labelled: {:?}",
+            a.rationale
+        );
+        let prose = a.rationale.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" ");
+        assert!(
+            prose.contains("not\nbecause it is all that fits")
+                || prose.contains("not because it is all that fits")
+        );
     }
 
     #[test]
