@@ -36,7 +36,7 @@ use moearc_kernels::Context;
 use moearc_model::tensors::MappedModel;
 
 use crate::cache::CacheStats;
-use crate::olmoe::{Config, EngineError, Model, Residency, ResidencyReport, Tap};
+use crate::moe::{Config, EngineError, Model, Residency, ResidencyReport, Tap};
 
 /// How to build a session.
 #[derive(Debug, Clone, Copy, Default)]

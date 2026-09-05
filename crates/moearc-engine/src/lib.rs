@@ -19,6 +19,6 @@ pub mod runtime;
 // scheduler and the memory planner — which are testable on any machine and are meant to stay
 // that way. Build with `--features gpu` to get `Session`.
 #[cfg(feature = "gpu")]
-pub mod olmoe;
+pub mod moe;
 #[cfg(feature = "gpu")]
 pub mod session;

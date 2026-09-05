@@ -44,7 +44,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use moearc_engine::olmoe::Residency;
+use moearc_engine::moe::Residency;
 use moearc_engine::session::{Session, SessionOptions, StopConditions, StopReason};
 
 /// One session for the whole file: the model is 3.9 GiB of VRAM and Rust runs tests in

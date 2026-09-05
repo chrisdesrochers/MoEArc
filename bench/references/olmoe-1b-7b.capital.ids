@@ -1,0 +1,12 @@
+# llama.cpp's greedy continuation, for `residency_sweep`.
+#
+# model     olmoe-1b-7b-0924-instruct-q4_k_m.gguf  (olmoe, 16 blocks, 64 experts, 8 active)
+# prompt    "The capital of France is"  ->  510 5347 273 6181 310
+# produced  llama-eval-callback on the CPU backend, argmax written out by hand
+#
+# The same ids as `tests/olmoe_forward.rs`'s LLAMA_CPP_GREEDY; kept here so the sweep can check
+# a row on either model with the same flag.
+7785 15 187 187 510 14731 273 6181 310 14029 15 187 187 510 3072 273 6181 310
+9963 15 19 3041 952 15 187 187 510 3565 3448 273 6181 310 5112 15 187 187
+510 3872 802 12404 273 6181 310 253 11414 280 687 7337 15 187 187 510 3872
+7908 273 6181 310 253 492 49122

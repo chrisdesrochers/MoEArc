@@ -1,0 +1,23 @@
+# llama.cpp's greedy continuation, for `residency_sweep` and `tests/qwen3moe_forward.rs`.
+#
+# model     Qwen3-30B-A3B-Q4_K_M.gguf  (qwen3moe, 48 blocks, 128 experts, 8 active)
+# prompt    "def fibonacci(n):\n    "  ->  750 75698 1445 982 257
+#           tokenised with add_bos = false, which is what this file's
+#           `tokenizer.ggml.add_bos_token` says.
+# produced  llama-eval-callback, MOEARC_GREEDY_N=64, llama.cpp
+#           e107984bcffcfd701e82738092a2b000b6fda7a2
+#
+# 🔴 These 64 ids are IDENTICAL on llama.cpp's CPU backend (-ngl 0) and its SYCL backend
+# (-ngl 99 --n-cpu-moe 32) — which is the property that makes them usable as a gate. The two
+# backends differ from each other by roughly the same amount MoEArc differs from either, so a
+# continuation they disagree about is measuring a tie-break rather than a model. On
+# "The capital of France is" they split at token 2; see the calibration note in
+# `tests/qwen3moe_forward.rs`.
+#
+# Argmax is written out by the patched example rather than taken from a sampler chain: at
+# temperature 0 a chain still runs top-k, top-p and min-p, and a tie broken differently there
+# would look like a model difference.
+421 308 2651 220 16 510 260 470 308 198 257 770 510 260 470 955
+579 39345 1445 12 16 8 488 75698 1445 12 17 4390 77 284 526 5384
+445 6269 279 1372 315 3793 25 330 4390 333 308 2651 220 15 510 257
+1173 445 5501 3725 264 6785 7546 1138 1503 510 257 1173 445 37 579 39345

@@ -1,0 +1,17 @@
+# llama.cpp's greedy continuation, for `residency_sweep` and the forward-pass gate.
+#
+# model     Qwen3-30B-A3B-Q4_K_M.gguf  (qwen3moe, 48 blocks, 128 experts, 8 active)
+# prompt    "The capital of France is"  ->  785 6722 315 9625 374
+#           tokenised with add_bos = false, which is what this file's
+#           `tokenizer.ggml.add_bos_token` says.
+# produced  llama-eval-callback with MOEARC_GREEDY_N=64, -ngl 0 (CPU backend), -t 20
+# llama.cpp e107984bcffcfd701e82738092a2b000b6fda7a2
+#
+# 🔴 Argmax is written out by the patched example rather than taken from a sampler chain: at
+# temperature 0 a chain still runs top-k, top-p and min-p, and a tie broken differently there
+# would look like a model difference.
+12095 13 576 6722 315 9856 374 19846 13 576 6722 315 15344 374 21718
+13 576 6722 315 17689 374 24081 13 576 6722 315 33311 374 80701 13
+576 6722 315 279 3639 15072 374 7148 13 576 6722 315 32961 374 37169
+13 576 6722 315 279 25662 374 37741 13 576 6722 315 29121 374 14168
+13 576 6722 315

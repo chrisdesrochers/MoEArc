@@ -1,29 +1,59 @@
-//! OLMoE, one decode step, on the device.
+//! One decode step of a routed-MoE transformer, on the device.
 //!
 //! This is the integration layer: it reads a GGUF with `moearc-model`, uploads every tensor to
 //! the card, and issues the `moearc-kernels` calls that turn one token id into one logit
 //! vector. It contains no arithmetic of its own — every operation below is a kernel that was
 //! already checked against a CPU twin and, for the dequantisers, against llama.cpp itself.
 //!
+//! # Two architectures, one graph
+//!
+//! [`Arch`] lists what this pass implements: `olmoe` and `qwen3moe`. They are the *same* graph —
+//! RMSNorm, QK-normalised attention with NeoX RoPE, a softmax router, a SwiGLU expert FFN, no
+//! shared expert, no biases anywhere — differing in four scalars and two switches, every one of
+//! which is read or derived in [`Config::from_model`] and named there. That is why this is one
+//! module and not two: the half of the file that matters to this project — the expert pool, the
+//! admission policies, `stage`, the ordering rule — is architecture-independent, and a second
+//! copy of it would drift from this one within a week.
+//!
+//! 🔴 [`Config::from_model`] still refuses every other architecture by name. Each MoE family
+//! differs somewhere this graph would get silently wrong — a shared expert, a sigmoid router, a
+//! partial-rotary RoPE — and fluent nonsense is worse than a refusal.
+//!
 //! # Where the graph came from
 //!
-//! Transcribed from llama.cpp's `llama_model_olmoe::graph` (`src/models/olmoe.cpp`) and
-//! `llm_graph_context::build_moe_ffn` (`src/llama-graph.cpp`), not from the tensor names. Four
-//! details are not guessable from the names, and each is wrong in an interesting way if
-//! assumed:
+//! Transcribed from llama.cpp's `llama_model_olmoe::graph` (`src/models/olmoe.cpp`),
+//! `llama_model_qwen3moe::graph` (`src/models/qwen3moe.cpp`) and
+//! `llm_graph_context::build_moe_ffn` (`src/llama-graph.cpp`), not from the tensor names. None of
+//! the following is guessable from the names, and each is wrong in an interesting way if assumed:
 //!
-//! - **QK-norm spans the whole `n_embd`-wide vector**, applied after the Q/K projections and
-//!   before the reshape into heads and before RoPE. Per-head normalisation is the natural
-//!   guess, raises no error, and degrades the output subtly.
-//! - **RoPE is NeoX-style.** `llama_model_rope_type` puts `LLM_ARCH_OLMOE` in the
-//!   `LLAMA_ROPE_TYPE_NEOX` arm, and the loader prints `rope type = 2`. The pairs are
+//! - **QK-norm spans a different vector in the two.** OLMoE's `attn_q_norm.weight` is `n_embd`
+//!   long and normalises the whole projection before the reshape into heads. Qwen3's is
+//!   `head_dim` long — `create_tensor(..., {n_embd_head_k})` in `load_arch_tensors` — and
+//!   normalises **each head separately**, because `build_qkv` has already returned a 3D tensor by
+//!   the time `build_norm` runs. Either choice raises no error on the other model and degrades
+//!   the output subtly. [`Config`] takes the answer from the architecture and then **checks it
+//!   against the tensor's own length**.
+//! - **`head_dim` is not `n_embd / n_head`.** Qwen3-30B-A3B is 2048 wide with 32 heads and a head
+//!   dimension of **128**; the quotient is 64. llama.cpp reads `attention.key_length` and falls
+//!   back to the quotient only when the file is silent, and so does this. It also means the Q
+//!   projection is *wider* than the residual stream (4096 against 2048), which is why the Q-side
+//!   activation buffers below are sized `n_head * head_dim` and not `n_embd`.
+//! - **The expert FFN's width is `expert_feed_forward_length` for `qwen3moe`** (768), not
+//!   `feed_forward_length` (6144). The latter describes a dense FFN this architecture does not
+//!   have; `load_arch_tensors` builds every expert bank from `hparams.n_ff_exp()`. OLMoE has no
+//!   such key and uses `feed_forward_length` (1024). Whichever key is used, [`Config`]
+//!   cross-checks it against the expert bank's own middle dimension.
+//! - **RoPE is NeoX-style in both.** `llama_model_rope_type` puts `LLM_ARCH_OLMOE` and
+//!   `LLM_ARCH_QWEN3MOE` in the same `LLAMA_ROPE_TYPE_NEOX` arm. The pairs are
 //!   `(i, i + n_dims/2)`, not `(2i, 2i+1)`.
-//! - **The router softmaxes over all experts before the top-k**, and the selected weights are
-//!   the raw probabilities: `build_moe_ffn` is called with `norm_w = false`, so they are **not**
-//!   renormalised to sum to one.
-//! - **`w_scale` is `hparams.expert_weights_scale`, which OLMoE never sets**, so it keeps its
-//!   `0.0f` default and `build_moe_ffn`'s `if (w_scale != 0.0f && w_scale != 1.0f)` guard skips
-//!   the scaling entirely.
+//! - **The router softmaxes over all experts before the top-k — and then the two differ.**
+//!   `build_moe_ffn` is called with `norm_w = false` for OLMoE, so its selected weights are raw
+//!   probabilities that do not sum to one, and with `norm_w = true` for Qwen3, which divides them
+//!   by their sum (clamped up to `6.103515625e-5`, f16's smallest normal). Getting this backwards
+//!   rescales every expert's contribution by one factor per block: finite, fluent, wrong.
+//! - **`w_scale` is `hparams.expert_weights_scale`, which neither architecture sets**, so it
+//!   keeps its `0.0f` default and `build_moe_ffn`'s `if (w_scale != 0.0f && w_scale != 1.0f)`
+//!   guard skips the scaling entirely.
 //!
 //! # Shape conventions
 //!
@@ -43,13 +73,17 @@
 //!
 //! One slot holds one *(block, expert)* pair across all three banks, so the pool is three
 //! parallel arrays of device buffers indexed by the same slot number. Each array's slot is
-//! sized to the largest that bank reaches in any block — this file quantises `ffn_down_exps` at
-//! Q6_K in 8 of 16 blocks and Q4_K in the rest, and a slot has to hold either.
+//! sized to the largest that bank reaches in any block — both files quantise `ffn_down_exps` at
+//! Q6_K in half their blocks and Q4_K in the rest, and a slot has to hold either. 🔴 That makes
+//! a full pool *larger than the bank it holds*: on Qwen3-30B-A3B, 6144 slots of 2.92 MiB commit
+//! 17.51 GiB to store 16.35 GiB of experts. The 1.16 GiB difference is not waste to be tuned
+//! away — it is the price of a slot that can hold any block — but it must be counted, because a
+//! budget built from `expert_bytes` rather than `slot_bytes` will over-promise by 7%.
 //!
 //! # The expert FFN, in three launches
 //!
 //! The router names `n_expert_used` experts and each has three weight matrices, so the obvious
-//! shape is a launch per expert per bank — 384 of them a token on this model, plus a SwiGLU and
+//! shape is a launch per expert per bank — 384 of them a token on OLMoE, plus a SwiGLU and
 //! an axpy each — 656 launches a token in all. That is now **four a block**, 64 a token: the
 //! gate and up projections of every active expert in one, a SwiGLU over all of them, the down
 //! projections in a second matvec, and a weighted combine that replaces both the zeroing pass
@@ -59,9 +93,10 @@
 //! 🔴 The reason is **parallelism, not launch count**. A submission costs 1.6 us, which against a
 //! 13 ms token is a rounding error. What matters is that one expert's gate matvec is 1024 rows —
 //! roughly one pass over a B580's resident threads — and a kernel one wave deep has no second
-//! wave to run while the first waits on memory. Measured on this file: the expert FFN fell from
+//! wave to run while the first waits on memory. Measured on OLMoE: the expert FFN fell from
 //! 8.39 ms a token to 3.83, and decode went from 63.8 tok/s to 76.7, with every greedy token id
-//! unchanged.
+//! unchanged. ⚠️ Qwen3's experts are **768** rows, narrower still, so the same argument applies
+//! harder there and the numbers above are not transferable to it.
 //!
 //! What batching did **not** do is saturate the card. The expert matvecs move 465 MiB a token,
 //! at 68 GB/s before and 133 GB/s after, against a peak of 456 GB/s — so they are still under a
@@ -171,15 +206,34 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// Which architecture's graph a file gets.
+///
+/// 🔴 Adding an arm is a deliberate act, not a formality. Every entry here has been read out of
+/// llama.cpp's `src/models/<arch>.cpp` and its `build_moe_ffn` call, and the differences that
+/// matter are the ones no tensor name reveals — see the module header. An architecture that is
+/// *nearly* one of these still belongs in a new arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    /// `olmoe` — OLMoE-1B-7B: 16 blocks, 64 experts, whole-vector QK-norm, unnormalised router.
+    Olmoe,
+    /// `qwen3moe` — Qwen3-30B-A3B and siblings: real GQA, per-head QK-norm, normalised router.
+    Qwen3Moe,
+}
+
 /// The model's geometry, read from the GGUF header — never assumed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// `general.architecture`, verbatim.
     pub arch: String,
+    /// Which graph [`Config::from_model`] selected for it.
+    pub kind: Arch,
     pub n_block: usize,
     pub n_embd: usize,
     pub n_ff: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
+    /// 🔴 Read from `attention.key_length`, **not** computed as `n_embd / n_head`. On
+    /// Qwen3-30B-A3B those are 128 and 64, and the computed one is fluent nonsense.
     pub head_dim: usize,
     /// Channels of each head that rotate — `n_rot` in llama.cpp. Defaults to `head_dim`.
     pub n_rot: usize,
@@ -189,6 +243,15 @@ pub struct Config {
     pub n_ctx_train: usize,
     pub rms_eps: f32,
     pub rope_freq_base: f32,
+    /// Whether QK-norm normalises each head on its own (`qwen3moe`) or the whole projection at
+    /// once (`olmoe`). Checked against the length of `attn_q_norm.weight`.
+    pub qk_norm_per_head: bool,
+    /// `build_moe_ffn`'s `norm_w`: whether the selected experts' weights are divided by their
+    /// sum. True for `qwen3moe`, false for `olmoe`.
+    ///
+    /// 🔴 Not derivable from the file. It is a property of llama.cpp's call site, and nothing in
+    /// a GGUF records it — which is exactly why architectures are allowlisted above.
+    pub normalize_router_weights: bool,
     pub bos: Option<u32>,
     pub eos: Option<u32>,
 }
@@ -209,16 +272,25 @@ fn u64_key_opt(model: &MappedModel, key: &str) -> Option<u64> {
 impl Config {
     /// Read the geometry out of a mapped file.
     ///
-    /// 🔴 Only `olmoe` is accepted. Every other architecture differs somewhere the graph below
-    /// would get silently wrong — a shared expert, a per-head QK-norm, another RoPE convention —
-    /// and producing fluent nonsense is worse than refusing.
+    /// 🔴 Only the architectures in [`Arch`] are accepted. Every other one differs somewhere the
+    /// graph below would get silently wrong — a shared expert, a sigmoid router, another RoPE
+    /// convention — and producing fluent nonsense is worse than refusing.
+    ///
+    /// Where a value can be taken two ways, this takes the one the file states and then checks it
+    /// against a tensor that must agree. `head_dim`, the expert FFN width and the QK-norm span
+    /// are all like that, and all three differ between the two supported architectures.
     pub fn from_model(model: &MappedModel) -> Result<Self, EngineError> {
         let arch = model.architecture()?.to_string();
-        if arch != "olmoe" {
-            return Err(EngineError::Unsupported(format!(
-                "this forward pass implements `olmoe` only; the file declares `{arch}`"
-            )));
-        }
+        let kind = match arch.as_str() {
+            "olmoe" => Arch::Olmoe,
+            "qwen3moe" => Arch::Qwen3Moe,
+            _ => {
+                return Err(EngineError::Unsupported(format!(
+                    "this forward pass implements `olmoe` and `qwen3moe`; the file declares \
+                     `{arch}`"
+                )));
+            }
+        };
         let h = model.header();
         let need = |k: &str| -> Result<u64, EngineError> {
             h.u64_key(&format!("{arch}.{k}")).map_err(EngineError::Model)
@@ -226,17 +298,61 @@ impl Config {
 
         let n_block = need("block_count")? as usize;
         let n_embd = need("embedding_length")? as usize;
-        let n_ff = need("feed_forward_length")? as usize;
         let n_head = need("attention.head_count")? as usize;
         let n_head_kv = need("attention.head_count_kv")? as usize;
-        if n_head == 0 || n_embd % n_head != 0 {
+        if n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 {
             return Err(EngineError::Unsupported(format!(
-                "embedding length {n_embd} is not divisible by {n_head} heads"
+                "{n_head} query heads over {n_head_kv} key/value heads is not a grouping"
             )));
         }
-        let head_dim = n_embd / n_head;
+
+        // 🔴 `attention.key_length` first, the quotient only as llama.cpp's own fallback.
+        // Qwen3-30B-A3B states 128 where the quotient is 64: computing it would halve every
+        // head, and the model would still emit fluent text.
+        let head_dim = match u64_key_opt(model, &format!("{arch}.attention.key_length")) {
+            Some(v) => v as usize,
+            None if n_embd % n_head == 0 => n_embd / n_head,
+            None => {
+                return Err(EngineError::Unsupported(format!(
+                    "no attention.key_length, and embedding length {n_embd} is not divisible by \
+                     {n_head} heads"
+                )));
+            }
+        };
+        if head_dim == 0 {
+            return Err(EngineError::Unsupported("attention.key_length is zero".to_string()));
+        }
+        // One `head_dim` runs through the KV pool's layout, `attn_decode` and `kq_scale`. A file
+        // whose values are a different width than its keys is not a tuning difference; it is a
+        // model this pass has not been written for.
+        let v_len = u64_key_opt(model, &format!("{arch}.attention.value_length"))
+            .map_or(head_dim, |v| v as usize);
+        if v_len != head_dim {
+            return Err(EngineError::Unsupported(format!(
+                "key length {head_dim} and value length {v_len} differ; this pass assumes one \
+                 head dimension"
+            )));
+        }
         let n_rot = u64_key_opt(model, &format!("{arch}.rope.dimension_count"))
             .map_or(head_dim, |v| v as usize);
+
+        // The width of one expert's hidden layer. `qwen3moe` states it separately and its
+        // `feed_forward_length` (6144) describes a dense FFN it does not have; using that would
+        // size every scratch buffer eight times too large and read past every expert's rows.
+        let n_ff = match kind {
+            Arch::Olmoe => need("feed_forward_length")? as usize,
+            Arch::Qwen3Moe => need("expert_feed_forward_length")? as usize,
+        };
+        // The bank's own middle dimension is the same number, so disagreement means the key was
+        // read wrongly — checked rather than trusted, because the failure is silent.
+        let gate0 = model.block_tensor(0, names::FFN_GATE_EXPS)?;
+        let banked = gate0.dims.get(1).copied().unwrap_or(0) as usize;
+        if banked != n_ff {
+            return Err(EngineError::Unsupported(format!(
+                "the header says an expert is {n_ff} wide, but `{}` is {banked}",
+                gate0.name
+            )));
+        }
 
         let n_expert = need("expert_count")? as usize;
         let n_expert_used = need("expert_used_count")? as usize;
@@ -268,6 +384,33 @@ impl Config {
                 EngineError::Unsupported("no attention.layer_norm_rms_epsilon".to_string())
             })?;
 
+        // 🔴 The two graph switches that no GGUF key records. They come from llama.cpp's source
+        // — `load_arch_tensors`' norm shapes and the `norm_w` argument to `build_moe_ffn` — and
+        // are the reason `Arch` is an allowlist rather than a hint.
+        let (qk_norm_per_head, normalize_router_weights) = match kind {
+            Arch::Olmoe => (false, false),
+            Arch::Qwen3Moe => (true, true),
+        };
+        // The QK-norm span is checkable, so it is checked. `attn_q_norm.weight` is `head_dim`
+        // long under per-head normalisation and as wide as the projection otherwise; a file that
+        // disagrees would be normalised over the wrong axis and never say so.
+        let n_embd_q = n_head * head_dim;
+        let n_embd_kv = n_head_kv * head_dim;
+        for (suffix, want) in [
+            (names::ATTN_Q_NORM, if qk_norm_per_head { head_dim } else { n_embd_q }),
+            (names::ATTN_K_NORM, if qk_norm_per_head { head_dim } else { n_embd_kv }),
+        ] {
+            let t = model.block_tensor(0, suffix)?;
+            let got = t.dims.iter().product::<u64>() as usize;
+            if got != want {
+                return Err(EngineError::Unsupported(format!(
+                    "`{}` is {got} long; `{arch}` normalises {} and needs {want}",
+                    t.name,
+                    if qk_norm_per_head { "each head" } else { "the whole projection" },
+                )));
+            }
+        }
+
         Ok(Self {
             n_block,
             n_embd,
@@ -282,10 +425,24 @@ impl Config {
             n_ctx_train: need("context_length")? as usize,
             rms_eps,
             rope_freq_base: f32_key(model, &format!("{arch}.rope.freq_base")).unwrap_or(10_000.0),
+            qk_norm_per_head,
+            normalize_router_weights,
             bos: u64_key_opt(model, "tokenizer.ggml.bos_token_id").map(|v| v as u32),
             eos: u64_key_opt(model, "tokenizer.ggml.eos_token_id").map(|v| v as u32),
             arch,
+            kind,
         })
+    }
+
+    /// Width of the Q projection — `n_head * head_dim`, which is **not** `n_embd` when the
+    /// architecture states its own `head_dim`. Qwen3-30B-A3B projects 2048 up to 4096.
+    fn n_embd_q(&self) -> usize {
+        self.n_head * self.head_dim
+    }
+
+    /// Width of each of the K and V projections.
+    fn n_embd_kv(&self) -> usize {
+        self.n_head_kv * self.head_dim
     }
 
     /// `1/sqrt(head_dim)`, the scale llama.cpp passes to `build_attn`.
@@ -385,8 +542,9 @@ impl<'c> Weights<'c> {
     /// Upload the always-resident half of the model and measure the rest.
     ///
     /// Embeddings, attention, norms, the routers and the output head go to the card here and
-    /// stay. The expert banks do not: they are read from the mapping on demand. On this model
-    /// that split is roughly 360 MiB resident against 3.6 GiB pageable.
+    /// stay. The expert banks do not: they are read from the mapping on demand. That split is
+    /// roughly 360 MiB resident against 3.6 GiB pageable on OLMoE-1B-7B, and 951 MiB against
+    /// 16.35 GiB on Qwen3-30B-A3B — where the pageable half alone exceeds the card.
     pub fn upload(ctx: &'c Context, model: &MappedModel) -> Result<Self, EngineError> {
         let cfg = Config::from_model(model)?;
         let mut bytes = 0u64;
@@ -502,6 +660,32 @@ pub enum Residency {
     /// Every *(block, expert)* slot. Nothing is ever fetched after the first token that needs
     /// it, and the cache degenerates to a warm-up. This is the baseline the rest is measured
     /// against.
+    ///
+    /// ⚠️ It is also the **default, and it is not always achievable**. A full pool is
+    /// `n_block * n_expert * slot_bytes`, which on Qwen3-30B-A3B is 17.51 GiB against a B580's
+    /// 11.33 GiB. Asking for it on such a model fails, which is the honest outcome — the
+    /// alternative would be silently choosing a budget the caller did not ask for. Use
+    /// [`Residency::Planned`], or [`Residency::Slots`], on a model that does not fit.
+    ///
+    /// 🔴 **But it does not fail where you would expect, and that is a property of the runtime,
+    /// not of this code.** `ExpertPool::new` calls `malloc_device` once per slot per bank — 9,300
+    /// allocations at 3,100 slots — and on the Level Zero runtime on this box **every one of them
+    /// returns a valid pointer well past the point where the memory exists**. The load reports
+    /// success and prints a pool size; the failure arrives on the first token, as a
+    /// host-to-device copy or a kernel launch that fails, and near the boundary the driver can
+    /// spin at 100% of a core for minutes before it says so. Measured on a B580 that reports
+    /// 11.33 GiB, at `n_ctx = 512` and 951 MiB of dense weights:
+    ///
+    /// ```text
+    ///   3050 slots   8899 MiB pool   9.67 GiB committed   runs
+    ///   3100 slots   9045 MiB pool   9.81 GiB committed   "embedding lookup failed"
+    ///   3157 slots   9212 MiB pool   9.97 GiB committed   "host-to-device copy failed"
+    /// ```
+    ///
+    /// So the usable ceiling is about **85% of what the device reports free**, and no allocation
+    /// return value discovers it. See [`crate::memory::Headroom::PROVISIONAL`], whose 12% is the
+    /// only thing standing between a plan and this cliff — and which lands 3157 slots, one row
+    /// into it.
     #[default]
     All,
     /// Exactly this many slots, managed by [`ExpertCache`]'s LRU.
@@ -523,6 +707,39 @@ pub enum Residency {
     /// agree except at `resident_blocks == n_block - 1` — which is also the only setting under
     /// which `StaticSplit::next_victim`'s pinning matters, and the one that caught it.
     StaticSplit { resident_blocks: u16 },
+}
+
+/// A [`Residency`] written the way a command line writes one.
+///
+/// One spelling, shared by every tool, so a sweep row and a probe run cannot mean different
+/// things by the same word:
+///
+/// | Spec | Meaning |
+/// |---|---|
+/// | `all` | every slot resident — see the warning on [`Residency::All`] |
+/// | `<n>` | `n` slots, LRU |
+/// | `plan:<bytes>` | whatever [`crate::memory::plan`] decides for a device with that much free |
+/// | `static:<blocks>` | the incumbent: `blocks` blocks pinned, the rest streamed |
+impl std::str::FromStr for Residency {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "all" {
+            return Ok(Self::All);
+        }
+        if let Some(rest) = s.strip_prefix("plan:") {
+            let free: u64 = rest.parse().map_err(|_| format!("`{rest}` is not a byte count"))?;
+            return Ok(Self::Planned(memory::DeviceMemory { total_bytes: free, free_bytes: free }));
+        }
+        if let Some(rest) = s.strip_prefix("static:") {
+            let resident_blocks =
+                rest.parse().map_err(|_| format!("`{rest}` is not a block count"))?;
+            return Ok(Self::StaticSplit { resident_blocks });
+        }
+        s.parse().map(Self::Slots).map_err(|_| {
+            format!("`{s}` is not a residency: expected `all`, `<slots>`, `plan:<bytes>` or `static:<blocks>`")
+        })
+    }
 }
 
 /// The resident expert pool: `capacity` slots, each able to hold any one *(block, expert)*.
@@ -812,7 +1029,11 @@ impl<'c> State<'c> {
     /// Allocate scratch and a KV pool for `n_ctx` tokens.
     pub fn new(ctx: &'c Context, cfg: &Config, n_ctx: usize) -> Result<Self, EngineError> {
         let n_embd = cfg.n_embd;
-        let n_embd_kv = cfg.n_head_kv * cfg.head_dim;
+        // 🔴 The Q side is `n_head * head_dim`, not `n_embd`. They are equal on OLMoE and differ
+        // by 2x on Qwen3-30B-A3B, where a buffer sized `n_embd` would have the QK-norm, the RoPE
+        // and the attention output all reading half a projection.
+        let n_embd_q = cfg.n_embd_q();
+        let n_embd_kv = cfg.n_embd_kv();
         let pages = n_ctx.div_ceil(PAGE_TOKENS).max(1);
         let page_elems = PAGE_TOKENS * n_embd_kv;
 
@@ -828,14 +1049,14 @@ impl<'c> State<'c> {
             pos: ctx.alloc_n::<i32>(1)?,
             h: ctx.alloc_n::<f32>(n_embd)?,
             x: ctx.alloc_n::<f32>(n_embd)?,
-            q: ctx.alloc_n::<f32>(n_embd)?,
+            q: ctx.alloc_n::<f32>(n_embd_q)?,
             k: ctx.alloc_n::<f32>(n_embd_kv)?,
             v: ctx.alloc_n::<f32>(n_embd_kv)?,
-            q_normed: ctx.alloc_n::<f32>(n_embd)?,
+            q_normed: ctx.alloc_n::<f32>(n_embd_q)?,
             k_normed: ctx.alloc_n::<f32>(n_embd_kv)?,
-            q_roped: ctx.alloc_n::<f32>(n_embd)?,
+            q_roped: ctx.alloc_n::<f32>(n_embd_q)?,
             k_roped: ctx.alloc_n::<f32>(n_embd_kv)?,
-            attn: ctx.alloc_n::<f32>(cfg.n_head * cfg.head_dim)?,
+            attn: ctx.alloc_n::<f32>(n_embd_q)?,
             proj: ctx.alloc_n::<f32>(n_embd)?,
             router: ctx.alloc_n::<f32>(cfg.n_expert)?,
             idx: ctx.alloc_n::<u32>(cfg.n_expert_used)?,
@@ -1053,7 +1274,8 @@ impl<'c, 'm> Model<'c, 'm> {
         }
 
         let n_embd = cfg.n_embd;
-        let n_embd_kv = cfg.n_head_kv * cfg.head_dim;
+        let n_embd_q = cfg.n_embd_q();
+        let n_embd_kv = cfg.n_embd_kv();
         let eps = cfg.rms_eps;
         let scale = cfg.kq_scale();
 
@@ -1079,11 +1301,21 @@ impl<'c, 'm> Model<'c, 'm> {
                 matvec(ctx, &st.v, &b.attn_v, &st.x)?;
             }
 
-            // QK-norm over the whole vector — before the head reshape, before RoPE.
+            // QK-norm, after the projections and before RoPE.
+            //
+            // 🔴 What one norm covers is architecture-specific, and both spellings are the same
+            // kernel with different row counts: `qwen3moe` normalises each head over `head_dim`
+            // channels with a `head_dim`-wide weight broadcast across heads, `olmoe` normalises
+            // the whole projection in one row. Neither raises an error on the other's model.
             {
                 let _p = profile::scope("attn.qk_norm");
-                ctx.rmsnorm(&st.q_normed, &st.q, Some(&b.attn_q_norm), 1, n_embd, eps)?;
-                ctx.rmsnorm(&st.k_normed, &st.k, Some(&b.attn_k_norm), 1, n_embd_kv, eps)?;
+                let (q_rows, q_cols, k_rows, k_cols) = if cfg.qk_norm_per_head {
+                    (cfg.n_head, cfg.head_dim, cfg.n_head_kv, cfg.head_dim)
+                } else {
+                    (1, n_embd_q, 1, n_embd_kv)
+                };
+                ctx.rmsnorm(&st.q_normed, &st.q, Some(&b.attn_q_norm), q_rows, q_cols, eps)?;
+                ctx.rmsnorm(&st.k_normed, &st.k, Some(&b.attn_k_norm), k_rows, k_cols, eps)?;
             }
 
             {
@@ -1163,8 +1395,10 @@ impl<'c, 'm> Model<'c, 'm> {
                 matvec(ctx, &st.router, &b.ffn_gate_inp, &st.x)?;
             }
             tap_record(&mut st.tap, format!("ffn_moe_logits-{bi}"), ctx, &st.router, cfg.n_expert)?;
-            // `normalize = false`: llama.cpp calls `build_moe_ffn` with `norm_w = false` for
-            // OLMoE, so the weights are raw softmax probabilities and do not sum to one.
+            // `normalize` is llama.cpp's `norm_w`: false for OLMoE, whose weights stay raw
+            // softmax probabilities that do not sum to one, true for Qwen3, which divides them
+            // by their sum. The kernel clamps that sum up to `6.103515625e-5` exactly as
+            // `build_moe_ffn`'s `ggml_clamp` does.
             {
                 let _p = profile::scope("moe.topk");
                 ctx.topk_router(
@@ -1174,7 +1408,7 @@ impl<'c, 'm> Model<'c, 'm> {
                     1,
                     cfg.n_expert,
                     cfg.n_expert_used,
-                    false,
+                    cfg.normalize_router_weights,
                 )?;
             }
             {
@@ -1523,6 +1757,27 @@ mod tests {
         assert_eq!(s.stats, CacheStats::default());
         let plan = s.admit(&(0..8).map(|x| e(1, x)).collect::<Vec<_>>()).unwrap();
         assert_eq!(plan.loads.len(), 8, "a cleared pool must refetch even its pinned half");
+    }
+
+    #[test]
+    fn a_residency_spec_round_trips_through_the_one_parser_every_tool_uses() {
+        // Two tools spelling the same sweep row differently is how a table ends up comparing
+        // two policies under one heading.
+        assert_eq!("all".parse::<Residency>().unwrap(), Residency::All);
+        assert_eq!("3172".parse::<Residency>().unwrap(), Residency::Slots(3172));
+        assert_eq!(
+            "static:24".parse::<Residency>().unwrap(),
+            Residency::StaticSplit { resident_blocks: 24 }
+        );
+        let free = 12_166_012_928u64;
+        assert_eq!(
+            format!("plan:{free}").parse::<Residency>().unwrap(),
+            Residency::Planned(memory::DeviceMemory { total_bytes: free, free_bytes: free })
+        );
+        // A typo has to be a refusal, not a silent `Slots(0)` or a fallback to `All`.
+        assert!("half".parse::<Residency>().is_err());
+        assert!("plan:lots".parse::<Residency>().is_err());
+        assert!("static:".parse::<Residency>().is_err());
     }
 
     #[test]

@@ -61,3 +61,64 @@ card's peak bandwidth where llama.cpp manages 63%. Carrying that efficiency onto
 deficit dominates.** Both numbers above are arithmetic from measured inputs, not engine runs —
 the engine cannot load this architecture yet. They are a prediction to be checked, and they are
 recorded here so that check is honest either way.
+
+---
+
+## The check — 2026-09-05, and the prediction was optimistic
+
+The engine runs this architecture now (`crates/moearc-engine/src/moe.rs`, gated by
+`crates/moearc-engine/tests/qwen3moe_forward.rs`), so the predictions above can be scored.
+
+**Method.** Prompt `def fibonacci(n):` + newline + four spaces → `750 75698 1445 982 257`, 192
+greedy tokens, `n_ctx = 512`, `ONEAPI_DEVICE_SELECTOR=level_zero:0`. Every row below reproduces
+the same 192 ids, and their first 64 match llama.cpp exactly on **both** its backends. Reproduce:
+
+```sh
+cargo run --release -p moearc-engine --features gpu --example residency_sweep -- \
+  <model.gguf> 192 512 2952,static:23,2056,static:16,1032,static:8,520,static:4,264,static:2 \
+  bench/references/qwen3-30b-a3b.fibonacci.ids 750 75698 1445 982 257
+```
+
+| slots | % of model | pool | LRU warm hit | LRU warm tok/s | static warm hit | static warm tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2952 | 48.0% | 8613 MiB | **93.0%** | **24.04** | 47.9% | 8.42 |
+| 2056 | 33.5% | 5999 MiB | 85.3% | 18.02 | 33.3% | 7.04 |
+| 1032 | 16.8% | 3011 MiB | 67.6% | 11.52 | 16.7% | 5.84 |
+| 520 | 8.5% | 1517 MiB | 47.9% | 8.24 | 8.3% | 5.41 |
+| 264 | 4.3% | 770 MiB | **0.0%** | 4.93 | 4.2% | 5.17 |
+
+⚠️ Unoptimised, and every figure is a floor: a miss is a synchronous host-to-device copy with
+nothing overlapped behind it, and prompt tokens go through the single-token decode path.
+
+**Score.**
+
+- **"roughly 38 tok/s at MoEArc's current efficiency" — no. 24.04.** The prediction was 1.6x
+  optimistic. It was arithmetic on a *bandwidth* model, and bandwidth is not what this engine is
+  short of.
+- **"LRU beats the static split" — yes, and by more than the offline study said.** 93.0% against
+  47.9% at matched capacity, and **2.9x the throughput**. The gap is wider than
+  `bench/traces`' 83.3%-vs-94.7% because the offline `widest_static_split` counts only the
+  experts a trace *touched* in a resident block, while the engine — like real `--n-cpu-moe` —
+  must hold all 128 of them. 2952 slots buys 23 whole blocks, not 40.
+- **llama.cpp's 50.13 tok/s stands, at 2.1x.** Closing it is kernel work, not residency work.
+
+**Where the time goes, from the sweep's own staged-bytes column.** The engine counts the bytes it
+actually copies, so the transfer share of a token is measurable rather than modelled. Over
+197 decode steps, against the `13.4 GB/s` host→device figure in `docs/roadmap.md`:
+
+| slots | warm staged | per step | transfer at 13.4 GB/s | measured step | not transfer |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2952 | 14 477 MiB | 73.5 MiB | 5.8 ms | 41.6 ms | **35.8 ms** |
+| 264 | 205 065 MiB | 1 041 MiB | 81.5 ms | 202.8 ms | **121.3 ms** |
+
+🔴 **A fixed cost of roughly 36 ms a token sits underneath every row**, and at the useful end of
+the sweep it is 86% of the step. Residency buys the difference between 4.9 and 24.0 tok/s — real,
+and larger than the static split by 2.9x — but the thing standing between 24.0 and llama.cpp's
+50.13 is not the bus. It is kernel and synchronisation work, and no residency policy touches it.
+
+🔴 **And the capacity in the top row is not the one the planner picks.** `memory::plan` chooses
+**3157** slots for this card and model, and 3157 does not run — the measured ceiling is between
+3050 and 3100, about 85% of the 11.33 GiB the device reports free, where `Headroom::PROVISIONAL`
+leaves 88%. Nothing detects it at load: `malloc_device` returns valid pointers past the point
+where the memory exists, so the pool reports its size and the first token fails. Measured rows
+are in `Headroom::PROVISIONAL` and `Residency::All`.

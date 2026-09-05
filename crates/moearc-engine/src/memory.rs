@@ -90,6 +90,20 @@ impl Headroom {
     /// slots. Every plan built on it is only as good as this guess, which is why it is named,
     /// printed in the rationale, and first on the calibration list. Measure it per device
     /// before quoting any number that depends on it — see `docs/calibration.md`.
+    ///
+    /// ⚠️ **First real measurement, and 12% is not enough on this card.** Loading Qwen3-30B-A3B
+    /// on an Arc B580 that reports 11.33 GiB free, `n_ctx = 512`, dense weights 951 MiB: 3050
+    /// expert slots (9.67 GiB committed) runs, 3100 (9.81 GiB) does not, so the usable ceiling
+    /// is about **85% of reported free**. This constant leaves 88%, and [`plan`] duly chooses
+    /// **3157 slots — the first setting past the cliff**. Worse, nothing says so at plan time:
+    /// on that Level Zero runtime `malloc_device` keeps returning valid pointers past the point
+    /// where the memory exists, so the load reports success and the *first token* fails instead.
+    /// [`crate::moe::Residency::All`] carries the three measured rows.
+    ///
+    /// 🔴 The constant is left alone deliberately. Changing it moves every plan on every device
+    /// and model, and one measurement on one card with one model is not a basis for that; the
+    /// real fix is the measured per-device headroom `docs/calibration.md` already asks for. This
+    /// note exists so the next person does not have to rediscover the cliff from a failing token.
     pub const PROVISIONAL: Self = Self::Fraction(0.12);
 
     fn reserve_from(self, free: u64) -> u64 {

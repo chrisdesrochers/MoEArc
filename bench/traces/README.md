@@ -155,3 +155,48 @@ on expert routing** — depth does, block type does not.
   each expert's first fetch. It is a modelling artifact, not a result.
 - **One model, one quantisation, one seed, three prompts, 1024 tokens each.** These are not
   claims about MoE routing in general.
+
+---
+
+# Qwen3-30B-A3B traces
+
+The `qwen3-30b-*` files are a different model from everything above — `qwen3moe`, **48 blocks,
+all 48 MoE, 128 experts each, 8 active ⇒ 384 activations per token**, a pure transformer with no
+shared experts and no recurrent blocks. The tables and conclusions earlier in this file are about
+`qwen35moe` and do **not** carry over: different expert count, different working-set size,
+different slot budget. `qwen3-30b-prose` was captured first; its provenance is in the commit that
+added it (`traces: Qwen3-30B-A3B, the first model where residency actually has to work`).
+
+## `qwen3-30b-fibonacci` — the trace the engine can be checked against
+
+| | |
+|---|---|
+| Prompt | `prompts/qwen3-30b-fibonacci.txt` — `def fibonacci(n):` + newline + four spaces, 5 tokens |
+| Sampling | **greedy** (`--temp 0 --top-k 1`), not the 0.7/20/0.8 used for the `qwen35moe` set |
+| Steps | 192 decode, 5 prefill |
+| Backend | CPU (`-ngl 0`) |
+| llama.cpp | `e107984bcffcfd701e82738092a2b000b6fda7a2` + `llama.cpp-eval-callback-moearc.patch` |
+
+🔴 **Greedy is the whole point of this one.** MoEArc reproduces llama.cpp exactly on this prompt
+(`crates/moearc-engine/tests/qwen3moe_forward.rs`), so the engine walks the same token sequence
+and therefore routes through nearly the same experts — which makes the offline simulator and the
+live engine comparable on *this* file in a way they are not on a sampled trace of some other
+prompt. Measured at matched capacities, over 192 decode steps:
+
+| slots | simulator LRU | engine LRU, cold | engine LRU, warm |
+| ---: | ---: | ---: | ---: |
+| 2952 | 91.0% | 91.0% | 93.0% |
+| 2056 | 84.1% | 84.3% | 85.3% |
+| 1032 | 68.4% | 67.3% | 67.6% |
+| 520 | 53.7% | 47.8% | 47.9% |
+
+⚠️ **The gap widens as capacity tightens, and the reason is routing, not caching.** MoEArc keeps
+activations in f32 where `ggml-cpu` quantises them to Q8_K before every K-quant matmul, so the
+router logits differ slightly and the 8th-ranked expert is not always the same one. Measured on
+one token of `The capital of France is`, comparing `ffn_moe_topk` block by block against a
+`MOEARC_DUMP_DIR` dump: of 48 blocks, **13 chose the identical list, 21 the same set in a
+different order, and 14 a different set**. A different set means a slightly larger working set
+over 192 steps, which costs nothing while almost everything fits and costs 6 points at 520 slots.
+
+Note also that an engine run is 197 steps — 5 prompt tokens decoded one at a time, then 192 —
+where the trace file holds the 192 decode steps only.
