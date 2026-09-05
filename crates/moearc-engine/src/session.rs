@@ -35,7 +35,17 @@ use std::thread::JoinHandle;
 use moearc_kernels::Context;
 use moearc_model::tensors::MappedModel;
 
-use crate::olmoe::{Config, EngineError, Model, Tap};
+use crate::cache::CacheStats;
+use crate::olmoe::{Config, EngineError, Model, Residency, ResidencyReport, Tap};
+
+/// How to build a session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionOptions {
+    /// Context length. `None` means the model's trained maximum.
+    pub n_ctx: Option<usize>,
+    /// How much of the expert bank stays in VRAM.
+    pub residency: Residency,
+}
 
 /// What a loaded model reports about itself.
 #[derive(Debug, Clone)]
@@ -45,8 +55,8 @@ pub struct SessionInfo {
     pub device: String,
     /// Context length this session was built for.
     pub n_ctx: usize,
-    /// Weight bytes copied to the card, summed from the uploads themselves.
-    pub bytes_uploaded: u64,
+    /// The pool as it stands at load: counters all zero, sizes final.
+    pub residency: ResidencyReport,
 }
 
 /// Why a generation ended. Mirrors `moearc_server::generate::StopReason`.
@@ -78,14 +88,23 @@ pub struct StopConditions {
 }
 
 enum Command {
-    Decode { token: u32, tap: bool },
+    Decode {
+        token: u32,
+        tap: bool,
+    },
     Reset,
+    /// Zero the cache counters, keeping what is resident.
+    ResetCacheStats,
+    /// Drop everything resident, so the next token pays a cold cache.
+    ClearResidency,
+    Residency,
     Shutdown,
 }
 
 enum Reply {
     Ready(Box<SessionInfo>),
     Logits(Vec<f32>, Option<Tap>),
+    Residency(Box<ResidencyReport>),
     Done,
     Failed(String),
 }
@@ -117,18 +136,25 @@ impl Session {
     /// [`Session::load_with_context`] to use less, which is the only knob that changes how much
     /// device memory the KV cache takes.
     pub fn load(path: &Path) -> Result<Self, EngineError> {
-        Self::load_with_context(path, None)
+        Self::load_with(path, SessionOptions::default())
     }
 
     /// [`Session::load`] with an explicit context length.
     pub fn load_with_context(path: &Path, n_ctx: Option<usize>) -> Result<Self, EngineError> {
+        Self::load_with(path, SessionOptions { n_ctx, ..Default::default() })
+    }
+
+    /// [`Session::load`] with a context length and a residency budget.
+    pub fn load_with(path: &Path, opts: SessionOptions) -> Result<Self, EngineError> {
+        let n_ctx = opts.n_ctx;
+        let residency = opts.residency;
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let (rep_tx, rep_rx) = mpsc::channel::<Reply>();
         let owned: PathBuf = path.to_path_buf();
 
         let thread = std::thread::Builder::new()
             .name("moearc-device".into())
-            .spawn(move || worker(&owned, n_ctx, &cmd_rx, &rep_tx))
+            .spawn(move || worker(&owned, n_ctx, residency, &cmd_rx, &rep_tx))
             .map_err(|e| {
                 EngineError::Unsupported(format!("could not start the device thread: {e}"))
             })?;
@@ -165,6 +191,37 @@ impl Session {
     /// `Generator::name`.
     pub fn name(&self) -> &'static str {
         "moearc"
+    }
+
+    /// What the expert pool holds and what it has moved, right now.
+    pub fn residency(&self) -> Result<ResidencyReport, EngineError> {
+        let link = self.link.lock().expect("the device thread panicked");
+        send(&link, Command::Residency)?;
+        match recv(&link)? {
+            Reply::Residency(r) => Ok(*r),
+            Reply::Failed(m) => Err(EngineError::Unsupported(m)),
+            _ => Err(EngineError::Unsupported("unexpected reply from the device".to_string())),
+        }
+    }
+
+    /// Cache counters only. Residency is left exactly as it is, which is what makes a
+    /// warm-cache measurement possible.
+    pub fn reset_cache_stats(&self) -> Result<(), EngineError> {
+        let link = self.link.lock().expect("the device thread panicked");
+        send(&link, Command::ResetCacheStats)?;
+        expect_done(&link)
+    }
+
+    /// Evict everything, so the next generation pays a cold cache.
+    pub fn clear_residency(&self) -> Result<(), EngineError> {
+        let link = self.link.lock().expect("the device thread panicked");
+        send(&link, Command::ClearResidency)?;
+        expect_done(&link)
+    }
+
+    /// Shorthand for the counters alone.
+    pub fn cache_stats(&self) -> Result<CacheStats, EngineError> {
+        Ok(self.residency()?.stats)
     }
 
     /// Run a whole sequence from an empty cache and return the final token's logits.
@@ -329,6 +386,7 @@ impl Drop for Session {
 fn worker(
     path: &Path,
     n_ctx: Option<usize>,
+    residency: Residency,
     rx: &mpsc::Receiver<Command>,
     tx: &mpsc::Sender<Reply>,
 ) {
@@ -354,7 +412,7 @@ fn worker(
         },
     };
 
-    let mut model = match Model::new(&ctx, &mapped, n_ctx) {
+    let mut model = match Model::new(&ctx, &mapped, n_ctx, residency) {
         Ok(m) => m,
         Err(e) => {
             let _ = tx.send(Reply::Failed(e.to_string()));
@@ -366,7 +424,7 @@ fn worker(
         config: model.cfg().clone(),
         device: ctx.device_name().unwrap_or_else(|_| "unknown device".to_string()),
         n_ctx,
-        bytes_uploaded: model.weights.bytes_uploaded,
+        residency: model.residency(),
     };
     if tx.send(Reply::Ready(Box::new(info))).is_err() {
         return;
@@ -379,6 +437,15 @@ fn worker(
                 Ok(()) => Reply::Done,
                 Err(e) => Reply::Failed(e.to_string()),
             },
+            Command::ResetCacheStats => {
+                model.reset_cache_stats();
+                Reply::Done
+            }
+            Command::ClearResidency => match model.clear_residency() {
+                Ok(()) => Reply::Done,
+                Err(e) => Reply::Failed(e.to_string()),
+            },
+            Command::Residency => Reply::Residency(Box::new(model.residency())),
             Command::Decode { token, tap } => {
                 model.state.tap = tap.then(Tap::default);
                 match model.decode(token) {

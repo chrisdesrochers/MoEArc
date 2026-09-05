@@ -143,6 +143,16 @@ impl ExpertCache {
         self.stats
     }
 
+    /// Zero the counters without disturbing what is resident.
+    ///
+    /// Measuring a *warm* cache means exactly this: keep the residency, forget the history that
+    /// built it. Rebuilding the cache instead would throw the residency away and measure a cold
+    /// one under a warm name, and subtracting two snapshots at the call site loses the `steps`
+    /// denominator as soon as anything else shares the cache.
+    pub fn reset_stats(&mut self) {
+        self.stats = CacheStats::default();
+    }
+
     /// Experts currently resident.
     pub fn resident_count(&self) -> usize {
         self.slot_of.len()

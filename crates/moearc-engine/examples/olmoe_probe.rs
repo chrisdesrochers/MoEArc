@@ -126,7 +126,16 @@ fn main() -> ExitCode {
     };
     let info = session.info();
     println!("device        {}", info.device);
-    println!("uploaded      {:.2} MiB", info.bytes_uploaded as f64 / (1024.0 * 1024.0));
+    let r = info.residency;
+    println!(
+        "resident      {} MiB dense + {}/{} expert slots ({:.1}%, {} MiB pool, {} policy)",
+        r.dense_bytes >> 20,
+        r.resident_slots,
+        r.total_slots,
+        100.0 * r.resident_fraction(),
+        r.pool_bytes >> 20,
+        r.policy
+    );
     println!("arch          {} n_ctx {}", info.config.arch, info.n_ctx);
     println!("tokens        {tokens:?}");
 

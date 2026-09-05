@@ -44,7 +44,8 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use moearc_engine::session::{Session, StopConditions, StopReason};
+use moearc_engine::olmoe::Residency;
+use moearc_engine::session::{Session, SessionOptions, StopConditions, StopReason};
 
 /// One session for the whole file: the model is 3.9 GiB of VRAM and Rust runs tests in
 /// parallel, so a session per test would try to hold several copies of it at once.
@@ -239,5 +240,118 @@ fn every_block_is_tapped_and_none_of_them_is_degenerate() {
     assert!(
         sums.iter().any(|s| (s - 1.0).abs() > 1e-3),
         "every block's router weights summed to one — they were renormalised: {sums:?}"
+    );
+}
+
+/// A session of its own, so a residency setting can be exercised without disturbing the shared
+/// one. Returns `None` when the suite is being skipped.
+fn constrained(residency: Residency) -> Option<Session> {
+    if std::env::var("MOEARC_TEST_GPU").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let path = PathBuf::from(std::env::var("MOEARC_OLMOE_MODEL").ok()?);
+    // 512 tokens is more than this file's prompts need, and it keeps the KV cache small enough
+    // that a constrained session can sit alongside the shared fully-resident one.
+    let opts = SessionOptions { n_ctx: Some(512), residency };
+    Some(Session::load_with(&path, opts).expect("constrained session would not load"))
+}
+
+#[test]
+fn the_pool_is_sized_in_slots_not_experts() {
+    let s = session_or_skip!();
+    let r = s.info().residency;
+    // 🔴 16 blocks x 64 experts. The file says "64 experts"; the engine has to hold 1024 places
+    // to put one, and conflating the two is a factor-of-16 error in every budget.
+    assert_eq!(r.total_slots, 1024);
+    assert_eq!(r.resident_slots, 1024, "the default is everything resident");
+    assert!((r.resident_fraction() - 1.0).abs() < f64::EPSILON);
+    // A slot has to hold whichever block the router lands in, and `ffn_down_exps` is Q6_K in
+    // half the blocks and Q4_K in the other half, so the pool is larger than the bank it holds.
+    assert!(
+        r.slot_bytes * u64::from(r.total_slots) >= r.expert_bytes,
+        "a pool of {} slots x {} B cannot hold {} B of experts",
+        r.total_slots,
+        r.slot_bytes,
+        r.expert_bytes
+    );
+    assert!(r.dense_bytes > 0 && r.dense_bytes < r.expert_bytes);
+}
+
+#[test]
+fn constraining_residency_does_not_change_a_single_token_id() {
+    // 🔴 The gate on the whole paging path. Residency decides what has to move, never what is
+    // computed, so a token id that moves with the budget is a paging bug — a slot read before it
+    // was filled, or two experts sharing one. Sessions are built and dropped one at a time so
+    // this never holds two pools at once.
+    if session().is_none() {
+        eprintln!("skipped: set MOEARC_TEST_GPU=1 and MOEARC_OLMOE_MODEL=<file.gguf> to run");
+        return;
+    }
+    let n = 24;
+    for residency in [
+        // Above the per-token working set of 128 slots, at it, and far below it.
+        Residency::Slots(256),
+        Residency::Slots(128),
+        Residency::Slots(16),
+        // The incumbent, including the one setting where the ring survives between visits to
+        // the same block — the case that caught a slot collision the others could not.
+        Residency::StaticSplit { resident_blocks: 4 },
+        Residency::StaticSplit { resident_blocks: 15 },
+    ] {
+        let s = constrained(residency).expect("checked above");
+        let got = generate(&s, &PROMPT, n);
+        assert_eq!(
+            got,
+            LLAMA_CPP_GREEDY[..n].to_vec(),
+            "{residency:?} changed the output; first difference at index {:?}",
+            got.iter().zip(LLAMA_CPP_GREEDY.iter()).position(|(a, b)| a != b)
+        );
+        let r = s.residency().expect("residency");
+        assert!(r.resident_slots <= r.total_slots);
+        assert_eq!(r.stats.demands, r.stats.hits + r.stats.misses);
+    }
+}
+
+#[test]
+fn a_thrashing_cache_still_moves_exactly_the_bytes_it_claims() {
+    // Sixteen blocks x eight experts is 128 slots per token, so a pool below that cannot hold a
+    // token's working set and LRU evicts everything before it is wanted again. The interesting
+    // part is not that the hit rate is low — it is that the accounting stays exact, because the
+    // whole residency argument is made in these numbers.
+    let Some(s) = constrained(Residency::Slots(16)) else {
+        eprintln!("skipped: set MOEARC_TEST_GPU=1 and MOEARC_OLMOE_MODEL=<file.gguf> to run");
+        return;
+    };
+    let n = 8;
+    s.clear_residency().unwrap();
+    s.reset_cache_stats().unwrap();
+    let _ = generate(&s, &PROMPT, n);
+    let r = s.residency().unwrap();
+
+    let cfg = s.config();
+    // 🔴 `n - 1`, not `n`. The last token generated is emitted and never fed back: a token the
+    // caller has not accepted must not reach the KV cache, or a cancelled request would leave
+    // the sequence a token ahead of what the client saw. So a run of `n` tokens is
+    // `prompt + n - 1` decode steps, and getting this wrong looks exactly like a miscounting
+    // cache.
+    let steps = (PROMPT.len() + n - 1) as u64;
+    assert_eq!(r.stats.steps, steps * cfg.n_block as u64, "one admission per block per token");
+    assert_eq!(r.stats.demands, steps * (cfg.n_block * cfg.n_expert_used) as u64);
+    assert_eq!(
+        r.stats.hits,
+        0,
+        "a pool below one token's working set cannot hit; it measured {}",
+        r.stats.hit_rate()
+    );
+    assert_eq!(r.stats.misses, r.stats.demands);
+    // Every miss moved three banks out of the mapping. The bytes are counted from the slices
+    // uploaded, so this is a cross-check of the counter against the cache, not a restatement.
+    assert!(r.bytes_staged > 0);
+    assert!(
+        r.bytes_staged <= r.stats.misses * r.slot_bytes,
+        "staged {} B for {} misses of at most {} B each",
+        r.bytes_staged,
+        r.stats.misses,
+        r.slot_bytes
     );
 }
