@@ -12,7 +12,7 @@
 //! The fixture is committed, so this needs neither Python nor a FreeToken checkout.
 
 use moearc_engine::cache_budget::{
-    net_cache_budget_bytes, plan_cache_budget, required_bytes, resolve_moe_cache_auto,
+    AutoCacheRequest, PlanRequest, QuantFormat, net_cache_budget_bytes, required_bytes,
 };
 use serde::Deserialize;
 
@@ -100,7 +100,10 @@ struct Oracle {
 }
 
 fn load() -> Oracle {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/cache_budget_oracle.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/data/cache_budget_oracle.json"
+    );
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("oracle fixture missing at {path}: {e}"));
     serde_json::from_str(&raw).expect("oracle fixture is not valid JSON")
@@ -109,65 +112,77 @@ fn load() -> Oracle {
 #[test]
 fn plan_cache_budget_matches_the_reference() {
     let oracle = load();
-    assert!(oracle.plan.len() > 3000, "fixture looks truncated: {} cases", oracle.plan.len());
+    assert!(
+        oracle.plan.len() > 3000,
+        "fixture looks truncated: {} cases",
+        oracle.plan.len()
+    );
 
     let (mut accepted, mut rejected) = (0usize, 0usize);
     for (i, case) in oracle.plan.iter().enumerate() {
         let a = &case.args;
-        let got = plan_cache_budget(
-            a.budget_bytes,
-            a.per_expert_bytes,
-            a.cache_per_page,
-            a.num_experts,
-            a.total_experts,
-            a.prefill_overlap,
-            a.kv_reserve_pages,
-            a.max_slots,
-        );
+        let got = PlanRequest {
+            budget_bytes: a.budget_bytes,
+            per_expert_bytes: a.per_expert_bytes,
+            cache_per_page: a.cache_per_page,
+            num_experts: a.num_experts,
+            total_experts: a.total_experts,
+            prefill_overlap: a.prefill_overlap,
+            kv_reserve_pages: a.kv_reserve_pages,
+            max_slots: a.max_slots,
+        }
+        .plan();
         match (&case.ok, got) {
             (Some(want), Ok(p)) => {
                 assert_eq!(
                     (p.moe_cache_size, p.num_pages, p.prefill_overlap),
                     (want.moe_cache_size, want.num_pages, want.prefill_overlap),
-                    "case {i} ({}) disagreed on the plan", case.kind
+                    "case {i} ({}) disagreed on the plan",
+                    case.kind
                 );
                 accepted += 1;
             }
             (None, Err(_)) => rejected += 1,
             (Some(want), Err(e)) => panic!(
-                "case {i} ({}): reference accepted {want:?}, port rejected with {e}", case.kind
+                "case {i} ({}): reference accepted {want:?}, port rejected with {e}",
+                case.kind
             ),
             (None, Ok(p)) => panic!(
                 "case {i} ({}): reference rejected, port accepted {p:?} — this is the \
-                 dangerous direction, it plans a geometry that will overrun VRAM", case.kind
+                 dangerous direction, it plans a geometry that will overrun VRAM",
+                case.kind
             ),
         }
     }
     // Guard against a fixture that is all one outcome, which would make agreement vacuous.
-    assert!(accepted > 1000 && rejected > 1000, "lopsided fixture: {accepted} ok, {rejected} rejected");
+    assert!(
+        accepted > 1000 && rejected > 1000,
+        "lopsided fixture: {accepted} ok, {rejected} rejected"
+    );
     eprintln!("plan_cache_budget: {accepted} accepted + {rejected} rejected all agree");
 }
 
 #[test]
-fn resolve_moe_cache_auto_matches_the_reference() {
+fn auto_cache_request_matches_the_reference() {
     let oracle = load();
     let (mut accepted, mut rejected) = (0usize, 0usize);
     for (i, case) in oracle.resolve.iter().enumerate() {
         let a = &case.args;
-        let got = resolve_moe_cache_auto(
-            a.baseline_free,
-            a.weights_bytes,
-            a.memory_ratio,
-            a.cache_per_page,
-            a.fixed_cache_size,
-            a.per_expert_bytes,
-            a.num_experts,
-            a.total_experts,
-            a.prefill_overlap,
-            a.kv_reserve_tokens,
-            a.page_size,
-            &a.quant_format,
-        );
+        let got = AutoCacheRequest {
+            baseline_free: a.baseline_free,
+            weights_bytes: a.weights_bytes,
+            memory_ratio: a.memory_ratio,
+            cache_per_page: a.cache_per_page,
+            fixed_cache_size: a.fixed_cache_size,
+            per_expert_bytes: a.per_expert_bytes,
+            num_experts: a.num_experts,
+            total_experts: a.total_experts,
+            prefill_overlap: a.prefill_overlap,
+            kv_reserve_tokens: a.kv_reserve_tokens,
+            page_size: a.page_size,
+            quant_format: QuantFormat::parse(&a.quant_format),
+        }
+        .resolve();
         match (&case.ok, got) {
             (Some(want), Ok(p)) => {
                 assert_eq!(
@@ -178,11 +193,16 @@ fn resolve_moe_cache_auto_matches_the_reference() {
                 accepted += 1;
             }
             (None, Err(_)) => rejected += 1,
-            (Some(want), Err(e)) => panic!("resolve case {i}: reference gave {want:?}, port rejected: {e}"),
+            (Some(want), Err(e)) => {
+                panic!("resolve case {i}: reference gave {want:?}, port rejected: {e}")
+            }
             (None, Ok(p)) => panic!("resolve case {i}: reference rejected, port accepted {p:?}"),
         }
     }
-    assert!(accepted > 100 && rejected > 100, "lopsided: {accepted} ok, {rejected} rejected");
+    assert!(
+        accepted > 100 && rejected > 100,
+        "lopsided: {accepted} ok, {rejected} rejected"
+    );
     eprintln!("resolve_moe_cache_auto: {accepted} accepted + {rejected} rejected all agree");
 }
 
@@ -193,13 +213,23 @@ fn helper_arithmetic_matches_the_reference() {
     for (i, h) in oracle.helpers.iter().enumerate() {
         let a = &h.net.args;
         assert_eq!(
-            net_cache_budget_bytes(a.memory_ratio, a.baseline_free, a.weights_bytes, a.fixed_cache_size),
+            net_cache_budget_bytes(
+                a.memory_ratio,
+                a.baseline_free,
+                a.weights_bytes,
+                a.fixed_cache_size
+            ),
             h.net.want,
             "net_cache_budget_bytes case {i}"
         );
         let b = &h.req.args;
         assert_eq!(
-            required_bytes(b.moe_cache_size, b.num_pages, b.per_expert_bytes, b.cache_per_page),
+            required_bytes(
+                b.moe_cache_size,
+                b.num_pages,
+                b.per_expert_bytes,
+                b.cache_per_page
+            ),
             h.req.want,
             "required_bytes case {i}"
         );
