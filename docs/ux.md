@@ -87,6 +87,24 @@ OpenAI-compatible `/v1/chat/completions` on a predictable port, so every existin
 unchanged. Startup prints what it decided — devices, split, context — so a user can see the
 reasoning without enabling debug logging.
 
+## The interface: a TUI with Charm's aesthetic
+
+Owner's reference point is **Bubbletea/Charm** — which is Go, so we cannot use it. The Rust
+answer is **`ratatui`** (the maintained successor to tui-rs, and what `gitui`, `atuin`, `yazi`
+and `bottom` are built on), with `crossterm` as backend and `indicatif` for download progress.
+
+Bubbletea's value is two separable things, and both port:
+
+- **The Elm loop** — Model / Update / View with messages. Ratatui does not impose an
+  architecture, so this is a small hand-rolled pattern rather than a framework to go find.
+- **The look** — which is really `lipgloss`: rounded borders, generous padding, a restrained
+  palette, aligned columns, nothing shouting. Ratatui expresses all of it
+  (`Block::bordered().border_type(BorderType::Rounded)`, styled spans, layout constraints).
+
+The TUI is the *default* face of the tool — device report, model picker, download, the split it
+chose, live serving stats. Every TUI action must also exist as a flag, so the tool stays
+scriptable and CI-usable. **Nothing may be reachable only through the TUI.**
+
 ## What this rules out
 
 - Config files required before first run.
