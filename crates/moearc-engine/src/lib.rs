@@ -7,5 +7,6 @@
 //! (that dynamic residency beats a static split) can be tested before a kernel exists.
 
 pub mod cache;
+pub mod kv;
 pub mod memory;
 pub mod residency;
