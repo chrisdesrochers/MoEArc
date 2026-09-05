@@ -29,6 +29,19 @@ math, it is the environment. We refuse to have one.
 The SYCL kernels are the one component that cannot be Rust — they ship as a bundled shared
 library behind an FFI seam, not as something the user builds.
 
+**The binary brings its own dependencies.** MoEArc must never hand the user a list of things to
+go install. Today, getting an Arc card to run inference means chasing oneAPI runtimes, Level
+Zero loaders and compute-runtime packages across distro versions, and the failure mode is a wall
+of messages about missing libraries. We absorb that:
+
+- The oneAPI/SYCL runtime and Level Zero loader are **bundled or fetched by the installer**, not
+  prerequisites. The user installs one thing.
+- The only genuine external requirement is the **kernel-side GPU driver** (`xe` / `i915`), which
+  ships with the kernel and cannot be vendored. If it is missing, that is the *one* thing we ask
+  for — named exactly, with the reason, and nothing else alongside it.
+- No message the user sees may be a dependency complaint they are expected to resolve. Either we
+  install it, or we state precisely what is missing and why we cannot.
+
 ### 2. It finds the hardware itself
 
 `moearc` with no arguments enumerates the devices, names them, reports usable VRAM, and states
