@@ -10,3 +10,11 @@ authors.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+# Level Zero is opened with dlopen at runtime rather than linked at build time. See the
+# module docs in `src/ze.rs` for why this is a product requirement and not a preference.
+libloading = "0.8"
+
+[[bin]]
+name = "moearc-device-report"
+path = "src/bin/report.rs"
