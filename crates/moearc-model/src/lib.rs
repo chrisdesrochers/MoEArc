@@ -25,6 +25,7 @@
 pub mod gguf;
 pub mod pull;
 pub mod quant;
+pub mod tensors;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -107,6 +108,31 @@ pub enum ModelError {
         expert + dense
     )]
     WeightsPartitionMismatch { dense: u64, expert: u64, total: u64 },
+
+    #[error("the model has no tensor named `{name}`")]
+    TensorNotFound { name: String },
+
+    #[error(
+        "tensor `{tensor}` has rank {rank}; slicing one index out of it needs at least 2 dimensions"
+    )]
+    NotSliceable { tensor: String, rank: usize },
+
+    #[error(
+        "tensor `{tensor}` has {count} slices along its last dimension; {index} is out of range"
+    )]
+    SliceOutOfRange { tensor: String, index: u64, count: u64 },
+
+    #[error(
+        "tensor `{tensor}` slices into {count} x {slice_bytes} B, which is not the {total_bytes} B \
+         it occupies; the slice arithmetic and the tensor size disagree"
+    )]
+    SliceStrideMismatch { tensor: String, slice_bytes: u64, count: u64, total_bytes: u64 },
+
+    #[error(
+        "expert bank `{tensor}` stacks {last_dim} matrices but the model declares {expert_count} \
+         experts; this tensor is not the expert bank it was addressed as"
+    )]
+    ExpertBankShape { tensor: String, last_dim: u64, expert_count: u32 },
 }
 
 /// What a model file says about itself.
@@ -261,7 +287,7 @@ impl ModelInfo {
 /// A slot in the MoE cache holds one expert's share of all three. Architectures vary: most
 /// carry gate/up/down, a few omit the gate (no GLU), so this sums whichever are present rather
 /// than requiring all three.
-const EXPERT_TENSORS: [&str; 3] =
+pub(crate) const EXPERT_TENSORS: [&str; 3] =
     ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"];
 
 /// Whether a tensor belongs to a block's expert bank.
@@ -342,7 +368,7 @@ fn expert_geometry(h: &GgufHeader, total_experts: u32) -> Result<ExpertGeometry,
 ///
 /// `attn_k`/`attn_v` are the ordinary projections. `attn_k_b`/`attn_v_b` are DeepSeek-style
 /// MLA, where the cached thing is the latent, but the block is still a KV-caching block.
-const KV_TENSORS: [&str; 4] =
+pub(crate) const KV_TENSORS: [&str; 4] =
     ["attn_k.weight", "attn_v.weight", "attn_k_b.weight", "attn_v_b.weight"];
 
 /// Bytes of KV cache one token needs, and how many blocks contribute.
@@ -417,7 +443,7 @@ fn kv_bytes_per_token(
 ///
 /// Returns [`None`] for anything else, which is how non-block tensors (`token_embd.weight`,
 /// `output.weight`) are filtered out without a second list to keep in sync.
-fn split_block_tensor(name: &str) -> Option<(u32, &str)> {
+pub(crate) fn split_block_tensor(name: &str) -> Option<(u32, &str)> {
     let rest = name.strip_prefix("blk.")?;
     let dot = rest.find('.')?;
     Some((rest[..dot].parse().ok()?, &rest[dot + 1..]))
