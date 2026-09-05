@@ -16,6 +16,31 @@ software that solves a different problem than ours.
 | `libloading` | Level Zero at runtime | Lets the binary `dlopen` `libze_loader` instead of linking it, so it still starts and can explain itself on a machine with no Level Zero runtime. Directly serves the "brings its own dependencies" rule. |
 | `serde` / `serde_json` | Config, `--json` output, test fixtures | Unavoidable and universal. |
 
+### `hf-hub` — Hugging Face's own Hub client · adopted, with a cost worth stating
+
+Adopted for `moearc pull`. It knows the Hub's repo/revision/blob semantics, and reimplementing
+those correctly is not a weekend.
+
+**It costs 213 transitive crates, up from 2.** `reqwest`, `tokio`, `hf-xet` and `rustls` come
+with it, and that is by a wide margin the largest dependency footprint in this workspace. Worth
+it for Hub semantics; not worth it for anything we could write ourselves.
+
+Two things had to be worked around rather than used, both found by running it:
+
+- **It does not resume.** `download_file` opens its destination with `File::create`, which
+  truncates, and issues a plain `GET` with no `Range` header. A 20 GiB interruption would
+  restart from zero. We use `download_file_stream` and own the file handling.
+- **`get_file_metadata` fails on every real GGUF repo**: it HEADs the resolve URL, the HEAD
+  redirects to the CDN, and the CDN response carries no `X-Repo-Commit`, which `hf-hub` treats
+  as malformed. We use `paths-info` instead, which also returns the true blob size rather than
+  the ~134-byte LFS *pointer* length.
+
+⚠️ **One open conflict with the single-binary goal in `ux.md`.** We enable `rustls-tls`, but
+`hf-hub` declares `reqwest` without `default-features = false`, so `native-tls` — and therefore
+a link against the system OpenSSL — stays enabled underneath. Closing that needs an upstream
+change. Until it is closed, **we cannot claim a fully static binary**, and the claim is not
+being made.
+
 ## Evaluated, not adopted
 
 ### `oneapi-rs` — official Rust SYCL bindings · Apache-2.0/MIT · **watching**
