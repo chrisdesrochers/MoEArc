@@ -19,6 +19,13 @@ pub struct MoearcCtx {
 unsafe extern "C" {
     pub fn moearc_ctx_create() -> *mut MoearcCtx;
     pub fn moearc_ctx_destroy(c: *mut MoearcCtx);
+    pub fn moearc_profile_events_enabled(c: *mut MoearcCtx) -> c_int;
+    pub fn moearc_profile_events_reset(c: *mut MoearcCtx) -> c_int;
+    pub fn moearc_profile_events_report(
+        c: *mut MoearcCtx,
+        out: *mut std::os::raw::c_char,
+        cap: c_ulong,
+    ) -> c_int;
     pub fn moearc_sync(c: *mut MoearcCtx) -> c_int;
     pub fn moearc_zero(c: *mut MoearcCtx, dst: *mut c_float, n: c_ulong) -> c_int;
     pub fn moearc_device_name(c: *mut MoearcCtx, out: *mut c_char, cap: c_ulong) -> c_int;

@@ -95,6 +95,10 @@ enum Command {
     Reset,
     /// Zero the cache counters, keeping what is resident.
     ResetCacheStats,
+    /// Per-kernel device time from the SYCL events themselves.
+    EventProfile,
+    /// Discard accumulated per-kernel device time.
+    ResetEventProfile,
     /// Drop everything resident, so the next token pays a cold cache.
     ClearResidency,
     Residency,
@@ -105,6 +109,7 @@ enum Reply {
     Ready(Box<SessionInfo>),
     Logits(Vec<f32>, Option<Tap>),
     Residency(Box<ResidencyReport>),
+    EventProfile(Vec<(String, u64, u64)>),
     Done,
     Failed(String),
 }
@@ -202,6 +207,31 @@ impl Session {
             Reply::Failed(m) => Err(EngineError::Unsupported(m)),
             _ => Err(EngineError::Unsupported("unexpected reply from the device".to_string())),
         }
+    }
+
+    /// Per-kernel device time, as `(key, nanoseconds, calls)`.
+    ///
+    /// Empty unless the process was started with `MOEARC_PROFILE_EVENTS=1`. 🔴 Unlike
+    /// `MOEARC_SYNC_EACH`, this leaves the queue asynchronous, so it reports where device time
+    /// goes in a step that still overlaps — which is the only version of that question worth
+    /// answering. It blocks until outstanding work completes, so call it after a generation,
+    /// not during one.
+    pub fn event_profile(&self) -> Result<Vec<(String, u64, u64)>, EngineError> {
+        let link = self.link.lock().expect("the device thread panicked");
+        send(&link, Command::EventProfile)?;
+        match recv(&link)? {
+            Reply::EventProfile(v) => Ok(v),
+            Reply::Failed(m) => Err(EngineError::Unsupported(m)),
+            _ => Err(EngineError::Unsupported("unexpected reply from the device".to_string())),
+        }
+    }
+
+    /// Discard accumulated per-kernel device time, so a warm-up is not averaged into a
+    /// steady-state measurement.
+    pub fn reset_event_profile(&self) -> Result<(), EngineError> {
+        let link = self.link.lock().expect("the device thread panicked");
+        send(&link, Command::ResetEventProfile)?;
+        expect_done(&link)
     }
 
     /// Cache counters only. Residency is left exactly as it is, which is what makes a
@@ -462,6 +492,14 @@ fn worker(
                 model.reset_cache_stats();
                 Reply::Done
             }
+            Command::EventProfile => match ctx.event_profile() {
+                Ok(v) => Reply::EventProfile(v),
+                Err(e) => Reply::Failed(e.to_string()),
+            },
+            Command::ResetEventProfile => match ctx.reset_event_profile() {
+                Ok(()) => Reply::Done,
+                Err(e) => Reply::Failed(e.to_string()),
+            },
             Command::ClearResidency => match model.clear_residency() {
                 Ok(()) => Reply::Done,
                 Err(e) => Reply::Failed(e.to_string()),

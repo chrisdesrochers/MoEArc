@@ -242,6 +242,57 @@ impl Context {
         Ok(DeviceBuffer { ptr, len: bytes, ctx: self })
     }
 
+    /// Whether this queue carries device timestamps — `MOEARC_PROFILE_EVENTS=1` at
+    /// [`Context::new`].
+    pub fn event_profiling(&self) -> bool {
+        unsafe { ffi::moearc_profile_events_enabled(self.raw) != 0 }
+    }
+
+    /// Discard accumulated per-kernel device times.
+    pub fn reset_event_profile(&self) -> Result<(), KernelError> {
+        let rc = unsafe { ffi::moearc_profile_events_reset(self.raw) };
+        self.finish(rc, "event profile reset")
+    }
+
+    /// Per-kernel device time, as `(key, nanoseconds, calls)`.
+    ///
+    /// 🔴 The point of this over `MOEARC_SYNC_EACH`: it reads the timestamps SYCL already
+    /// attaches to each submission, so the queue stays asynchronous and kernels still overlap.
+    /// `MOEARC_SYNC_EACH` buys the same attribution by waiting after every launch — correct for
+    /// "how long is this kernel" and actively misleading for "where does the step's time go",
+    /// because the waiting is itself the thing being measured.
+    ///
+    /// ⚠️ This **blocks** until every outstanding event has completed, so it belongs after the
+    /// work being measured and never inside it. Returns empty unless `event_profiling()`.
+    ///
+    /// The key carries the kernel's shape (`mvq_batched r768 m16`) because several distinct
+    /// phases share one entry point, and summing them would hide the comparison this exists for.
+    pub fn event_profile(&self) -> Result<Vec<(String, u64, u64)>, KernelError> {
+        let mut buf = vec![0u8; 1 << 16];
+        let rc = unsafe {
+            ffi::moearc_profile_events_report(
+                self.raw,
+                buf.as_mut_ptr().cast(),
+                buf.len() as ffi::c_ulong,
+            )
+        };
+        self.finish(rc, "event profile report")?;
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        let text = String::from_utf8_lossy(&buf[..end]).into_owned();
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let mut it = line.rsplitn(3, ' ');
+            let (Some(calls), Some(ns), Some(key)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let (Ok(ns), Ok(calls)) = (ns.parse::<u64>(), calls.parse::<u64>()) else {
+                continue;
+            };
+            out.push((key.to_string(), ns, calls));
+        }
+        Ok(out)
+    }
+
     /// Copy host bytes to a device buffer.
     pub fn upload(&self, dst: &DeviceBuffer<'_>, src: &[u8]) -> Result<(), KernelError> {
         let n = src.len().min(dst.len);

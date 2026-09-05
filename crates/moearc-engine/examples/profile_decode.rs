@@ -75,19 +75,40 @@ fn main() -> ExitCode {
     };
     println!("device        {}", session.info().device);
 
+    // 🔴 The warm-up is its own generation, and the device-event counters are cleared between
+    // the two.
+    //
+    // Those counters are cumulative from process start, and — unlike `profile::reset()`, which
+    // is a free function — clearing them means calling back into the `Session`. `on_token` runs
+    // while `generate` holds the session's link mutex, so doing it from the callback deadlocks.
+    // (It did. That is why this is two calls and not a branch inside one.)
+    //
+    // Left uncleared, the prompt pass and the cold-cache warm-up fold into a steady-state
+    // per-token figure: measured, that inflated every kernel by 17% and reported `calls/tok` of
+    // 55.3 on a model with 48 blocks. **`calls/tok` landing on a whole number is the check that
+    // this is right**, and it is worth glancing at every time.
+    let warm = StopConditions { max_tokens: WARMUP, stop_tokens: Vec::new() };
+    if let Err(e) = session.generate(&tokens, &warm, &mut |_| true) {
+        eprintln!("warm-up failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = session.reset_event_profile() {
+        eprintln!("could not clear the device-event counters: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // 🔴 Everything below is per **decode step**, not per emitted token, and the two are not the
+    // same number: `generate` decodes the whole prompt and then feeds back each accepted token
+    // except the last, so `n` tokens cost `prompt + n - 1` steps. The host phases and the device
+    // events are now reset together, immediately before this generation, so both cover exactly
+    // these steps. Dividing by tokens instead put `calls/step` at 55.3 on a 48-block model —
+    // which is the check: **this number must come out at 48.**
+    profile::reset();
     let stop = StopConditions { max_tokens: n_predict, stop_tokens: Vec::new() };
-    let mut step = 0usize;
-    // Wall clock for the measured window only, so tok/s and the breakdown describe the same
-    // tokens.
-    let mut measured_from = Instant::now();
     let mut ids = Vec::new();
+    let measured_from = Instant::now();
     let r = session.generate(&tokens, &stop, &mut |t| {
         ids.push(t);
-        step += 1;
-        if step == WARMUP {
-            profile::reset();
-            measured_from = Instant::now();
-        }
         true
     });
     let wall = measured_from.elapsed();
@@ -95,10 +116,42 @@ fn main() -> ExitCode {
         eprintln!("generate failed: {e}");
         return ExitCode::FAILURE;
     }
-    let measured = step.saturating_sub(WARMUP);
+    let measured = tokens.len() + ids.len().saturating_sub(1);
     if measured == 0 {
-        eprintln!("nothing measured: ask for more than {WARMUP} tokens");
+        eprintln!("nothing measured");
         return ExitCode::FAILURE;
+    }
+
+    // Device timestamps from the events themselves, if the queue was built to carry them.
+    // Printed alongside the host-side phases on purpose: the two disagreeing is the finding.
+    match session.event_profile() {
+        Ok(ev) if !ev.is_empty() => {
+            let total_ns: u64 = ev.iter().map(|(_, ns, _)| *ns).sum();
+            println!("\ndevice time from SYCL events (queue still asynchronous)");
+            println!("{:<26} {:>10} {:>10} {:>9}", "kernel", "ms/step", "calls/step", "us/call");
+            let mut rows = ev.clone();
+            rows.sort_by_key(|(_, ns, _)| std::cmp::Reverse(*ns));
+            for (key, ns, calls) in &rows {
+                println!(
+                    "{:<26} {:>10.2} {:>10.1} {:>9.1}",
+                    key,
+                    *ns as f64 / 1e6 / measured as f64,
+                    *calls as f64 / measured as f64,
+                    *ns as f64 / 1e3 / *calls as f64
+                );
+            }
+            let busy_ms = total_ns as f64 / 1e6 / measured as f64;
+            let step_ms = wall.as_secs_f64() * 1000.0 / measured as f64;
+            println!(
+                "{:<26} {:>10.2}   tracked device busy, {:.1}% of the {:.2} ms step",
+                "TRACKED BUSY",
+                busy_ms,
+                100.0 * busy_ms / step_ms,
+                step_ms
+            );
+        }
+        Ok(_) => println!("\n(set MOEARC_PROFILE_EVENTS=1 for per-kernel device time)"),
+        Err(e) => println!("\nevent profile unavailable: {e}"),
     }
 
     let phases = profile::report();
@@ -106,8 +159,8 @@ fn main() -> ExitCode {
     let sum: f64 = phases.iter().filter(|p| p.name != "decode.total").map(|p| p.seconds).sum();
 
     println!(
-        "\nsteady state over {measured} tokens ({:.2} tok/s)",
-        measured as f64 / wall.as_secs_f64()
+        "\nsteady state over {measured} decode steps ({:.2} tok/s)",
+        ids.len() as f64 / wall.as_secs_f64()
     );
     println!(
         "{:<20} {:>10} {:>9} {:>9} {:>7}",

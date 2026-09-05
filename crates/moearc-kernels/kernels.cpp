@@ -7,6 +7,11 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace sycl;
 
@@ -543,7 +548,7 @@ static constexpr int MATVEC_ROWS = 8;
 /// eight of thirty-two lanes had work and twenty-four sat out. Splitting by unit gives sixty-four
 /// pieces to thirty-two lanes.
 template <unsigned int TY>
-static void matvec_q_submit(queue &q, float *out, const void *w, const float *x,
+static event matvec_q_submit(queue &q, float *out, const void *w, const float *x,
                             unsigned long n_rows, unsigned long n_cols) {
     constexpr int BB = const_block_bytes<TY>();
     constexpr int UPB = units_per_block<TY>();
@@ -552,7 +557,7 @@ static void matvec_q_submit(queue &q, float *out, const void *w, const float *x,
     const unsigned long row_bytes = nb * (unsigned long) BB;
     const unsigned long groups = (n_rows + MATVEC_ROWS - 1) / (unsigned long) MATVEC_ROWS;
     const auto *base = static_cast<const unsigned char *>(w);
-    q.parallel_for(
+    return q.parallel_for(
         nd_range<1>{range<1>{groups * (MATVEC_ROWS * WG)}, range<1>{MATVEC_ROWS * WG}},
         [=](nd_item<1> it) [[sycl::reqd_sub_group_size(WG)]] {
             const auto sg = it.get_sub_group();
@@ -602,7 +607,7 @@ struct mat_table {
 /// what the gate and up projections do; the down projection passes `n_ff` because each expert
 /// consumes its own.
 template <unsigned int TY>
-static void matvec_q_batched_submit(queue &q, float *out, mat_table w, unsigned int n_mat,
+static event matvec_q_batched_submit(queue &q, float *out, mat_table w, unsigned int n_mat,
                                     const float *x, unsigned long x_stride,
                                     unsigned long n_rows, unsigned long n_cols) {
     constexpr int BB = const_block_bytes<TY>();
@@ -612,7 +617,7 @@ static void matvec_q_batched_submit(queue &q, float *out, mat_table w, unsigned 
     const unsigned long row_bytes = nb * (unsigned long) BB;
     const unsigned long per_mat = (n_rows + MATVEC_ROWS - 1) / (unsigned long) MATVEC_ROWS;
     const unsigned long groups = per_mat * (unsigned long) n_mat;
-    q.parallel_for(
+    return q.parallel_for(
         nd_range<1>{range<1>{groups * (MATVEC_ROWS * WG)}, range<1>{MATVEC_ROWS * WG}},
         [=](nd_item<1> it) [[sycl::reqd_sub_group_size(WG)]] {
             const auto sg = it.get_sub_group();
@@ -637,11 +642,11 @@ static void matvec_q_batched_submit(queue &q, float *out, mat_table w, unsigned 
 /// The unhoisted path: one element at a time through `elem_at`, for the formats that have no
 /// 32-element unit to hoist anything out of (f16, f32). Shared by the single and batched entry
 /// points so the two cannot drift.
-static void matvec_generic_submit(queue &q, unsigned int type_id, int bb, float *out,
+static event matvec_generic_submit(queue &q, unsigned int type_id, int bb, float *out,
                                   const void *w, const float *x, unsigned long n_rows,
                                   unsigned long n_cols) {
     const auto *base = static_cast<const unsigned char *>(w);
-    q.parallel_for(nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}}, [=](nd_item<1> it) {
+    return q.parallel_for(nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}}, [=](nd_item<1> it) {
         const size_t row = it.get_group(0);
         const size_t lid = it.get_local_id(0);
         float acc = 0.0f;
@@ -655,9 +660,70 @@ static void matvec_generic_submit(queue &q, unsigned int type_id, int bb, float 
 
 extern "C" {
 
+/// One kernel's accumulated device time, keyed by kernel and shape.
+struct kernel_time {
+    std::string key;
+    unsigned long long ns;
+    unsigned long long calls;
+};
+
 struct moearc_ctx {
     queue q;
+    /// Whether the queue was built with `enable_profiling`. See `moearc_ctx_create`.
+    bool profiling = false;
+    /// Events submitted but not yet folded into `totals`. Drained lazily, never waited on
+    /// early: reading a profiling timestamp requires the event to have completed, so draining
+    /// at submission time would reintroduce exactly the synchronisation this exists to avoid.
+    std::vector<std::pair<std::string, event>> pending;
+    std::vector<kernel_time> totals;
 };
+
+/// Fold every completed event into `totals`.
+///
+/// 🔴 Called only from `moearc_profile_events_report`, i.e. after the caller has already
+/// finished the work it wants to measure. `get_profiling_info` blocks until the event
+/// completes, so calling this mid-stream would serialise the queue and produce the same
+/// distortion `MOEARC_SYNC_EACH` produces.
+static void moearc_flush_events(moearc_ctx *c) {
+    for (auto &pe : c->pending) {
+        unsigned long long ns = 0;
+        try {
+            const auto t0 = pe.second.get_profiling_info<info::event_profiling::command_start>();
+            const auto t1 = pe.second.get_profiling_info<info::event_profiling::command_end>();
+            ns = (t1 > t0) ? (unsigned long long) (t1 - t0) : 0ull;
+        } catch (...) {
+            continue;  // a backend that will not profile this event is skipped, not guessed at
+        }
+        bool found = false;
+        for (auto &kt : c->totals) {
+            if (kt.key == pe.first) {
+                kt.ns += ns;
+                kt.calls += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) c->totals.push_back(kernel_time{pe.first, ns, 1});
+    }
+    c->pending.clear();
+}
+
+/// Record one submission's event under a key that carries the kernel's shape.
+///
+/// The shape is in the key on purpose: every quantised mat-vec in this engine goes through two
+/// entry points, so without it `out.matvec`, `attn.qkv` and `attn.proj` would be summed into one
+/// number and the question this instrument exists to answer -- what a batched launch costs
+/// against an unbatched one -- would be unanswerable.
+static void moearc_track(moearc_ctx *c, const char *what, unsigned long n_rows, unsigned int n_mat,
+                         const event &e) {
+    if (!c->profiling) return;
+    char key[96];
+    std::snprintf(key, sizeof(key), "%s r%lu m%u", what, n_rows, n_mat);
+    c->pending.emplace_back(std::string(key), e);
+    // A token submits a few hundred events; a long run would otherwise hold every one of them
+    // alive. Anything this far back is long complete, so folding it in costs nothing.
+    if (c->pending.size() >= 16384) moearc_flush_events(c);
+}
 
 // ---- lifecycle ------------------------------------------------------------------------
 moearc_ctx *moearc_ctx_create() {
@@ -667,13 +733,69 @@ moearc_ctx *moearc_ctx_create() {
         // still writing is the queue's ordering, not a synchronisation after every launch.
         // An out-of-order queue with these submissions would produce output that is finite,
         // fluent and wrong.
-        return new moearc_ctx{queue{gpu_selector_v, property::queue::in_order()}};
+        // `MOEARC_PROFILE_EVENTS=1` adds `enable_profiling`, which makes every submission
+        // carry device timestamps. That is the only way to attribute device time per kernel
+        // **without** serialising -- `MOEARC_SYNC_EACH` buys the same attribution by waiting
+        // after every launch, which destroys exactly the overlap it is then used to reason
+        // about. Off by default because enabling profiling on a queue is not free.
+        const char *ev = std::getenv("MOEARC_PROFILE_EVENTS");
+        const bool want_profiling = ev != nullptr && ev[0] == '1';
+        auto *c = want_profiling
+                      ? new moearc_ctx{queue{gpu_selector_v,
+                                             property_list{property::queue::in_order(),
+                                                           property::queue::enable_profiling()}}}
+                      : new moearc_ctx{queue{gpu_selector_v, property::queue::in_order()}};
+        c->profiling = want_profiling;
+        return c;
     } catch (...) {
         return nullptr;
     }
 }
 
 void moearc_ctx_destroy(moearc_ctx *c) { delete c; }
+
+// ---- event profiling -------------------------------------------------------------------
+//
+// Per-kernel device time, taken from the SYCL events themselves, on a queue that is still
+// asynchronous. `MOEARC_SYNC_EACH` answers the same question by waiting after every launch,
+// which is sound for attribution and useless for anything that depends on kernels overlapping.
+// This is the instrument to prefer; see `moearc_ctx_create`.
+
+int moearc_profile_events_enabled(moearc_ctx *c) { return (c && c->profiling) ? 1 : 0; }
+
+int moearc_profile_events_reset(moearc_ctx *c) {
+    if (!c) return ERR;
+    c->pending.clear();
+    c->totals.clear();
+    return OK;
+}
+
+// Write one `key nanoseconds calls` line per kernel shape into `out`.
+//
+// Drains outstanding events first, which blocks until they complete -- call it after the work
+// being measured, never inside it.
+int moearc_profile_events_report(moearc_ctx *c, char *out, unsigned long cap) {
+    if (!c || !out || cap == 0) return ERR;
+    if (!c->profiling) {
+        out[0] = '\0';
+        return OK;
+    }
+    try {
+        moearc_flush_events(c);
+        unsigned long used = 0;
+        for (const auto &kt : c->totals) {
+            char line[160];
+            const int n = std::snprintf(line, sizeof(line), "%s %llu %llu\n", kt.key.c_str(),
+                                        kt.ns, kt.calls);
+            if (n <= 0 || used + (unsigned long) n + 1 > cap) break;
+            std::memcpy(out + used, line, (unsigned long) n);
+            used += (unsigned long) n;
+        }
+        out[used] = '\0';
+        return OK;
+    } catch (...) { return ERR; }
+}
+
 
 // Block until everything submitted to the queue has finished.
 //
@@ -857,22 +979,27 @@ int moearc_matvec_q(moearc_ctx *c, unsigned int type_id, float *out, const void 
     try {
         switch (type_id) {
             case GGML_TYPE_Q4_K:
-                matvec_q_submit<GGML_TYPE_Q4_K>(c->q, out, w, x, n_rows, n_cols);
+                moearc_track(c, "mvq", n_rows, 1,
+                             matvec_q_submit<GGML_TYPE_Q4_K>(c->q, out, w, x, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q5_K:
-                matvec_q_submit<GGML_TYPE_Q5_K>(c->q, out, w, x, n_rows, n_cols);
+                moearc_track(c, "mvq", n_rows, 1,
+                             matvec_q_submit<GGML_TYPE_Q5_K>(c->q, out, w, x, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q6_K:
-                matvec_q_submit<GGML_TYPE_Q6_K>(c->q, out, w, x, n_rows, n_cols);
+                moearc_track(c, "mvq", n_rows, 1,
+                             matvec_q_submit<GGML_TYPE_Q6_K>(c->q, out, w, x, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q8_0:
-                matvec_q_submit<GGML_TYPE_Q8_0>(c->q, out, w, x, n_rows, n_cols);
+                moearc_track(c, "mvq", n_rows, 1,
+                             matvec_q_submit<GGML_TYPE_Q8_0>(c->q, out, w, x, n_rows, n_cols));
                 break;
             default:
                 // f32 and f16 are "blocks" of one element, so there is no unit to hoist
                 // anything out of and no constraint that `n_cols` be a multiple of 32. One
                 // element per step, straight through `elem_at`.
-                matvec_generic_submit(c->q, type_id, bb, out, w, x, n_rows, n_cols);
+                moearc_track(c, "mv_generic", n_rows, 1,
+                             matvec_generic_submit(c->q, type_id, bb, out, w, x, n_rows, n_cols));
                 break;
         }
         return OK;
@@ -934,27 +1061,34 @@ int moearc_matvec_q_batched(moearc_ctx *c, unsigned int type_id, float *out,
     try {
         switch (type_id) {
             case GGML_TYPE_Q4_K:
-                matvec_q_batched_submit<GGML_TYPE_Q4_K>(c->q, out, t, n_mat, x, x_stride, n_rows,
-                                                        n_cols);
+                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                             matvec_q_batched_submit<GGML_TYPE_Q4_K>(
+                                 c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q5_K:
-                matvec_q_batched_submit<GGML_TYPE_Q5_K>(c->q, out, t, n_mat, x, x_stride, n_rows,
-                                                        n_cols);
+                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                             matvec_q_batched_submit<GGML_TYPE_Q5_K>(
+                                 c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q6_K:
-                matvec_q_batched_submit<GGML_TYPE_Q6_K>(c->q, out, t, n_mat, x, x_stride, n_rows,
-                                                        n_cols);
+                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                             matvec_q_batched_submit<GGML_TYPE_Q6_K>(
+                                 c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q8_0:
-                matvec_q_batched_submit<GGML_TYPE_Q8_0>(c->q, out, t, n_mat, x, x_stride, n_rows,
-                                                        n_cols);
+                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                             matvec_q_batched_submit<GGML_TYPE_Q8_0>(
+                                 c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             default:
                 // No unit structure to batch over; issue the generic path per matrix. Correct,
                 // and no slower than the unbatched call it replaces.
                 for (unsigned int m = 0; m < n_mat; ++m) {
-                    matvec_generic_submit(c->q, type_id, bb, out + (size_t) m * n_rows, t.p[m],
-                                          x + (size_t) m * x_stride, n_rows, n_cols);
+                    moearc_track(c, "mv_generic", n_rows, 1,
+                                 matvec_generic_submit(c->q, type_id, bb,
+                                                       out + (size_t) m * n_rows, t.p[m],
+                                                       x + (size_t) m * x_stride, n_rows,
+                                                       n_cols));
                 }
                 break;
         }

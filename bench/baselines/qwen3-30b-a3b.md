@@ -182,3 +182,67 @@ GB/s), the lm_head (4.0 ms at 63 GB/s), attention (9.8 ms), and a pinned staging
 leaves 88%. Nothing detects it at load: `malloc_device` returns valid pointers past the point
 where the memory exists, so the pool reports its size and the first token fails. Measured rows
 are in `Headroom::PROVISIONAL` and `Residency::All`.
+
+---
+
+## The instrument, and what it says once you have one
+
+`MOEARC_SYNC_EACH=1` buys per-phase attribution by waiting after every launch — sound for "how
+long is this kernel", and structurally unable to answer "where does the step's time go", because
+the waiting is itself what is being measured. After two wrong conclusions in one day from
+host-side timers, the engine now carries the instrument that does not have to choose:
+**`MOEARC_PROFILE_EVENTS=1`** builds the queue with `enable_profiling` and reads each
+submission's own device timestamps, leaving the queue asynchronous.
+
+Two checks before trusting it. **It costs ~5%** (26.6 -> 25.2 tok/s, measured), against
+`SYNC_EACH`'s ~10% *plus* the serialisation. And **`calls/step` must come out at 48** on a
+48-block model — it read 55.3 at first, because the counters are cumulative from process start
+and were folding in the prompt pass and the warm-up.
+
+**The verdict on `SYNC_EACH`: it was broadly right.** Free-running device time agrees with it to
+within ~15%, so the kernel-bound conclusion stands and was not an artifact of the instrument.
+
+### Per-kernel device time, queue asynchronous, 68 decode steps at 2952 slots
+
+| kernel | ms/step | bytes/step | achieved | % of 456 GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| expert down, batched Q6_K/Q4_K (`r2048 m8`) | 3.11 | 418 MB | 134 GB/s | 29% |
+| expert gate+up, batched Q4_K (`r768 m16`) | 5.39 | 679 MB | 126 GB/s | 28% |
+| `attn_q`, Q4_K (`r4096 m1`) | 1.89 | 226 MB | 120 GB/s | 26% |
+| `attn_output`, Q4_K (`r2048 m1`) | 2.00 | 226 MB | 113 GB/s | 25% |
+| **lm_head, Q6_K (`r151936 m1`)** | **4.03** | 255 MB | **63 GB/s** | **14%** |
+| `attn_k`+`attn_v` (`r512 m1`, x2) | 0.97 | 63 MB | 65 GB/s | 14% |
+| **tracked matvec busy** | **17.38** | | | **46% of the 37.66 ms step** |
+
+### 🔴 The `mat_table` finding does not transfer either
+
+An isolated microbenchmark on this card measured our by-value 32-pointer weight table at
+**1.66x slower** than a base-pointer-plus-stride kernel (141 vs 235 GB/s), and it reconciled
+independently with `moe.expert_down`'s 133 GB/s. It was the best-supported lever we had.
+
+**In the engine the batched kernels — the ones that use `mat_table` — are the *fastest* per byte
+we have**: 126 and 134 GB/s, against 113-120 GB/s for unbatched Q4_K matvecs of comparable size
+on the same queue in the same step. Whatever the microbenchmark measured, it is not what this
+kernel does. `mat_table` is not the bottleneck and restructuring the expert pool to remove it is
+not justified.
+
+That is the **second** finding from the same harness to fail in place, after the device-`half`
+conversion. Both were well-argued and both were measured — just not on this kernel. The standing
+rule that comes out of it: **a microbenchmark of "the same kernel" is not this kernel; port the
+change and measure in the engine before believing any of it.**
+
+### What the numbers actually name
+
+1. **Q6_K is half the efficiency of everything else.** The lm_head runs at **63 GB/s** where every
+   Q4_K matvec manages 113-134, and it is 4.03 ms — 11% of the step — in a single call. Expert
+   down is Q6_K in 24 of 48 blocks and is dragged by the same thing. This is the largest
+   *efficiency* gap in the engine and it is one kernel's inner loop.
+2. **Staging cannot overlap with compute.** `moe.stage` is ~11 ms and its copies go into the
+   **same in-order queue** as the kernels, so a token's transfers and its arithmetic are strictly
+   serialised. Tracked matvecs (17.4 ms) plus the untracked kernels (~7.7 ms by `SYNC_EACH`)
+   account for ~25 ms of a 37.7 ms step; staging is most of the rest. A second queue with
+   explicit event dependencies — the expert matvec waiting on its own staging copy while the
+   same block's attention runs — is the shape of the fix, and the in-order safety argument that
+   the whole engine rests on would have to be re-made explicitly rather than inherited.
+3. **Everything Q4_K sits at 25-29% of peak** against llama.cpp SYCL's ~63% on this card. That
+   remains the standing gap, and neither of the two candidate explanations tested today survived.
