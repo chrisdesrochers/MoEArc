@@ -687,6 +687,58 @@ int moearc_copy_d2h(moearc_ctx *c, void *dst, const void *src, unsigned long byt
     try { c->q.memcpy(dst, src, bytes).wait_and_throw(); return 0; } catch (...) { return -1; }
 }
 
+// Host-to-device copy that submits and returns.
+//
+// 🔴 **The mechanism is not what it looks like, and the obvious explanation is wrong.**
+//
+// It is tempting to say the blocking `moearc_copy_h2d` "drains the queue", which it does in
+// general. But trace the in-order queue through one block of `moearc-engine`'s decode: the
+// router's top-k is submitted, then its result is **read back** — and that read drains
+// everything. Admission is host-only. So by the time staging runs **the queue is already
+// empty**, and each blocking upload waits for nothing but itself.
+//
+// What the wait actually cost was **overlap**. Serialised, copy n+1 could not be submitted
+// until copy n had landed, so the copy engine never had a queue to stream and the host never
+// ran ahead into the next block's kernels. Measured on Qwen3-30B-A3B at 2952 resident slots,
+// 95 steady-state tokens, changing only this:
+//
+//     moe.stage       17.33 -> 10.11 ms/token
+//     decode.total    43.19 -> 37.51 ms/token
+//     throughput      22.87 -> 26.28 tok/s          (+15%)
+//
+// with every greedy token id, every cache hit rate and every staged-byte count unchanged.
+//
+// ⚠️ **Do not compare what remains against the 13.4 GB/s in `docs/roadmap.md`.** That figure
+// comes from `tools/stream_bench.cpp`, which allocates its host side with `malloc_host` — it is
+// a **pinned** number. This path copies out of a memory-mapped GGUF: ordinary pageable,
+// file-backed pages, which Level Zero cannot DMA from directly and must bounce through a
+// driver staging buffer. Measured here, per ~930 KiB bank copy: **136 us at a 93% hit rate,
+// falling to 91 us at 0%** as the copies pipeline — an effective 6.7 GB/s and 10.5 GB/s
+// respectively, against a phase that is now within ~20% of the pinned link rate at volume.
+// Closing that last gap means a pinned staging ring, and the arithmetic does not obviously
+// favour one: an extra mmap->pinned host copy at the measured 22.8 GB/s costs more than it
+// saves unless the pageable path is worse than 10.5 GB/s. Measure before building it.
+//
+// **Ordering is preserved by the queue, not by the wait.** The memcpy is submitted before the
+// matvec that reads the slot, so the matvec runs after it — the same argument every kernel in
+// this file already relies on, and the reason `moearc_ctx_create` asks for `in_order()`.
+//
+// ⚠️ Two things the caller takes on, and both are real:
+//
+//   - **`src` must stay alive and unmodified until the copy completes**, and the caller cannot
+//     see when that is. `moearc-engine`'s `stage()` copies straight out of the memory-mapped
+//     GGUF, which outlives every buffer here; `session.rs` makes that ordering explicit rather
+//     than incidental, and says why. A caller copying from a temporary, a stack array, or a
+//     buffer it is about to reuse **must** use the blocking `moearc_copy_h2d`. Nothing in the
+//     type system stops it; that comment and this one are the only guard.
+//   - **Failures surface later, at the next synchronisation.** A pool that over-committed
+//     device memory used to fail on the copy itself with a legible message; it will now fail on
+//     whichever kernel or readback comes next.
+int moearc_copy_h2d_async(moearc_ctx *c, void *dst, const void *src, unsigned long bytes) {
+    if (!c) return -1;
+    try { c->q.memcpy(dst, src, bytes); return 0; } catch (...) { return -1; }
+}
+
 // ---- the first real kernel ------------------------------------------------------------
 // Gather `count` expert slots of `slot_bytes` each from a resident pool into a packed
 // staging buffer, given their slot indices.

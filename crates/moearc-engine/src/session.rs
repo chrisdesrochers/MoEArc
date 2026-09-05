@@ -390,13 +390,34 @@ fn worker(
     rx: &mpsc::Receiver<Command>,
     tx: &mpsc::Sender<Reply>,
 ) {
-    let started = || -> Result<(MappedModel, Context), EngineError> {
-        Ok((MappedModel::open(path)?, Context::new()?))
-    };
-    let (mapped, ctx) = match started() {
+    // 🔴 These are two separate `let`s, in this order, and that is load-bearing — it became so
+    // the moment `moe::stage` started uploading **asynchronously** out of the mapping.
+    //
+    // Locals drop in reverse declaration order, so `ctx` is destroyed first. Destroying it
+    // destroys the SYCL queue, whose destructor waits for everything submitted to it — including
+    // any expert copy still in flight, whose *source* is a page of `mapped`. Only then does
+    // `mapped` unmap the file.
+    //
+    // The other order is a use-after-free the host cannot see: the pages would be unmapped while
+    // the device was still DMA-ing out of them, and nothing anywhere would report an error. It
+    // was a single tuple binding before, which is exactly the shape that makes this invisible.
+    //
+    // ⚠️ It is *also* true that every `decode` ends by downloading logits, which on an in-order
+    // queue drains the queue, so in practice nothing should be outstanding by the time this
+    // function returns. That is an incidental property of the current graph — a future decode
+    // that returns without a readback would silently remove it — and it is deliberately not what
+    // this relies on.
+    let mapped = match MappedModel::open(path) {
         Ok(v) => v,
         Err(e) => {
-            let _ = tx.send(Reply::Failed(e.to_string()));
+            let _ = tx.send(Reply::Failed(EngineError::from(e).to_string()));
+            return;
+        }
+    };
+    let ctx = match Context::new() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(Reply::Failed(EngineError::from(e).to_string()));
             return;
         }
     };

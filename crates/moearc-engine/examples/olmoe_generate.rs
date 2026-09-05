@@ -10,7 +10,7 @@
 //!
 //! Timing is printed and covers the whole run, prompt included, from a **cold expert pool** —
 //! so it is a floor, not a steady state: the first tokens pay for staging every expert they
-//! name. `examples/olmoe_profile.rs` reports the steady state and where the time goes.
+//! name. `examples/profile_decode.rs` reports the steady state and where the time goes.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

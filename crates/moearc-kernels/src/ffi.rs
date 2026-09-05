@@ -30,6 +30,12 @@ unsafe extern "C" {
         src: *const c_void,
         bytes: c_ulong,
     ) -> c_int;
+    pub fn moearc_copy_h2d_async(
+        c: *mut MoearcCtx,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: c_ulong,
+    ) -> c_int;
     pub fn moearc_copy_d2h(
         c: *mut MoearcCtx,
         dst: *mut c_void,

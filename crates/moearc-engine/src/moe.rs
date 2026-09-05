@@ -108,7 +108,7 @@
 //!
 //! # What is still slow, and known to be
 //!
-//! Three things, all deliberate and all measured — run the `olmoe_profile` example for the
+//! Three things, all deliberate and all measured — run the `profile_decode` example for the
 //! current breakdown:
 //!
 //! - **Prompt tokens go through the single-token decode path one at a time.** There is no
@@ -1638,7 +1638,20 @@ fn stage(
                 have: dst.len(),
             }));
         }
-        ctx.upload(dst, v.data)?;
+        // 🔴 Asynchronous, and the safety argument is the whole reason this is fast.
+        //
+        // `v.data` is a borrow of the memory-mapped GGUF — `MappedModel` outlives every buffer
+        // in this engine and the file is never written — so the source stays alive and
+        // unmodified for as long as the copy needs it, which is what `upload_async` requires.
+        // Ordering is the in-order queue's: this memcpy is submitted before the matvec that
+        // reads the slot, so the matvec runs after it. That is the same guarantee the rest of
+        // the decode path already relies on, and it is why `stage` before compute remains a
+        // correctness property of this file rather than an accident of every call waiting.
+        //
+        // ⚠️ If this ever stages from anything but the mapping — a decompressed buffer, a
+        // reordered scratch, a temporary — it must go back to the blocking `ctx.upload`. The
+        // failure mode is a slot filled with whatever the memory became: finite, fluent, wrong.
+        unsafe { ctx.upload_async(dst, v.data)? };
         moved += v.data.len() as u64;
     }
     Ok(moved)

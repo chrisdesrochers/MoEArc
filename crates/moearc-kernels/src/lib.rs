@@ -35,7 +35,7 @@
 //!
 //! What is *not* claimed anywhere here is a throughput number. `examples/launch_overhead.rs`
 //! measures the one thing this crate can honestly report on its own — what a submission costs
-//! — and the engine's `olmoe_profile` example measures the rest.
+//! — and the engine's `profile_decode` example measures the rest.
 
 mod ffi;
 pub mod reference;
@@ -247,6 +247,45 @@ impl Context {
         let n = src.len().min(dst.len);
         let rc = unsafe {
             ffi::moearc_copy_h2d(self.raw, dst.ptr, src.as_ptr().cast(), n as ffi::c_ulong)
+        };
+        if rc == 0 { Ok(()) } else { Err(KernelError::Failed("host-to-device copy")) }
+    }
+
+    /// Copy host bytes to a device buffer **without waiting for the copy to finish**.
+    ///
+    /// 🔴 What the blocking [`Context::upload`] costs on the staging path is **overlap, not a
+    /// drain** — by the time an engine stages experts its queue has already been emptied by the
+    /// router readback, so each wait waits only for itself, but it stops the copy engine ever
+    /// having a queue to stream and stops the host running ahead. Measured on Qwen3-30B-A3B at
+    /// 2952 resident slots, changing only this: staging 17.33 -> 10.11 ms/token, the whole step
+    /// 43.19 -> 37.51 ms, 22.87 -> 26.28 tok/s, with every token id and every staged byte
+    /// unchanged. `kernels.cpp` carries the full note, including why the 13.4 GB/s figure in
+    /// `docs/roadmap.md` is a **pinned-memory** number that does not describe a copy out of a
+    /// memory-mapped file.
+    ///
+    /// Ordering is still guaranteed — the queue is in-order, so a kernel submitted after this
+    /// copy runs after it. What is *not* guaranteed is anything about `src`.
+    ///
+    /// # Safety
+    ///
+    /// `src` must remain allocated and unmodified until the copy completes, and there is no way
+    /// for the caller to observe when that is short of [`Context::sync`]. The only sound uses
+    /// are sources that outlive the [`Context`] — a memory-mapped file, or a buffer owned for
+    /// the lifetime of the engine. **Passing a temporary, a stack array, or a buffer that is
+    /// about to be reused is undefined behaviour and will not fail loudly**: it produces a slot
+    /// filled with whatever the memory became, which is finite, plausible, wrong output.
+    ///
+    /// A second, milder consequence: a failed copy is reported at the next synchronisation
+    /// rather than here, so an over-committed pool fails on a later kernel instead of on this
+    /// call.
+    pub unsafe fn upload_async(
+        &self,
+        dst: &DeviceBuffer<'_>,
+        src: &[u8],
+    ) -> Result<(), KernelError> {
+        let n = src.len().min(dst.len);
+        let rc = unsafe {
+            ffi::moearc_copy_h2d_async(self.raw, dst.ptr, src.as_ptr().cast(), n as ffi::c_ulong)
         };
         if rc == 0 { Ok(()) } else { Err(KernelError::Failed("host-to-device copy")) }
     }

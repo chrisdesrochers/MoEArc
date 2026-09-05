@@ -136,7 +136,7 @@ cancels. Lower is better for residency.
 | model | experts | active | touched/token | fits in 11.33 GiB? |
 | --- | ---: | ---: | ---: | --- |
 | OLMoE-1B-7B | 64 | 8 | 12.5% | yes — residency does nothing |
-| **Qwen3-30B-A3B** | 128 | 8 | **6.2%** | **no** — running; 24.0 tok/s at 2952 slots |
+| **Qwen3-30B-A3B** | 128 | 8 | **6.2%** | **no** — running; 27.0 tok/s at 2952 slots |
 | **Gemma-4-26B-A4B** | 128 | 8 | **6.2%** | **no** — candidate |
 | Qwen3.6-35B-A3B | 256 | 8 | 3.1% | no — but hybrid, needs SSM kernels |
 
