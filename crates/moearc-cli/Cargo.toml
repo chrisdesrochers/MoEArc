@@ -1,0 +1,17 @@
+[package]
+name = "moearc-cli"
+description = "The moearc binary: device report, model picker, and server launcher."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "moearc"
+path = "src/main.rs"
+
+[dependencies]
+moearc-engine.workspace = true
+anyhow.workspace = true

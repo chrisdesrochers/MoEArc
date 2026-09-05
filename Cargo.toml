@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/moearc-engine"]
+members = [
+    "crates/moearc-engine",
+    "crates/moearc-device",
+    "crates/moearc-model",
+    "crates/moearc-cli",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -11,8 +16,15 @@ repository = "https://github.com/chrisdesrochers/MoEArc"
 authors = ["Superabundant LLC"]
 
 [workspace.dependencies]
+moearc-engine = { path = "crates/moearc-engine" }
+moearc-device = { path = "crates/moearc-device" }
+moearc-model = { path = "crates/moearc-model" }
+
+anyhow = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
 
 # Optimise dependencies even in dev builds. Inference work is dominated by time spent in
 # dependencies, and an unoptimised debug build of them is slow enough to distort any
