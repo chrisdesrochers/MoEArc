@@ -1,9 +1,14 @@
 //! Where a decode step's time goes, per phase, on real hardware.
 //!
 //! ```text
-//! MOEARC_PROFILE=1 cargo run -p moearc-engine --features gpu --example olmoe_profile -- \
-//!     <model.gguf> <n-predict> <token-id> [token-id ...]
+//! MOEARC_PROFILE=1 cargo run -p moearc-engine --features gpu --example profile_decode -- \
+//!     <model.gguf> <n-predict> <residency> <n-ctx|-> <token-id> [token-id ...]
 //! ```
+//!
+//! `<residency>` is a [`Residency`] spec (`all`, `<slots>`, `plan:<bytes>`, `static:<blocks>`)
+//! and `<n-ctx>` a token count or `-` for the model's trained maximum. 🔴 Required rather than
+//! defaulted: on a model that does not fit the card the defaults cannot be allocated, and a
+//! profile of a configuration the caller did not choose is worse than no profile.
 //!
 //! The first few tokens are thrown away before the counters are read: token one pays a cold
 //! expert cache and a first-touch of every device allocation, and averaging that into a
@@ -16,16 +21,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use moearc_engine::moe::Residency;
 use moearc_engine::profile;
-use moearc_engine::session::{Session, StopConditions};
+use moearc_engine::session::{Session, SessionOptions, StopConditions};
 
 /// Tokens decoded before the counters are cleared.
 const WARMUP: usize = 5;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 {
-        eprintln!("usage: olmoe_profile <model.gguf> <n-predict> <token-id> [token-id ...]");
+    if args.len() < 6 {
+        eprintln!(
+            "usage: profile_decode <model.gguf> <n-predict> <residency> <n-ctx|-> <token-id> \
+             [token-id ...]"
+        );
         return ExitCode::FAILURE;
     }
     if !profile::enabled() {
@@ -37,9 +46,27 @@ fn main() -> ExitCode {
         eprintln!("n-predict must be a number");
         return ExitCode::FAILURE;
     };
-    let tokens: Vec<u32> = args[3..].iter().filter_map(|s| s.parse().ok()).collect();
+    let residency: Residency = match args[3].parse() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let n_ctx = if args[4] == "-" {
+        None
+    } else {
+        match args[4].parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                eprintln!("`{}` is not a context length", args[4]);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let tokens: Vec<u32> = args[5..].iter().filter_map(|s| s.parse().ok()).collect();
 
-    let session = match Session::load(&model) {
+    let session = match Session::load_with(&model, SessionOptions { n_ctx, residency }) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("load failed: {e}");

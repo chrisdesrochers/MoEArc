@@ -122,3 +122,28 @@ and larger than the static split by 2.9x — but the thing standing between 24.0
 leaves 88%. Nothing detects it at load: `malloc_device` returns valid pointers past the point
 where the memory exists, so the pool reports its size and the first token fails. Measured rows
 are in `Headroom::PROVISIONAL` and `Residency::All`.
+
+---
+
+## 🔴 CORRECTION (2026-09-05, later): compute is not the bottleneck here
+
+The projections above — *"roughly 38 tok/s at MoEArc's current efficiency"*, and the follow-on
+claim that coalescing loads and quantising activations would reach ~52 tok/s — **model bandwidth,
+and bandwidth is not what this engine is short of on this model.**
+
+A real decode step at 2952 slots, profiled:
+
+| phase | cold | warm |
+| --- | ---: | ---: |
+| `moe.stage` | **79.0%** | 40.1% |
+| `moe.readback` | **15.0%** | 44.0% |
+| `out.readback` | 3.5% | 9.9% |
+| **all arithmetic** | **~1.2%** | **~6%** |
+
+Kernel-efficiency work would touch about 6% of the step. 📌 **The error was carrying a
+conclusion across a regime change**: on OLMoE the model fits in VRAM, nothing streams, and expert
+matvecs genuinely were 92% of the step. Once experts stream, staging and readback are the step.
+
+The real targets are synchronisation, not arithmetic: `moe.readback` is a **drain** — 48 calls of
+32 bytes costing 390 µs each because the in-order queue makes the first download wait on
+everything submitted — and `moe.stage` moves bytes at ~4 GB/s against a 13.4 GB/s link.

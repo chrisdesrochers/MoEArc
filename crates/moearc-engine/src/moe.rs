@@ -1414,7 +1414,28 @@ impl<'c, 'm> Model<'c, 'm> {
             {
                 let _p = profile::scope("moe.readback");
                 ctx.download_slice(&mut st.idx_host, &st.idx)?;
-                ctx.download_slice(&mut st.w_host, &st.weights)?;
+                // The router's weights are not read back in the serving path: they stay on
+                // the device, where `moe_combine` reads them out of `st.weights`, and the only
+                // consumer of a host copy is the tap. Downloading them unconditionally was
+                // simply pointless work, so this is kept — but ⚠️ **it is not an optimisation
+                // worth quoting.** Measured on Qwen3-30B-A3B at 2952 slots, 95 steady-state
+                // tokens: `moe.readback` 19.01 -> 18.71 ms/token, 22.87 -> 23.17 tok/s. **+1.3%.**
+                //
+                // 🔴 That near-zero is the useful result. It says the 18.7 ms this phase costs is
+                // **not** the copy — 48 calls moving 32 bytes each — it is the *drain*. The queue
+                // is asynchronous and in-order, so the first download waits for everything
+                // submitted before it, and the second then costs almost nothing because the
+                // pipeline is already empty. Removing a second drain that was never happening
+                // buys nothing. The 390 us/call is one pipeline stall per block per token, and
+                // the only thing that removes it is not reading the router's choice back at all
+                // — driving the expert gather from the device. See the note at the top of this
+                // file, which called this out as "a device round trip per block" and, on OLMoE
+                // with 16 blocks and a resident pool, correctly measured it at ~13 us. At 48
+                // blocks with a streaming pool it is 30x that, and it is the largest phase in
+                // the step.
+                if st.tap.is_some() {
+                    ctx.download_slice(&mut st.w_host, &st.weights)?;
+                }
             }
             if let Some(t) = st.tap.as_mut() {
                 t.items.push((

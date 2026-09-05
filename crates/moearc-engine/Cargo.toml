@@ -17,7 +17,7 @@ moearc-kernels = { path = "../moearc-kernels", optional = true }
 
 [features]
 default = []
-# The real forward pass: `olmoe` and `session`.
+# The real forward pass: `moe` and `session`.
 gpu = ["dep:moearc-model", "dep:moearc-kernels"]
 
 [dev-dependencies]
@@ -37,5 +37,5 @@ name = "residency_sweep"
 required-features = ["gpu"]
 
 [[example]]
-name = "olmoe_profile"
+name = "profile_decode"
 required-features = ["gpu"]
