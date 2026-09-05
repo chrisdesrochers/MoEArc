@@ -92,6 +92,35 @@ bundling roots means either an upstream feature or depending on `reqwest` direct
 message naming the missing bundle. The second is less work and arguably more correct — a system
 CA store is administered, and overriding it silently is its own bad behaviour.
 
+## 🔴 Known gap: the kernel `.so` does not follow the binary
+
+**Status: open. `LD_LIBRARY_PATH` is the current workaround, and it is not a fix.**
+
+`moearc-kernels`' `build.rs` emits an rpath via `cargo:rustc-link-arg` so its own tests find
+`libmoearc_kernels.so`. **That directive applies only to the crate that emits it and does not
+propagate to downstream crates.** So any binary depending on the kernels — `moearc-server`, and
+eventually `moearc` itself — links fine and then dies at startup:
+
+```
+error while loading shared libraries: libmoearc_kernels.so: cannot open shared object file
+```
+
+That is precisely the failure `ux.md` exists to prevent: a user installs one binary and gets a
+loader error instead of an explanation.
+
+📌 **Worth noting how this was missed.** Every crate's tests were green and the workspace built
+clean, because the kernels tests run *inside* the crate that carries the rpath. Nothing in 309
+passing tests executed a binary that depends on the kernels crate. **A suite can be entirely
+healthy and still not cover the first thing a user does.**
+
+The fix is the one already described above — embed the object with `include_bytes!`, extract it
+to a cache directory on first run, and load it from there. Until that exists, running a
+kernel-dependent binary from a dev build requires:
+
+```
+LD_LIBRARY_PATH=$(dirname target/debug/build/moearc-kernels-*/out/libmoearc_kernels.so)
+```
+
 ## Standing rules
 
 - **The user's machine never compiles C++.** If a step needs a toolchain, it happens on ours.

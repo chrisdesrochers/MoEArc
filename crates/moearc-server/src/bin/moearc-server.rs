@@ -41,6 +41,14 @@ struct Args {
     #[arg(long)]
     tokenizer: Option<PathBuf>,
 
+    /// Refuse to start unless the real engine loads.
+    ///
+    /// 🔴 Without this, a failed engine load falls back to the stub, which answers every
+    /// request with fabricated text. That failure mode looks exactly like success, so any
+    /// deployment that means to serve a model should set this.
+    #[arg(long)]
+    require_engine: bool,
+
     /// Override the chat template with a Jinja file.
     #[arg(long)]
     chat_template: Option<PathBuf>,
@@ -111,14 +119,37 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ─────────────────────────────────────────────────────────────────────────────────────
-    // 🔴 THE INTEGRATION POINT. This is the one line that changes when the engine lands:
+    // THE INTEGRATION POINT. The real engine is used when this crate is built with
+    // `--features engine` AND a model file was given; otherwise the stub answers and says so
+    // on every `/health`.
     //
-    //     let generator: SharedGenerator = Arc::new(moearc_engine::Session::load(&path)?);
-    //
-    // Nothing else in this crate refers to a concrete generator type. See `generate.rs` for
-    // the contract the implementation has to meet.
+    // 🔴 The fallback is never silent. A server that quietly answered with fabricated text
+    // because a model failed to load would be the worst possible failure here — it looks
+    // exactly like success. `--require-engine` turns any fallback into a startup error.
     // ─────────────────────────────────────────────────────────────────────────────────────
-    let generator: SharedGenerator = Arc::new(EchoGenerator::new(tokenizer.vocab_size()));
+    #[allow(unused_mut)]
+    let mut generator: Option<SharedGenerator> = None;
+
+    #[cfg(feature = "engine")]
+    if let Some(path) = args.model.as_deref().filter(|p| p.is_file()) {
+        match moearc_server::engine::EngineGenerator::shared(path) {
+            Ok(g) => generator = Some(g),
+            Err(e) if args.require_engine => {
+                anyhow::bail!("--require-engine was given but the engine failed to load: {e:#}")
+            }
+            Err(e) => tracing::warn!("engine unavailable, falling back to the stub: {e:#}"),
+        }
+    }
+
+    if generator.is_none() && args.require_engine {
+        anyhow::bail!(
+            "--require-engine was given but this binary has no engine: rebuild with \
+             `--features engine`, and pass --model pointing at a GGUF file"
+        );
+    }
+
+    let generator: SharedGenerator =
+        generator.unwrap_or_else(|| Arc::new(EchoGenerator::new(tokenizer.vocab_size())));
 
     let defaults = SamplingParams {
         temperature: args.temperature,

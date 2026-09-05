@@ -57,6 +57,10 @@
 //! real network.
 
 pub mod chat;
+/// The bridge to the real inference engine. Behind the `engine` feature because it
+/// transitively needs Intel's DPC++ to build; without it this crate still serves.
+#[cfg(feature = "engine")]
+pub mod engine;
 pub mod error;
 pub mod generate;
 pub mod gguf;

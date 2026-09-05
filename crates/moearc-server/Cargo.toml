@@ -12,7 +12,14 @@ authors.workspace = true
 name = "moearc-server"
 path = "src/bin/moearc-server.rs"
 
+[features]
+default = []
+# Wires the real engine in. Pulls moearc-engine/gpu, which needs Intel DPC++
+# at build time -- hence opt-in, so the serving path stays buildable anywhere.
+engine = ["dep:moearc-engine", "moearc-engine/gpu"]
+
 [dependencies]
+moearc-engine = { workspace = true, optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
