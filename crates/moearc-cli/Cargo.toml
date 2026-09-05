@@ -15,3 +15,11 @@ path = "src/main.rs"
 [dependencies]
 moearc-engine.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache", "underline-color", "all-widgets"] }
+tui-input = { version = "0.15", default-features = false, features = ["ratatui", "ratatui-crossterm"] }
+throbber-widgets-tui = "0.11"
