@@ -92,6 +92,6 @@ fn bytemuck_cast(v: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
 }
 fn bytemuck_cast_back(v: &[u8]) -> &[u32] {
-    assert!(v.len().is_multiple_of(4));
+    assert!(v.len() % 4 == 0);
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() / 4) }
 }
