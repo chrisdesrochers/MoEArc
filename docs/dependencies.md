@@ -35,11 +35,20 @@ Two things had to be worked around rather than used, both found by running it:
   as malformed. We use `paths-info` instead, which also returns the true blob size rather than
   the ~134-byte LFS *pointer* length.
 
-⚠️ **One open conflict with the single-binary goal in `ux.md`.** We enable `rustls-tls`, but
-`hf-hub` declares `reqwest` without `default-features = false`, so `native-tls` — and therefore
-a link against the system OpenSSL — stays enabled underneath. Closing that needs an upstream
-change. Until it is closed, **we cannot claim a fully static binary**, and the claim is not
-being made.
+✅ **Correction (verified against the resolved graph).** This entry previously said
+`native-tls` "stays enabled underneath", so a static binary could not be claimed. That was
+reasoned from `hf-hub`'s manifest rather than from what cargo actually resolves, and it is
+wrong. `openssl-sys` and `native-tls` are **zero nodes workspace-wide**; the only `openssl`
+match is `openssl-probe`, a pure-Rust crate reached via `rustls-native-certs →
+rustls-platform-verifier` that *locates* the OS trust store and links nothing. The built binary
+dynamically links only `libc`, `libm`, `libgcc_s` and the dynamic loader.
+
+The real residual is narrower: **we depend on the host having a CA certificate bundle**, so a
+minimal container without one fails TLS at download time. `hf-hub` 1.0.0 offers no
+`webpki-roots` feature. See `packaging.md`.
+
+📌 The lesson is the reusable part: **a manifest states what a crate can enable, not what your
+build resolved.** Check `cargo tree -i` and `ldd`, not `Cargo.toml`.
 
 ## Evaluated, not adopted
 
