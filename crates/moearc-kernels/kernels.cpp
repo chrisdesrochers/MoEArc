@@ -508,6 +508,11 @@ static inline void unit_acc(float &acc, const unsigned char *blk, const float *x
         const float d = f16_to_f32(ld_u16le(blk + 208));
         const bool hi = k >= 2;
         const int shift = 2 * k;
+        // ⚠️ The `hi` select is deliberately left **inside** the loop, unlike the Q4_K branch
+        // above which hoists its equivalent into a branch on a scalar. Hoisting it here was
+        // tried and is measurably worse: batched Q6_K went 4.13 -> 6.06 ps/element and the
+        // unbatched path barely moved (13.05 -> 12.53). Do not "fix" this to match Q4_K.
+        //
         // Q6_K scales one 16-element half at a time, so the unit splits in two.
         for (int half = 0; half < 2; ++half) {
             const float ds = d * (float) sc[n * 8 + 2 * k + half];
@@ -710,10 +715,12 @@ static void moearc_flush_events(moearc_ctx *c) {
 
 /// Record one submission's event under a key that carries the kernel's shape.
 ///
-/// The shape is in the key on purpose: every quantised mat-vec in this engine goes through two
-/// entry points, so without it `out.matvec`, `attn.qkv` and `attn.proj` would be summed into one
-/// number and the question this instrument exists to answer -- what a batched launch costs
-/// against an unbatched one -- would be unanswerable.
+/// The key carries the quantisation **and** the shape on purpose. Every quantised mat-vec in
+/// this engine goes through one of two entry points, so without the shape `out.matvec`,
+/// `attn.qkv` and `attn.proj` collapse into one number; and without the type, a bank that is
+/// Q6_K in half its blocks and Q4_K in the other half -- which is every expert `down` bank and
+/// every `attn_v` in this file -- reports the **average** of two kernels that differ by 2x. That
+/// average is exactly what made Q6_K look fine in `expert_down` and slow in `lm_head`.
 static void moearc_track(moearc_ctx *c, const char *what, unsigned long n_rows, unsigned int n_mat,
                          const event &e) {
     if (!c->profiling) return;
@@ -979,19 +986,44 @@ int moearc_matvec_q(moearc_ctx *c, unsigned int type_id, float *out, const void 
     try {
         switch (type_id) {
             case GGML_TYPE_Q4_K:
-                moearc_track(c, "mvq", n_rows, 1,
+                moearc_track(c, "mvq Q4_K", n_rows, 1,
                              matvec_q_submit<GGML_TYPE_Q4_K>(c->q, out, w, x, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q5_K:
-                moearc_track(c, "mvq", n_rows, 1,
+                moearc_track(c, "mvq Q5_K", n_rows, 1,
                              matvec_q_submit<GGML_TYPE_Q5_K>(c->q, out, w, x, n_rows, n_cols));
                 break;
-            case GGML_TYPE_Q6_K:
-                moearc_track(c, "mvq", n_rows, 1,
-                             matvec_q_submit<GGML_TYPE_Q6_K>(c->q, out, w, x, n_rows, n_cols));
+            case GGML_TYPE_Q6_K: {
+                // 🔴 Q6_K goes through the **batched** kernel with a single matrix, and that is
+                // not a tidying-up — it is worth 3.2x.
+                //
+                // The two kernels have token-identical inner loops. They differ only in how the
+                // row pointer is formed: `base + row * row_bytes` from a kernel argument here,
+                // against `w.p[mat] + row * row_bytes` through a by-value table there. On Q6_K,
+                // and *only* on Q6_K, that is the difference between ~13.1 and ~4.1
+                // ps/element -- flat across every `n_cols` from 256 to 4096. Q4_K and Q5_K are
+                // unaffected by the same swap, and Q5_K reads two byte streams exactly as Q6_K
+                // does, so it is neither "Q6_K is expensive" nor "two streams break coalescing".
+                //
+                // ⚠️ **The source-level cause is not established.** Three hypotheses were
+                // measured and refuted: `n_cols` (flat), the second byte stream (Q5_K is fine),
+                // and the in-loop nibble select (hoisting it made things worse -- see the note
+                // in `unit_acc`). What remains is an IGC codegen difference that an opaque
+                // pointer suppresses. It is characterised, reproducible via
+                // `examples/matvec_scaling`, and this is a workaround, not a fix.
+                //
+                // Routing only Q6_K, because the swap is *not* free at every shape: at
+                // `n_cols = 512` the batched kernel costs Q4_K 4.98 -> 7.57 ps/element. No
+                // shape in this engine uses it, but a future one might.
+                mat_table t{};
+                t.p[0] = static_cast<const unsigned char *>(w);
+                moearc_track(c, "mvq Q6_K", n_rows, 1,
+                             matvec_q_batched_submit<GGML_TYPE_Q6_K>(c->q, out, t, 1, x, 0,
+                                                                     n_rows, n_cols));
                 break;
+            }
             case GGML_TYPE_Q8_0:
-                moearc_track(c, "mvq", n_rows, 1,
+                moearc_track(c, "mvq Q8_0", n_rows, 1,
                              matvec_q_submit<GGML_TYPE_Q8_0>(c->q, out, w, x, n_rows, n_cols));
                 break;
             default:
@@ -1061,22 +1093,22 @@ int moearc_matvec_q_batched(moearc_ctx *c, unsigned int type_id, float *out,
     try {
         switch (type_id) {
             case GGML_TYPE_Q4_K:
-                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                moearc_track(c, "mvq_batched Q4_K", n_rows, n_mat,
                              matvec_q_batched_submit<GGML_TYPE_Q4_K>(
                                  c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q5_K:
-                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                moearc_track(c, "mvq_batched Q5_K", n_rows, n_mat,
                              matvec_q_batched_submit<GGML_TYPE_Q5_K>(
                                  c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q6_K:
-                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                moearc_track(c, "mvq_batched Q6_K", n_rows, n_mat,
                              matvec_q_batched_submit<GGML_TYPE_Q6_K>(
                                  c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             case GGML_TYPE_Q8_0:
-                moearc_track(c, "mvq_batched", n_rows, n_mat,
+                moearc_track(c, "mvq_batched Q8_0", n_rows, n_mat,
                              matvec_q_batched_submit<GGML_TYPE_Q8_0>(
                                  c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;

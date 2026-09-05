@@ -88,7 +88,9 @@ cargo run --release -p moearc-engine --features gpu --example residency_sweep --
 | 264 | 4.3% | 770 MiB | **0.0%** | 7.38 | 4.2% | 7.84 |
 
 ⚠️ Unoptimised, and every figure is a floor: prompt tokens go through the single-token decode
-path and there is no batched prefill.
+path and there is no batched prefill. ⚠️ **This table predates the Q6_K routing at the foot
+of this file** — see there for the refreshed throughput; the hit rates and staged bytes are
+unaffected by it.
 
 **Score.**
 
@@ -246,3 +248,93 @@ change and measure in the engine before believing any of it.**
    the whole engine rests on would have to be re-made explicitly rather than inherited.
 3. **Everything Q4_K sits at 25-29% of peak** against llama.cpp SYCL's ~63% on this card. That
    remains the standing gap, and neither of the two candidate explanations tested today survived.
+
+---
+
+## Q6_K was a red herring, and chasing the cause found a 3.2x kernel bug
+
+The per-kernel table above showed the Q6_K lm_head at **63 GB/s** where every Q4_K matvec managed
+113-134, and Q6_K is the obvious suspect: 210 bytes per 256 values, six-bit quants split across a
+low-nibble array and a separate high-bits array. But `expert_down` is Q6_K in 24 of its 48 blocks
+and ran at 134 GB/s. **If Q6_K were simply expensive, that number should have been dragged down
+and it was not.** Resolving that contradiction before optimising anything is what found the real
+defect.
+
+**Step 1 — split the profile key by quantisation.** The 134 GB/s was an average over two kernels
+that differ by 2x. Per element, in a live decode:
+
+```text
+  expert_down  n_cols=768    Q4_K 5.12    Q6_K 5.21   ps/element  -- identical
+  attn_v       n_cols=2048   Q4_K 6.87    Q6_K 18.0               -- 2.6x
+  lm_head      n_cols=2048                Q6_K 13.0
+```
+
+**Step 2 — sweep `n_cols` at fixed total work** (`crates/moearc-kernels/examples/matvec_scaling`,
+run through the engine's own `Context::matvec_q`, anchored by reproducing the lm_head's 13.0 to
+within 0.4%). Q6_K is **flat at ~13 ps/element from `n_cols` 256 to 4096**. Not `n_cols` either.
+
+**Step 3 — batched against unbatched.** The engine has two matvec entry points with
+**token-identical inner loops**, differing only in how the row pointer is formed: a kernel
+argument (`base + row * row_bytes`) versus an opaque by-value table (`w.p[mat] + row *
+row_bytes`).
+
+```text
+  n_cols = 2048        unbatched   batched
+  Q4_K                    4.05       4.17    ps/element
+  Q5_K                    3.81       3.61
+  Q6_K                   13.05       4.13    <- 3.2x
+```
+
+Batched-with-one-matrix matches batched-with-eight, so it is the **kernel structure, not the
+batching**. And Q5_K — which also reads two byte streams — is untouched, so it is not the split
+load either.
+
+### Three hypotheses measured and refuted
+
+| hypothesis | verdict |
+| --- | --- |
+| Q6_K's unpack is genuinely more work | **No.** Identical to Q4_K at `n_cols = 768`, and fine in the batched kernel at every shape. |
+| The `ql`/`qh` split load hurts coalescing | **No.** Q5_K reads two streams too and is unaffected. |
+| The in-loop nibble select (Q4_K hoists its equivalent, Q6_K does not) | **No, and worse.** Hoisting it moved unbatched only 13.05 -> 12.53 and regressed *batched* Q6_K 4.13 -> 6.06. Reverted, with a note telling the next person not to repeat it. |
+
+🔴 **The source-level cause is not established.** It is an IGC codegen difference that an opaque
+pointer suppresses, on one quantiser in one of two otherwise-identical kernels. What is
+established is that it is real, reproducible, and 3.2x.
+
+### The change, and what it bought
+
+`moearc_matvec_q` routes **Q6_K only** through the batched kernel with a single matrix. Q4_K and
+Q5_K are left alone: the swap is not free everywhere — at `n_cols = 512` it costs Q4_K
+4.98 -> 7.57 ps/element. No shape in this engine uses that, but a future one might.
+
+| | before | after | |
+| --- | ---: | ---: | ---: |
+| lm_head (`mvq Q6_K r151936`) | 4038.9 us/call | **1240.3** | **3.26x** |
+| `attn_v` Q6_K (`mvq Q6_K r512`) | 18.9 us/call | **8.6** | 2.2x |
+| tracked matvec busy | 17.41 ms | **14.38 ms** | |
+| step | 37.5 ms | **31.8 ms** | |
+| **throughput** | **26.6 tok/s** | **29.14 tok/s** | **+9.5%** |
+
+Every greedy token id unchanged on both models. **It is a workaround for a compiler pathology,
+not a fix**, and `examples/matvec_scaling` exists so the next person can re-check it after a
+driver or compiler upgrade.
+
+### The sweep, re-run after the routing
+
+Same prompt, same 192 tokens, same reference check — every row still reproduces the identical
+token ids and the first 64 match llama.cpp.
+
+| slots | LRU warm hit | before | **after** | |
+| ---: | ---: | ---: | ---: | ---: |
+| 2952 | 93.0% | 26.97 | **29.52** | +9.5% |
+| 2056 | 85.3% | 21.73 | **23.10** | +6.3% |
+| 1032 | 67.6% | 15.28 | **15.98** | +4.6% |
+| 520 | 47.9% | 11.62 | **11.93** | +2.7% |
+| 264 | 0.0% | 7.38 | **7.62** | +3.3% |
+| `static:23` (2952) | 47.9% | 12.10 | **12.58** | +4.0% |
+
+The gain tapers as capacity falls, which is what it should do: at 264 slots the step is dominated
+by staging 1 GiB of experts per token and the lm_head is a smaller share of it.
+
+**Against llama.cpp's 50.13 tok/s the gap is now 1.7x**, from 2.1x this morning. Every point of
+that came from measurement, and two of the three changes attempted today were reverted.
