@@ -11,6 +11,6 @@ authors.workspace = true
 [dependencies]
 thiserror.workspace = true
 hf-hub = { version = "1.0.0", features = ["rustls-tls"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
 futures-util = "0.3"
 libc = "0.2"

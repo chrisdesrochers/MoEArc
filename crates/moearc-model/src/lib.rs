@@ -9,6 +9,10 @@
 //! [`inspect`] answers all four from the file's header alone. It reads about 11 MB of a
 //! 20.6 GiB model and never opens the tensor blob.
 //!
+//! [`pull`](pull::pull) is the other half of the job: getting the file in the first place. It
+//! fetches a GGUF from the Hugging Face Hub — resumably, silently, and reporting progress
+//! through a callback — and hands it to [`inspect`] before it says the download succeeded.
+//!
 //! ```no_run
 //! # use std::path::Path;
 //! let info = moearc_model::inspect(Path::new("model.gguf"))?;
@@ -19,6 +23,7 @@
 //! [auto]: https://github.com/chrisdesrochers/MoEArc
 
 pub mod gguf;
+pub mod pull;
 pub mod quant;
 
 use std::collections::BTreeMap;
@@ -777,8 +782,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_dense_model_is_named_as_such_rather_than_mis_sized() {
+    /// The synthetic file with `expert_count` renamed away, so it reads as a dense model.
+    ///
+    /// The key is replaced with one of exactly the same length, so every later offset in the
+    /// header is untouched and the file stays structurally valid — the *only* difference is
+    /// that the MoE metadata is missing. Shared with `pull`'s tests, where downloading a dense
+    /// model has to come out as a success, not as a corrupt transfer.
+    pub(crate) fn synthetic_gguf_without_experts() -> Vec<u8> {
         let (mut bytes, _) = synthetic_gguf();
         let needle: Vec<u8> = {
             let mut v = Vec::new();
@@ -786,8 +796,13 @@ mod tests {
             v
         };
         let at = bytes.windows(needle.len()).position(|w| w == needle.as_slice()).unwrap();
-        // Rename the key so it is no longer found: same length, so nothing downstream shifts.
         bytes[at + 8..at + 8 + needle.len() - 8].copy_from_slice(b"testmoe.expert_counx");
+        bytes
+    }
+
+    #[test]
+    fn a_dense_model_is_named_as_such_rather_than_mis_sized() {
+        let bytes = synthetic_gguf_without_experts();
         let f = TempGguf::new("dense", &bytes);
         match inspect(&f.0) {
             Err(ModelError::NotMixtureOfExperts { architecture }) => {
