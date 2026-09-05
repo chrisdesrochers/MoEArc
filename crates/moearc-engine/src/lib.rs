@@ -11,3 +11,13 @@ pub mod kv;
 pub mod memory;
 pub mod residency;
 pub mod runtime;
+
+// The forward pass. Behind a feature because it is the one part of this crate that is not
+// device-independent: `moearc-kernels` compiles SYCL with Intel's DPC++ at build time, so
+// depending on it unconditionally would put an oneAPI toolchain in the way of building the
+// scheduler and the memory planner — which are testable on any machine and are meant to stay
+// that way. Build with `--features gpu` to get `Session`.
+#[cfg(feature = "gpu")]
+pub mod olmoe;
+#[cfg(feature = "gpu")]
+pub mod session;

@@ -9,7 +9,25 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Optional: see the `gpu` feature. `moearc-kernels` builds SYCL with Intel's DPC++, so making
+# it unconditional would make an oneAPI toolchain a requirement for building the parts of this
+# crate that have no device in them at all.
+moearc-model = { workspace = true, optional = true }
+moearc-kernels = { path = "../moearc-kernels", optional = true }
+
+[features]
+default = []
+# The real forward pass: `olmoe` and `session`.
+gpu = ["dep:moearc-model", "dep:moearc-kernels"]
 
 [dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[[example]]
+name = "olmoe_probe"
+required-features = ["gpu"]
+
+[[example]]
+name = "olmoe_generate"
+required-features = ["gpu"]

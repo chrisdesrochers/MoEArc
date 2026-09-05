@@ -1990,6 +1990,8 @@ dependencies = [
 name = "moearc-engine"
 version = "0.0.0"
 dependencies = [
+ "moearc-kernels",
+ "moearc-model",
  "serde",
  "serde_json",
 ]
