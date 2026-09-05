@@ -1785,6 +1785,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "moearc-kernels"
+version = "0.0.0"
+
+[[package]]
 name = "moearc-model"
 version = "0.0.0"
 dependencies = [

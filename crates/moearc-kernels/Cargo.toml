@@ -1,0 +1,12 @@
+[package]
+name = "moearc-kernels"
+description = "The GPU seam: SYCL kernels behind a C ABI, compiled at build time by DPC++."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]

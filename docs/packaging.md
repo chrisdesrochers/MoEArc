@@ -34,11 +34,25 @@ Three-crate split, following the guide:
   that made the tch-rs XPU patch forward-declare its symbols rather than include the headers.
 - **`moearc-kernels`** — the safe API the engine consumes.
 
-⚠️ The guide's warning about extracting object files from `make` output applies directly:
-DPC++ emits a shared object, and building a `.a` from it means driving `ar` over the objects by
-hand. The author's verdict on parsing build output for those paths — *"many times it won't
-work"* — is worth believing before spending a day on it. The `include_bytes!` route below may
-simply be better.
+✅ **Settled by building it: a shared object, linked by `icpx` itself.**
+
+The first attempt produced a static archive with `ar` and let cargo link it with `cc`. It failed
+on `undefined symbol: _intel_fast_memcpy` — a symbol from `libintlc`, one of several Intel
+runtime libraries (`intlc`, `irc`, `imf`, `svml`, `irng`, …) that `icpx` links automatically and
+`cc` knows nothing about. That list is a property of the compiler version, not of our code, so
+chasing it is the exact "transitive dependencies must be explicitly linked" pitfall the guide
+warns about.
+
+Letting `icpx` perform the link makes it the compiler's problem: the `.so` records its own
+dependencies in `DT_NEEDED` and cargo links one library. It is also the shape we ship regardless
+— the SYCL runtime cannot be statically linked — so a packaged build embeds this object and
+extracts it, exactly the `include_bytes!` + `libloading` route described below.
+
+**Proven on hardware.** `moearc-kernels` compiles `kernels.cpp` with `icpx` from `build.rs` and
+the tests run on a real Arc B580: queue creation, a host↔device round trip, and a device-side
+expert gather returning correct data for a scattered, out-of-order, repeating index list.
+Mutation-tested — an off-by-one in the gather index fails the suite with
+`expected expert 63, got 0`.
 
 ### Level Zero loader — embed, extract, dlopen
 
