@@ -101,6 +101,20 @@ Bubbletea's value is two separable things, and both port:
   palette, aligned columns, nothing shouting. Ratatui expresses all of it
   (`Block::bordered().border_type(BorderType::Rounded)`, styled spans, layout constraints).
 
+Charm's **`bubbles`** is the component library, and its widget list maps almost one-to-one onto
+the screens MoEArc needs — which is a useful check that the four-command journey above is the
+right shape:
+
+| `bubbles` | ratatui equivalent | screen |
+| --- | --- | --- |
+| `list` | `List` + `tui-widget-list` | model picker |
+| `textinput` | `tui-input` | paste a Hugging Face repo id |
+| `progress` | `Gauge` / `LineGauge` | download |
+| `spinner` | `throbber-widgets-tui` | detect, load |
+| `table` | `Table` | device report |
+| `viewport` | `Paragraph` + `Scrollbar` | logs |
+| `help` | hand-rolled | keybind footer |
+
 The TUI is the *default* face of the tool — device report, model picker, download, the split it
 chose, live serving stats. Every TUI action must also exist as a flag, so the tool stays
 scriptable and CI-usable. **Nothing may be reachable only through the TUI.**
