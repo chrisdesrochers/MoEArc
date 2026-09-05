@@ -29,6 +29,44 @@ to build. That cost lands on *our* build machine, not the user's — we compile 
 with DPC++ and ship the resulting shared library either way. So the toolkit requirement does
 not conflict with the one-binary rule. **Re-evaluate at 0.1.0.**
 
+### `RLX` — Rust ML compiler and runtime · Apache-2.0/MIT · **reference, and a real one**
+
+The most relevant project surveyed so far, and the claims were checked rather than taken from
+the README — this project has been burned once already by a repository whose advertised SYCL
+kernels existed only in its documentation.
+
+What is actually there: a genuine history (30 distinct commit days, May–Aug 2026, not a code
+dump), **712k lines of Rust**, and near-zero stub density (0 `todo!()`, 2 `unimplemented!()`
+across the whole tree). It is real software. It also contains our exact problem domain —
+`hot_expert_cache.rs`, `expert_pool.rs`, `moe_expert_store.rs`, `moe_residency.rs`,
+`moe_split.rs` — which makes it worth **reading** before we design expert residency.
+
+Why it is not a foundation for MoEArc, all measured:
+
+- **The Intel backend is its weakest limb**: 4,893 lines of Rust against the CUDA backend's
+  38,589, roughly an eight-to-one gap.
+- **Its oneAPI kernels are OpenCL C** (53 `.cl` files), not SYCL.
+- **Zero references to XMX, DPAS or `joint_matrix`** anywhere in the oneAPI backend — so no
+  matrix-engine path, which is where Battlemage's throughput actually lives.
+- **The MoE hot/cold parity tests exist for CUDA and ROCm, not for oneAPI.** The expert
+  machinery that interests us most is the part unvalidated on Intel.
+
+A general-purpose compiler with a thin Intel backend is the opposite of what this project is:
+an Intel-first engine. Read it for design, build our own.
+
+### `llama-cpp-rs` — Rust bindings to llama.cpp · Apache-2.0/MIT · **for benchmarking**
+
+Actively maintained (1,812 commits) with an explicit goal of tracking llama.cpp closely.
+
+**Not for the engine** — building on it would make MoEArc a llama.cpp wrapper, which is not the
+project. **Useful for the benchmark harness**: comparison (1) in `bench/README.md` is MoEArc
+against llama.cpp SYCL on the same card, and driving that in-process from Rust gives cleaner
+measurement than shelling out to `llama-bench` and parsing tables.
+
+⬜ **Unverified**: only `cuda` and `metal` cargo features are documented. llama.cpp's SYCL
+backend is a CMake option, so it may be reachable through the same build path — but that is an
+assumption, not a finding, and must be tested before the harness depends on it.
+
 ### `gpu-probe` — cross-platform VRAM detection · Apache-2.0 · **no**
 
 Its Intel path is a **static PCI device-ID table** rather than a runtime query, and its own
