@@ -17,9 +17,10 @@
 //! warm cache, but the first request after a load does not, and a table showing only one of
 //! them would be choosing the flattering half.
 //!
-//! 🔴 Every timing here is **unoptimised**. A miss is a synchronous host-to-device copy with
-//! nothing overlapped behind it, every kernel waits on its own queue, and the prompt is decoded
-//! one token at a time. The numbers are a floor, not a claim.
+//! 🔴 Every timing here is a **floor, not a claim**. A miss is a synchronous host-to-device copy
+//! with nothing overlapped behind it, and the prompt is decoded one token at a time. The cold
+//! row in particular is dominated by staging rather than by arithmetic — which is the point of
+//! reporting it next to the warm one.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -108,7 +109,7 @@ fn main() -> ExitCode {
     let specs: Vec<&str> = args[3].split(',').filter(|s| !s.is_empty()).collect();
     let prompt: Vec<u32> = args[4..].iter().filter_map(|s| s.parse().ok()).collect();
 
-    println!("prompt {prompt:?}, {n_predict} tokens, all timings UNOPTIMISED\n");
+    println!("prompt {prompt:?}, {n_predict} tokens; cold rows are staging-dominated\n");
     println!(
         "| policy | slots | % of model | pool | cold hit | cold tok/s | warm hit | warm tok/s \
          | cold staged | warm staged | ids |"

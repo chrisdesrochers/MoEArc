@@ -365,6 +365,24 @@ static constexpr size_t WG = 32;
 // allocate. Real MoE models use 8 or fewer; 32 leaves headroom without spilling.
 static constexpr int MAX_TOPK = 32;
 
+// Lanes per row for RMSNorm.
+//
+// `WG` (32) is one sub-group, which is the right width for a short row and nowhere near enough
+// for a long one: a single work-group has one hardware thread's worth of outstanding loads, so
+// a 2048-wide row spends its time waiting on memory rather than doing arithmetic. Measured on
+// a B580, one RMSNorm over `n_embd = 2048` cost 28 us at WG=32 — for 8 KiB of traffic.
+//
+// 🔴 This changes the *grouping* of the sum of squares, and floating-point addition is not
+// associative, so a wider group is not bit-identical to a narrower one. It is not less accurate
+// either — a wider tree over the same values has a shorter dependence chain and no more error —
+// but it is a change to the arithmetic, and the forward-pass tests are what say it is a safe
+// one.
+static inline size_t norm_wg(unsigned long n_cols) {
+    if (n_cols >= 1024) return 256;
+    if (n_cols >= 256) return 64;
+    return WG;
+}
+
 // Return codes shared by the entry points below.
 //   0  ok
 //  -1  a device call threw, or an argument was null
@@ -372,6 +390,157 @@ static constexpr int MAX_TOPK = 32;
 static constexpr int OK = 0;
 static constexpr int ERR = -1;
 static constexpr int ERR_ARG = -2;
+
+
+// =======================================================================================
+// The quantised matvec's inner loop
+// =======================================================================================
+//
+// Every format above has a natural **32-element unit** over which the dequantisation constants
+// are fixed: a K-quant super-block is eight of them, a Q8_0 block is exactly one. `elem_at`
+// derives those constants afresh for every element — two f16 conversions and a 6-bit scale
+// unpack for a single multiply-accumulate. Deriving them once per unit instead is worth about
+// 25 instructions per MAC, and a decode step spends most of its time here.
+//
+// 🔴 The per-element expression is unchanged, term for term and in the same association:
+// `d1 * q - m1` with `d1 = d * sc` and `m1 = dmin * m` for Q4_K and Q5_K, `(d * s) * q` for
+// Q6_K, `(q * d)` for Q8_0 — exactly as `ggml-quants.c` writes them, and exactly as the
+// `*_elem` functions above compute them. Only *where* those constants are computed moves. The
+// accumulation is likewise still `acc += weight * x` one element at a time, so a lane that
+// covers the same elements in the same order gets a bit-identical answer.
+//
+// `elem_at` and the `*_elem` functions stay, and stay the single definition of what a byte
+// means: `moearc_dequant`, `moearc_embed_rows` and the reference tests all still go through
+// them, and `tests/gguf_crosscheck.rs` checks them against llama.cpp's own `to_float`. What is
+// below is the same formulas re-associated for a hot loop, and the forward-pass tests are what
+// hold the two in agreement.
+
+/// 32-element units per block of `TY`. A K-quant super-block holds eight; a Q8_0 block is one.
+template <unsigned int TY>
+static constexpr int units_per_block() {
+    return TY == GGML_TYPE_Q8_0 ? 1 : QK_K / 32;
+}
+
+/// Bytes per block of `TY`, as a compile-time constant so the address arithmetic folds.
+template <unsigned int TY>
+static constexpr int const_block_bytes() {
+    return TY == GGML_TYPE_Q4_K   ? Q4_K_BYTES
+           : TY == GGML_TYPE_Q5_K ? Q5_K_BYTES
+           : TY == GGML_TYPE_Q6_K ? Q6_K_BYTES
+                                  : Q8_0_BYTES;
+}
+
+/// Accumulate `x . w` over one 32-element unit: sub-block `sub` of the block at `blk`, against
+/// the 32 activations at `xs`.
+template <unsigned int TY>
+static inline void unit_acc(float &acc, const unsigned char *blk, const float *xs, int sub) {
+    if constexpr (TY == GGML_TYPE_Q4_K) {
+        int sc, m;
+        q45k_scale_min(blk + 4, sub, &sc, &m);
+        const float d1 = f16_to_f32(ld_u16le(blk)) * (float) sc;
+        const float m1 = f16_to_f32(ld_u16le(blk + 2)) * (float) m;
+        const unsigned char *qs = blk + 16 + (sub >> 1) * 32;
+        // The nibble half is uniform across the unit, so it leaves the loop as a branch on a
+        // scalar rather than a select on every element.
+        if (sub & 1) {
+            for (int l = 0; l < 32; ++l) acc += (d1 * (float) (qs[l] >> 4) - m1) * xs[l];
+        } else {
+            for (int l = 0; l < 32; ++l) acc += (d1 * (float) (qs[l] & 0xFu) - m1) * xs[l];
+        }
+    } else if constexpr (TY == GGML_TYPE_Q5_K) {
+        int sc, m;
+        q45k_scale_min(blk + 4, sub, &sc, &m);
+        const float d1 = f16_to_f32(ld_u16le(blk)) * (float) sc;
+        const float m1 = f16_to_f32(ld_u16le(blk + 2)) * (float) m;
+        const unsigned char *qh = blk + 16;
+        const unsigned char *ql = blk + 48 + (sub >> 1) * 32;
+        // `q5k_elem` shifts `qh[l]` by `2 * n + half` with `n = sub >> 1`, `half = sub & 1` —
+        // which is `sub` itself.
+        const int shift = sub;
+        const bool hi = (sub & 1) != 0;
+        for (int l = 0; l < 32; ++l) {
+            const unsigned int byte = ql[l];
+            const unsigned int lo = hi ? (byte >> 4) : (byte & 0xFu);
+            const unsigned int h = (qh[l] >> shift) & 1u;
+            acc += (d1 * (float) (lo + 16u * h) - m1) * xs[l];
+        }
+    } else if constexpr (TY == GGML_TYPE_Q6_K) {
+        // A Q6_K unit is one `(n, k)` quarter of `q6k_elem`'s indexing: `sub = 4n + k`.
+        const int n = sub >> 2;
+        const int k = sub & 3;
+        const unsigned char *ql = blk + n * 64 + (k & 1) * 32;
+        const unsigned char *qh = blk + 128 + n * 32;
+        const signed char *sc = (const signed char *) (blk + 192);
+        const float d = f16_to_f32(ld_u16le(blk + 208));
+        const bool hi = k >= 2;
+        const int shift = 2 * k;
+        // Q6_K scales one 16-element half at a time, so the unit splits in two.
+        for (int half = 0; half < 2; ++half) {
+            const float ds = d * (float) sc[n * 8 + 2 * k + half];
+            for (int l = half * 16; l < half * 16 + 16; ++l) {
+                const unsigned int byte = ql[l];
+                const unsigned int lo = hi ? (byte >> 4) : (byte & 0xFu);
+                const unsigned int hb = (qh[l] >> shift) & 3u;
+                acc += (ds * (float) ((int) (lo | (hb << 4)) - 32)) * xs[l];
+            }
+        }
+    } else {  // Q8_0: no sub-block structure, one delta for the whole 32
+        const float d = f16_to_f32(ld_u16le(blk));
+        const signed char *q = (const signed char *) (blk + 2);
+        for (int l = 0; l < 32; ++l) acc += ((float) q[l] * d) * xs[l];
+    }
+}
+
+/// Rows one work-group covers.
+///
+/// 🔴 This is not about the weights. A matvec reads each weight byte exactly once; what it reads
+/// `n_rows` times is the **activation vector**, and on these shapes that is the larger number by
+/// an order of magnitude — an expert's gate matrix is 1.2 MiB against 8 MiB of re-read `x`. That
+/// showed up as a matvec running at what looked like full memory bandwidth while moving almost
+/// no weights: `attn_q`, `attn_k` and `attn_v` together measured 55 MiB of traffic in 121 us,
+/// which is 456 GB/s on a card whose peak is 456 GB/s — and only 7 MiB of it was weights.
+///
+/// Eight rows to a work-group means one trip through `x` serves eight of them. The work-group is
+/// eight sub-groups of `WG`, one row each, so the *total* number of work-items is unchanged and
+/// so is occupancy; only the sharing changes.
+static constexpr int MATVEC_ROWS = 8;
+
+/// Submit a matvec against block-quantised weights: one sub-group per row, `MATVEC_ROWS` rows
+/// to a work-group.
+///
+/// 🔴 The work split within a row is over **32-element units, not blocks**, and that is the
+/// other half of the point. A block-per-lane split leaves a work-group mostly idle on the shapes
+/// this model actually runs: an expert's `n_cols` is 2048, which is eight Q4_K super-blocks, so
+/// eight of thirty-two lanes had work and twenty-four sat out. Splitting by unit gives sixty-four
+/// pieces to thirty-two lanes.
+template <unsigned int TY>
+static void matvec_q_submit(queue &q, float *out, const void *w, const float *x,
+                            unsigned long n_rows, unsigned long n_cols) {
+    constexpr int BB = const_block_bytes<TY>();
+    constexpr int UPB = units_per_block<TY>();
+    const unsigned long nb = n_cols / (unsigned long) (UPB * 32);
+    const unsigned long units = nb * (unsigned long) UPB;
+    const unsigned long row_bytes = nb * (unsigned long) BB;
+    const unsigned long groups = (n_rows + MATVEC_ROWS - 1) / (unsigned long) MATVEC_ROWS;
+    const auto *base = static_cast<const unsigned char *>(w);
+    q.parallel_for(
+        nd_range<1>{range<1>{groups * (MATVEC_ROWS * WG)}, range<1>{MATVEC_ROWS * WG}},
+        [=](nd_item<1> it) [[sycl::reqd_sub_group_size(WG)]] {
+            const auto sg = it.get_sub_group();
+            const size_t row = it.get_group(0) * MATVEC_ROWS + sg.get_group_linear_id();
+            const size_t lane = sg.get_local_linear_id();
+            // A tail group has rows past the end. They read row 0 and throw the answer away,
+            // rather than branching out — every lane has to reach the reduction below.
+            const bool live = row < n_rows;
+            const unsigned char *rowp = base + (live ? row : 0) * row_bytes;
+            float acc = 0.0f;
+            for (size_t u = lane; u < units; u += WG) {
+                unit_acc<TY>(acc, rowp + (u / UPB) * (size_t) BB, x + u * 32, (int) (u % UPB));
+            }
+            const float total = reduce_over_group(sg, acc, sycl::plus<float>());
+            if (lane == 0 && live) out[row] = total;
+        });
+}
 
 extern "C" {
 
@@ -382,13 +551,29 @@ struct moearc_ctx {
 // ---- lifecycle ------------------------------------------------------------------------
 moearc_ctx *moearc_ctx_create() {
     try {
-        return new moearc_ctx{queue{gpu_selector_v}};
+        // 🔴 In-order, and that is load-bearing. The kernels below submit and return
+        // without waiting, so what keeps a matmul from reading a buffer another kernel is
+        // still writing is the queue's ordering, not a synchronisation after every launch.
+        // An out-of-order queue with these submissions would produce output that is finite,
+        // fluent and wrong.
+        return new moearc_ctx{queue{gpu_selector_v, property::queue::in_order()}};
     } catch (...) {
         return nullptr;
     }
 }
 
 void moearc_ctx_destroy(moearc_ctx *c) { delete c; }
+
+// Block until everything submitted to the queue has finished.
+//
+// The queue is in-order, so this is also the point at which an exception thrown by any kernel
+// submitted since the last synchronisation is delivered. Kernels below therefore return OK for
+// "accepted", not for "completed" — the completion verdict arrives here, or at the next
+// device-to-host copy, which waits for the same reason.
+int moearc_sync(moearc_ctx *c) {
+    if (!c) return ERR;
+    try { c->q.wait_and_throw(); return OK; } catch (...) { return ERR; }
+}
 
 int moearc_device_name(moearc_ctx *c, char *out, unsigned long cap) {
     if (!c || !out || cap == 0) return -1;
@@ -475,7 +660,7 @@ int moearc_dequant(moearc_ctx *c, unsigned int type_id, float *dst, const void *
             const size_t b = g / be;
             const int i = (int) (g % be);
             dst[g] = elem_at(type_id, base + b * (size_t) bb, i);
-        }).wait_and_throw();
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -507,25 +692,40 @@ int moearc_matvec_q(moearc_ctx *c, unsigned int type_id, float *out, const void 
     if (n_cols % (unsigned long) be != 0) return ERR_ARG;
     if (n_rows == 0) return OK;
     try {
-        const unsigned long nb = n_cols / be;
-        const auto *base = static_cast<const unsigned char *>(w);
-        c->q.parallel_for(
-               nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}},
-               [=](nd_item<1> it) {
-                   const size_t row = it.get_group(0);
-                   const size_t lid = it.get_local_id(0);
-                   float acc = 0.0f;
-                   for (size_t b = lid; b < nb; b += WG) {
-                       const unsigned char *blk = base + (row * nb + b) * (size_t) bb;
-                       const float *xs = x + b * be;
-                       for (int i = 0; i < be; ++i) {
-                           acc += elem_at(type_id, blk, i) * xs[i];
-                       }
-                   }
-                   const float total = reduce_over_group(it.get_group(), acc, sycl::plus<float>());
-                   if (lid == 0) out[row] = total;
-               })
-            .wait_and_throw();
+        switch (type_id) {
+            case GGML_TYPE_Q4_K:
+                matvec_q_submit<GGML_TYPE_Q4_K>(c->q, out, w, x, n_rows, n_cols);
+                break;
+            case GGML_TYPE_Q5_K:
+                matvec_q_submit<GGML_TYPE_Q5_K>(c->q, out, w, x, n_rows, n_cols);
+                break;
+            case GGML_TYPE_Q6_K:
+                matvec_q_submit<GGML_TYPE_Q6_K>(c->q, out, w, x, n_rows, n_cols);
+                break;
+            case GGML_TYPE_Q8_0:
+                matvec_q_submit<GGML_TYPE_Q8_0>(c->q, out, w, x, n_rows, n_cols);
+                break;
+            default: {
+                // f32 and f16 are "blocks" of one element, so there is no unit to hoist
+                // anything out of and no constraint that `n_cols` be a multiple of 32. One
+                // element per step, straight through `elem_at`.
+                const auto *base = static_cast<const unsigned char *>(w);
+                c->q.parallel_for(
+                    nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}}, [=](nd_item<1> it) {
+                        const size_t row = it.get_group(0);
+                        const size_t lid = it.get_local_id(0);
+                        float acc = 0.0f;
+                        for (size_t i = lid; i < n_cols; i += WG) {
+                            acc += elem_at(type_id, base + (row * n_cols + i) * (size_t) bb, 0)
+                                   * x[i];
+                        }
+                        const float total =
+                            reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+                        if (lid == 0) out[row] = total;
+                    });
+                break;
+            }
+        }
         return OK;
     } catch (...) { return ERR; }
 }
@@ -549,8 +749,7 @@ int moearc_matvec_f32(moearc_ctx *c, float *out, const float *w, const float *x,
                    }
                    const float total = reduce_over_group(it.get_group(), acc, sycl::plus<float>());
                    if (lid == 0) out[row] = total;
-               })
-            .wait_and_throw();
+               });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -571,25 +770,26 @@ int moearc_rmsnorm(moearc_ctx *c, float *out, const float *x, const float *weigh
     if (n_rows == 0) return OK;
     try {
         const bool have_w = weight != nullptr;
+        const size_t wg = norm_wg(n_cols);
         c->q.parallel_for(
-               nd_range<1>{range<1>{n_rows * WG}, range<1>{WG}},
+               nd_range<1>{range<1>{n_rows * wg}, range<1>{wg}},
                [=](nd_item<1> it) {
                    const size_t row = it.get_group(0);
                    const size_t lid = it.get_local_id(0);
+                   const size_t width = it.get_local_range(0);
                    const float *xr = x + row * n_cols;
                    float *outr = out + row * n_cols;
 
                    float ss = 0.0f;
-                   for (size_t i = lid; i < n_cols; i += WG) ss += xr[i] * xr[i];
+                   for (size_t i = lid; i < n_cols; i += width) ss += xr[i] * xr[i];
                    ss = reduce_over_group(it.get_group(), ss, sycl::plus<float>());
 
                    const float scale = sycl::rsqrt(ss / (float) n_cols + eps);
-                   for (size_t i = lid; i < n_cols; i += WG) {
+                   for (size_t i = lid; i < n_cols; i += width) {
                        const float v = xr[i] * scale;
                        outr[i] = have_w ? v * weight[i] : v;
                    }
-               })
-            .wait_and_throw();
+               });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -602,7 +802,7 @@ int moearc_silu(moearc_ctx *c, float *out, const float *x, unsigned long n) {
         c->q.parallel_for(range<1>{n}, [=](id<1> it) {
             const float v = x[it[0]];
             out[it[0]] = v / (1.0f + sycl::exp(-v));
-        }).wait_and_throw();
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -618,7 +818,7 @@ int moearc_swiglu(moearc_ctx *c, float *out, const float *gate, const float *up,
         c->q.parallel_for(range<1>{n}, [=](id<1> it) {
             const float g = gate[it[0]];
             out[it[0]] = (g / (1.0f + sycl::exp(-g))) * up[it[0]];
-        }).wait_and_throw();
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -674,8 +874,7 @@ int moearc_softmax(moearc_ctx *c, float *out, const float *x, const float *mask,
                    for (size_t i = lid; i < n_cols; i += WG) {
                        outr[i] = sycl::exp(xr[i] * scale + (have_mask ? mr[i] : 0.0f) - mx) * inv;
                    }
-               })
-            .wait_and_throw();
+               });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -742,7 +941,7 @@ int moearc_rope(moearc_ctx *c, float *dst, const float *src, const int *pos,
             const float x0 = s[lo];
             const float x1 = s[hi];
             o[d] = is_lo ? (x0 * ct - x1 * st) : (x0 * st + x1 * ct);
-        }).wait_and_throw();
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -775,46 +974,70 @@ int moearc_topk_router(moearc_ctx *c, unsigned int *idx, float *weights, const f
     if (k == 0 || k > (unsigned int) MAX_TOPK || (unsigned long) k > n_expert) return ERR_ARG;
     if (n_tokens == 0) return OK;
     try {
-        c->q.parallel_for(range<1>{n_tokens}, [=](id<1> it) {
-            const size_t t = it[0];
-            const float *l = logits + t * n_expert;
+        c->q.parallel_for(
+               nd_range<1>{range<1>{n_tokens * WG}, range<1>{WG}},
+               [=](nd_item<1> it) {
+                   const size_t t = it.get_group(0);
+                   const size_t lid = it.get_local_id(0);
+                   const auto g = it.get_group();
+                   const float *l = logits + t * n_expert;
+                   constexpr float NEG_MAX = -3.402823466e+38f;
 
-            float mx = -3.402823466e+38f;
-            for (size_t j = 0; j < n_expert; ++j) mx = sycl::fmax(mx, l[j]);
-            float denom = 0.0f;
-            for (size_t j = 0; j < n_expert; ++j) denom += sycl::exp(l[j] - mx);
+                   // The maximum is exact under any grouping: `fmax` is associative.
+                   float mymax = NEG_MAX;
+                   for (size_t j = lid; j < n_expert; j += WG) mymax = sycl::fmax(mymax, l[j]);
+                   const float mx = reduce_over_group(g, mymax, sycl::maximum<float>());
 
-            int sel[MAX_TOPK];
-            for (unsigned int r = 0; r < k; ++r) {
-                int best = -1;
-                float bestv = 0.0f;
-                for (size_t j = 0; j < n_expert; ++j) {
-                    bool taken = false;
-                    for (unsigned int p = 0; p < r; ++p) {
-                        if (sel[p] == (int) j) { taken = true; break; }
-                    }
-                    if (taken) continue;
-                    // Strict `>` so the first — lowest-indexed — of equal logits wins.
-                    if (best < 0 || l[j] > bestv) {
-                        best = (int) j;
-                        bestv = l[j];
-                    }
-                }
-                sel[r] = best;
-            }
+                   // Selection, k rounds of a masked argmax. The serial version rescanned every
+                   // expert against every already-chosen one in a single lane — k*n_expert*k
+                   // comparisons on one work-item, which is where a decode step's router time
+                   // went. Every lane keeps its own copy of `sel`; they agree because the two
+                   // reductions below are group-wide.
+                   int sel[MAX_TOPK];
+                   for (unsigned int r = 0; r < k; ++r) {
+                       int bidx = -1;
+                       float bestv = NEG_MAX;
+                       for (size_t j = lid; j < n_expert; j += WG) {
+                           bool taken = false;
+                           for (unsigned int p = 0; p < r; ++p) {
+                               if (sel[p] == (int) j) { taken = true; break; }
+                           }
+                           if (taken) continue;
+                           // Strict `>`, ascending scan: the lower index wins a tie in a lane.
+                           if (bidx < 0 || l[j] > bestv) {
+                               bidx = (int) j;
+                               bestv = l[j];
+                           }
+                       }
+                       const float gmax =
+                           reduce_over_group(g, bidx < 0 ? NEG_MAX : bestv, sycl::maximum<float>());
+                       // ...and the lower index wins a tie across lanes, which is what makes the
+                       // same logits always name the same experts.
+                       const int cand = (bidx >= 0 && bestv == gmax) ? bidx : 0x7FFFFFFF;
+                       sel[r] = reduce_over_group(g, cand, sycl::minimum<int>());
+                   }
 
-            float wsum = 0.0f;
-            for (unsigned int r = 0; r < k; ++r) {
-                const float w = sycl::exp(l[sel[r]] - mx) / denom;
-                idx[t * k + r] = (unsigned int) sel[r];
-                weights[t * k + r] = w;
-                wsum += w;
-            }
-            if (normalize) {
-                const float clamped = sycl::fmax(wsum, 6.103515625e-5f);
-                for (unsigned int r = 0; r < k; ++r) weights[t * k + r] /= clamped;
-            }
-        }).wait_and_throw();
+                   // 🔴 The denominator and the weights stay in one lane, summed in index order.
+                   // Floating-point addition is not associative, so reducing them over the group
+                   // would change the router's weights in the last bits — a change to the
+                   // model's arithmetic, bought for a few microseconds on a 64-element sum.
+                   if (lid == 0) {
+                       float denom = 0.0f;
+                       for (size_t j = 0; j < n_expert; ++j) denom += sycl::exp(l[j] - mx);
+
+                       float wsum = 0.0f;
+                       for (unsigned int r = 0; r < k; ++r) {
+                           const float w = sycl::exp(l[sel[r]] - mx) / denom;
+                           idx[t * k + r] = (unsigned int) sel[r];
+                           weights[t * k + r] = w;
+                           wsum += w;
+                       }
+                       if (normalize) {
+                           const float clamped = sycl::fmax(wsum, 6.103515625e-5f);
+                           for (unsigned int r = 0; r < k; ++r) weights[t * k + r] /= clamped;
+                       }
+                   }
+               });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -827,8 +1050,7 @@ int moearc_add(moearc_ctx *c, float *out, const float *a, const float *b, unsign
     if (!c || !out || !a || !b) return ERR;
     if (n == 0) return OK;
     try {
-        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] = a[it[0]] + b[it[0]]; })
-            .wait_and_throw();
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] = a[it[0]] + b[it[0]]; });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -837,8 +1059,21 @@ int moearc_mul(moearc_ctx *c, float *out, const float *a, const float *b, unsign
     if (!c || !out || !a || !b) return ERR;
     if (n == 0) return OK;
     try {
-        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] = a[it[0]] * b[it[0]]; })
-            .wait_and_throw();
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] = a[it[0]] * b[it[0]]; });
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// Fill a device buffer with zeros.
+//
+// The MoE combine needs its accumulator cleared once per block. Doing that by uploading a host
+// vector of zeros is a host-to-device copy, and a copy is a synchronisation point: it drains
+// the queue that everything else is now free to run ahead of. A kernel is not.
+int moearc_zero(moearc_ctx *c, float *dst, unsigned long n) {
+    if (!c || !dst) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { dst[it[0]] = 0.0f; });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -853,8 +1088,7 @@ int moearc_axpy(moearc_ctx *c, float *out, const float *x, float alpha, unsigned
     if (!c || !out || !x) return ERR;
     if (n == 0) return OK;
     try {
-        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] += alpha * x[it[0]]; })
-            .wait_and_throw();
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { out[it[0]] += alpha * x[it[0]]; });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -868,8 +1102,7 @@ int moearc_quantize_f16(moearc_ctx *c, void *dst, const float *src, unsigned lon
     if (n == 0) return OK;
     try {
         auto *d = static_cast<unsigned short *>(dst);
-        c->q.parallel_for(range<1>{n}, [=](id<1> it) { d[it[0]] = f32_to_f16(src[it[0]]); })
-            .wait_and_throw();
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) { d[it[0]] = f32_to_f16(src[it[0]]); });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -904,7 +1137,7 @@ int moearc_embed_rows(moearc_ctx *c, unsigned int type_id, float *out, const voi
             const size_t i = g % n_embd;
             const unsigned char *row = base + (size_t) token_ids[t] * row_bytes;
             out[g] = elem_at(type_id, row + (i / be) * (size_t) bb, (int) (i % be));
-        }).wait_and_throw();
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -933,7 +1166,7 @@ int moearc_kv_append(moearc_ctx *c, void *k_pages, void *v_pages, const float *k
             const size_t i = it[0];
             kv_store(k_pages, base + i, k[i], kv_type);
             kv_store(v_pages, base + i, v[i], kv_type);
-        }).wait_and_throw();
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -1015,8 +1248,7 @@ int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_
                    }
 
                    out[h * head_dim + d] = acc / l;
-               })
-            .wait_and_throw();
+               });
         return OK;
     } catch (...) { return ERR; }
 }

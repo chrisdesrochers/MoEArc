@@ -19,6 +19,8 @@ pub struct MoearcCtx {
 unsafe extern "C" {
     pub fn moearc_ctx_create() -> *mut MoearcCtx;
     pub fn moearc_ctx_destroy(c: *mut MoearcCtx);
+    pub fn moearc_sync(c: *mut MoearcCtx) -> c_int;
+    pub fn moearc_zero(c: *mut MoearcCtx, dst: *mut c_float, n: c_ulong) -> c_int;
     pub fn moearc_device_name(c: *mut MoearcCtx, out: *mut c_char, cap: c_ulong) -> c_int;
     pub fn moearc_alloc_device(c: *mut MoearcCtx, bytes: c_ulong) -> *mut c_void;
     pub fn moearc_free_device(c: *mut MoearcCtx, p: *mut c_void);

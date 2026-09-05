@@ -35,3 +35,7 @@ required-features = ["gpu"]
 [[example]]
 name = "olmoe_residency"
 required-features = ["gpu"]
+
+[[example]]
+name = "olmoe_profile"
+required-features = ["gpu"]

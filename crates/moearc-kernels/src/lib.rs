@@ -26,10 +26,16 @@
 //!
 //! # Performance
 //!
-//! Not yet a goal. The kernels are written for auditability: the dequantisation formula lives
-//! in one function that both the expansion and the matvec call, at the cost of recomputing
-//! per-block constants per element. Nothing here has been tuned, and no throughput claim is
-//! made anywhere in this crate.
+//! One kernel has been tuned, because a decode step spent 92% of its time in it: `matvec_q`.
+//! Three things were wrong with the first version, and all three were measured rather than
+//! guessed — see `Context::matvec_q` and the `unit_acc` / `matvec_q_submit` notes in
+//! `kernels.cpp`. The rest of this crate is still written for auditability first: `dequant`,
+//! `embed_rows` and the reference twins recompute per-block constants per element, which is
+//! redundant work in exchange for the element formula living in exactly one place.
+//!
+//! What is *not* claimed anywhere here is a throughput number. `examples/launch_overhead.rs`
+//! measures the one thing this crate can honestly report on its own — what a submission costs
+//! — and the engine's `olmoe_profile` example measures the rest.
 
 mod ffi;
 pub mod reference;
@@ -40,8 +46,26 @@ use std::os::raw::c_int;
 pub use reference::{KvType, QK_K, QK8_0, QuantType, RopeKind};
 
 /// A GPU context: a SYCL queue and the device it targets.
+///
+/// # Submission, not completion
+///
+/// 🔴 The kernel methods below **submit work and return**. `Ok(())` means the device accepted
+/// the launch, not that it ran. The queue is **in-order**, so a kernel cannot start before
+/// everything submitted ahead of it has finished and no caller has to express a dependency —
+/// but a host that wants to *read* a result, or to reuse a host buffer a copy is sourcing
+/// from, must first reach a synchronisation point. There are two, and they are the same two
+/// that report a failed kernel: [`Context::sync`] and [`Context::download`] (with the
+/// `_slice` wrapper over it).
+///
+/// [`Context::upload`] also waits, which is what makes `ctx.upload_slice(&buf, &[x])` on a
+/// temporary safe to write. That is a deliberate cost: an upload happens a couple of times per
+/// token, and a copy that did not wait would hand every caller a lifetime problem the type
+/// system is not expressing.
 pub struct Context {
     raw: *mut ffi::MoearcCtx,
+    /// Wait after every kernel, so a host-side profile attributes device time to the call that
+    /// caused it. Off unless `MOEARC_SYNC_EACH=1`; see [`Context::new`].
+    sync_each: bool,
 }
 
 /// Why a device operation failed.
@@ -147,9 +171,40 @@ fn as_bytes_mut<T: Copy>(v: &mut [T]) -> &mut [u8] {
 
 impl Context {
     /// Open a queue on the default GPU.
+    ///
+    /// `MOEARC_SYNC_EACH=1` makes every kernel wait for the device before returning. That is
+    /// the old, slow behaviour, kept as a measurement tool: with an asynchronous queue a
+    /// host-side timer around a launch measures the *submission*, and all the device time
+    /// piles up at whichever call happens to synchronise next. Setting this hands the time
+    /// back to the call that caused it — at a cost that is the whole reason the flag is a flag.
     pub fn new() -> Result<Self, KernelError> {
         let raw = unsafe { ffi::moearc_ctx_create() };
-        if raw.is_null() { Err(KernelError::NoDevice) } else { Ok(Self { raw }) }
+        if raw.is_null() {
+            return Err(KernelError::NoDevice);
+        }
+        let sync_each = std::env::var("MOEARC_SYNC_EACH").ok().as_deref() == Some("1");
+        Ok(Self { raw, sync_each })
+    }
+
+    /// Turn a kernel's return code into a `Result`, and wait for it if asked to.
+    fn finish(&self, rc: c_int, what: &'static str) -> Result<(), KernelError> {
+        check(rc, what)?;
+        if self.sync_each { self.sync() } else { Ok(()) }
+    }
+
+    /// Block until every kernel submitted so far has finished.
+    ///
+    /// The kernel wrappers below submit and return; they do not wait. That is what lets a
+    /// forward pass hand the device a run of dependent work instead of a launch, a stall, a
+    /// launch. The queue is in-order, so ordering is guaranteed without this — what this adds
+    /// is *completion*, which the host needs before it reads a result or reuses a host buffer
+    /// a copy is still sourcing from.
+    ///
+    /// 🔴 It is also where a failed kernel is reported. A wrapper returning `Ok` means the
+    /// work was accepted, not that it succeeded; the verdict arrives here or at the next
+    /// [`Context::download`], which waits for the same reason.
+    pub fn sync(&self) -> Result<(), KernelError> {
+        check(unsafe { ffi::moearc_sync(self.raw) }, "queue synchronisation")
     }
 
     /// The device's reported name.
@@ -274,7 +329,7 @@ impl Context {
                 nblocks as ffi::c_ulong,
             )
         };
-        check(rc, "dequantisation")
+        self.finish(rc, "dequantisation")
     }
 
     /// `out[row] = sum_col W[row][col] * x[col]` against block-quantised weights.
@@ -311,7 +366,7 @@ impl Context {
                 n_cols as ffi::c_ulong,
             )
         };
-        check(rc, "quantised matvec")
+        self.finish(rc, "quantised matvec")
     }
 
     /// The same product against unquantised f32 weights.
@@ -336,7 +391,7 @@ impl Context {
                 n_cols as ffi::c_ulong,
             )
         };
-        check(rc, "f32 matvec")
+        self.finish(rc, "f32 matvec")
     }
 
     /// RMSNorm over the last axis, optionally scaled by a per-column weight.
@@ -370,7 +425,7 @@ impl Context {
                 eps,
             )
         };
-        check(rc, "rmsnorm")
+        self.finish(rc, "rmsnorm")
     }
 
     /// SiLU: `x / (1 + exp(-x))`, elementwise.
@@ -384,7 +439,7 @@ impl Context {
         out.require("silu output", n * 4)?;
         let rc =
             unsafe { ffi::moearc_silu(self.raw, out.ptr.cast(), x.ptr.cast(), n as ffi::c_ulong) };
-        check(rc, "silu")
+        self.finish(rc, "silu")
     }
 
     /// SwiGLU: `silu(gate) * up`, elementwise — the gated FFN activation, fused.
@@ -407,7 +462,7 @@ impl Context {
                 n as ffi::c_ulong,
             )
         };
-        check(rc, "swiglu")
+        self.finish(rc, "swiglu")
     }
 
     /// Row-wise softmax, max-subtracted, unmasked and unscaled.
@@ -461,7 +516,7 @@ impl Context {
                 },
             )
         };
-        check(rc, "rope")
+        self.finish(rc, "rope")
     }
 
     /// Top-k expert selection from router logits.
@@ -497,7 +552,7 @@ impl Context {
                 i32::from(normalize),
             )
         };
-        check(rc, "top-k router")
+        self.finish(rc, "top-k router")
     }
 
     /// Row-wise softmax of `x * scale + mask` — `ggml_soft_max_ext` with no ALiBi.
@@ -535,7 +590,7 @@ impl Context {
                 scale,
             )
         };
-        check(rc, "softmax")
+        self.finish(rc, "softmax")
     }
 
     /// `out[i] = a[i] + b[i]` — the residual add.
@@ -552,7 +607,7 @@ impl Context {
         let rc = unsafe {
             ffi::moearc_add(self.raw, out.ptr.cast(), a.ptr.cast(), b.ptr.cast(), n as ffi::c_ulong)
         };
-        check(rc, "add")
+        self.finish(rc, "add")
     }
 
     /// `out[i] = a[i] * b[i]`.
@@ -569,7 +624,18 @@ impl Context {
         let rc = unsafe {
             ffi::moearc_mul(self.raw, out.ptr.cast(), a.ptr.cast(), b.ptr.cast(), n as ffi::c_ulong)
         };
-        check(rc, "mul")
+        self.finish(rc, "mul")
+    }
+
+    /// Fill `n` f32 with zeros.
+    ///
+    /// The accumulator [`Context::axpy`] folds into has to start empty. Uploading a host vector
+    /// of zeros would do it, and did — but a copy synchronises and a kernel does not, so on a
+    /// queue everything else runs ahead of, the upload was the only thing stopping.
+    pub fn zero(&self, dst: &DeviceBuffer<'_>, n: usize) -> Result<(), KernelError> {
+        dst.require("zero-fill target", n * 4)?;
+        let rc = unsafe { ffi::moearc_zero(self.raw, dst.ptr.cast(), n as ffi::c_ulong) };
+        self.finish(rc, "zero fill")
     }
 
     /// `out[i] += alpha * x[i]`, in place — the MoE combine.
@@ -589,7 +655,7 @@ impl Context {
         let rc = unsafe {
             ffi::moearc_axpy(self.raw, out.ptr.cast(), x.ptr.cast(), alpha, n as ffi::c_ulong)
         };
-        check(rc, "axpy")
+        self.finish(rc, "axpy")
     }
 
     /// Convert `n` f32 to f16 on the device, round-to-nearest-even.
@@ -607,7 +673,7 @@ impl Context {
         let rc = unsafe {
             ffi::moearc_quantize_f16(self.raw, dst.ptr, src.ptr.cast(), n as ffi::c_ulong)
         };
-        check(rc, "f16 conversion")
+        self.finish(rc, "f16 conversion")
     }
 
     /// Gather token rows out of an embedding table and expand them to f32.
@@ -643,7 +709,7 @@ impl Context {
                 n_embd as ffi::c_ulong,
             )
         };
-        check(rc, "embedding lookup")
+        self.finish(rc, "embedding lookup")
     }
 
     /// Write one token's K and V into the page slot the cache allocator handed out.
@@ -686,7 +752,7 @@ impl Context {
                 kv.type_id(),
             )
         };
-        check(rc, "KV append")
+        self.finish(rc, "KV append")
     }
 
     /// Single-query attention over the paged KV cache: `softmax(scale * q.K^T) . V`.
@@ -746,7 +812,7 @@ impl Context {
                 kv.type_id(),
             )
         };
-        check(rc, "paged attention")
+        self.finish(rc, "paged attention")
     }
 }
 

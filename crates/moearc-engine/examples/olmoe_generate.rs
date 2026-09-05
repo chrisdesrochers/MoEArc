@@ -8,9 +8,9 @@
 //! Ids rather than text on purpose: two implementations can print the same string from
 //! different tokenisations, and the acceptance question is whether the *ids* agree.
 //!
-//! Timing is printed and is **unoptimised** — the whole model is resident, every expert is a
-//! separate allocation, and the router's choice is read back to the host once per block. No
-//! throughput claim is made from it.
+//! Timing is printed and covers the whole run, prompt included, from a **cold expert pool** —
+//! so it is a floor, not a steady state: the first tokens pay for staging every expert they
+//! name. `examples/olmoe_profile.rs` reports the steady state and where the time goes.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
         Ok(s) => {
             println!("ids           {out:?}");
             println!(
-                "{} prompt + {} generated in {:.2}s ({:.2} tok/s, UNOPTIMISED) — {:?}",
+                "{} prompt + {} generated in {:.2}s ({:.2} tok/s, cold pool) — {:?}",
                 s.prompt_tokens,
                 s.completion_tokens,
                 elapsed.as_secs_f64(),

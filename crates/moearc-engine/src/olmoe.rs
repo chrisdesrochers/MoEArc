@@ -46,13 +46,25 @@
 //! sized to the largest that bank reaches in any block — this file quantises `ffn_down_exps` at
 //! Q6_K in 8 of 16 blocks and Q4_K in the rest, and a slot has to hold either.
 //!
-//! # What this is not
+//! # What is still slow, and known to be
 //!
-//! Not fast, and not trying to be. The router's choice is read back to the host once per block,
-//! which costs a device round trip per block per token; prompt tokens go through the
-//! single-token decode path one at a time rather than as a batched prefill; and a miss is a
-//! synchronous host-to-device copy with nothing overlapped behind it. All three are deliberate,
-//! and any timing taken from this is unoptimised.
+//! Three things, all deliberate and all measured — run the `olmoe_profile` example for the
+//! current breakdown:
+//!
+//! - **Prompt tokens go through the single-token decode path one at a time.** There is no
+//!   batched prefill; there is one code path to be correct instead of two.
+//! - **A miss is a synchronous host-to-device copy with nothing overlapped behind it.** On a
+//!   cold pool this is the largest single phase; on a warm one it nearly vanishes, which is why
+//!   the profile example throws away its first tokens before reading the counters.
+//! - **The router's choice is read back to the host once per block**, so the host can decide
+//!   what to stage. It is a device round trip per block per token, and at ~13 us it is now
+//!   under one percent of a step — the reason to remove it would be to drive the gather from
+//!   the device, not the round trip itself.
+//!
+//! What is *no longer* true: the queue is asynchronous and in-order, so the kernels below
+//! submit and return rather than waiting one at a time. That is what makes the ordering of
+//! `stage` before compute a correctness property of this file rather than an accident of every
+//! call synchronising.
 
 use moearc_kernels::{Context, DeviceBuffer, KernelError, KvType, QuantType, RopeKind};
 use moearc_model::gguf::Value;
@@ -62,6 +74,7 @@ use moearc_model::{ModelError, ModelInfo};
 use crate::cache::{CacheError, CacheStats, ExpertCache, Load, Slot, StepPlan};
 use crate::kv::{KvError, PagedKvCache, SeqId};
 use crate::memory::{self, PlanError};
+use crate::profile;
 use crate::residency::ExpertRef;
 
 /// The one sequence a [`Model`] tracks. Batching is not implemented.
@@ -742,7 +755,6 @@ pub struct State<'c> {
     /// it grows.
     table_host: Vec<u32>,
 
-    zeros: Vec<f32>,
     idx_host: Vec<u32>,
     w_host: Vec<f32>,
     /// Expert bytes copied host-to-device since the last `reset_traffic`. Counted from the
@@ -802,7 +814,6 @@ impl<'c> State<'c> {
             begun: false,
             n_kv: 0,
             table_host: Vec::new(),
-            zeros: vec![0.0; n_embd],
             idx_host: vec![0; cfg.n_expert_used],
             w_host: vec![0.0; cfg.n_expert_used],
             bytes_staged: 0,
@@ -978,6 +989,7 @@ impl<'c, 'm> Model<'c, 'm> {
             )));
         }
 
+        let _p_step = profile::scope("decode.total");
         if !st.begun {
             st.kv.begin(SEQ, 0)?;
             st.begun = true;
@@ -995,8 +1007,11 @@ impl<'c, 'm> Model<'c, 'm> {
             ctx.upload_slice(&st.block_table, &st.table_host)?;
         }
 
-        ctx.upload_slice(&st.tok, &[token])?;
-        ctx.upload_slice(&st.pos, &[pos])?;
+        {
+            let _p = profile::scope("setup.upload");
+            ctx.upload_slice(&st.tok, &[token])?;
+            ctx.upload_slice(&st.pos, &[pos])?;
+        }
 
         let n_embd = cfg.n_embd;
         let n_embd_kv = cfg.n_head_kv * cfg.head_dim;
@@ -1004,91 +1019,127 @@ impl<'c, 'm> Model<'c, 'm> {
         let scale = cfg.kq_scale();
 
         // h = token_embd[token]
-        ctx.embed_rows(w.token_embd.ty, &st.h, &w.token_embd.buf, &st.tok, 1, n_embd)?;
+        {
+            let _p = profile::scope("embed");
+            ctx.embed_rows(w.token_embd.ty, &st.h, &w.token_embd.buf, &st.tok, 1, n_embd)?;
+        }
 
         for (bi, b) in w.blocks.iter().enumerate() {
             // ---- attention -------------------------------------------------------------
-            ctx.rmsnorm(&st.x, &st.h, Some(&b.attn_norm), 1, n_embd, eps)?;
-            matvec(ctx, &st.q, &b.attn_q, &st.x)?;
-            matvec(ctx, &st.k, &b.attn_k, &st.x)?;
-            matvec(ctx, &st.v, &b.attn_v, &st.x)?;
+            {
+                let _p = profile::scope("attn.norm");
+                ctx.rmsnorm(&st.x, &st.h, Some(&b.attn_norm), 1, n_embd, eps)?;
+            }
+            {
+                let _p = profile::scope("attn.qkv");
+                matvec(ctx, &st.q, &b.attn_q, &st.x)?;
+                matvec(ctx, &st.k, &b.attn_k, &st.x)?;
+                matvec(ctx, &st.v, &b.attn_v, &st.x)?;
+            }
 
             // QK-norm over the whole vector — before the head reshape, before RoPE.
-            ctx.rmsnorm(&st.q_normed, &st.q, Some(&b.attn_q_norm), 1, n_embd, eps)?;
-            ctx.rmsnorm(&st.k_normed, &st.k, Some(&b.attn_k_norm), 1, n_embd_kv, eps)?;
+            {
+                let _p = profile::scope("attn.qk_norm");
+                ctx.rmsnorm(&st.q_normed, &st.q, Some(&b.attn_q_norm), 1, n_embd, eps)?;
+                ctx.rmsnorm(&st.k_normed, &st.k, Some(&b.attn_k_norm), 1, n_embd_kv, eps)?;
+            }
 
-            ctx.rope(
-                &st.q_roped,
-                &st.q_normed,
-                &st.pos,
-                1,
-                cfg.n_head,
-                cfg.head_dim,
-                cfg.n_rot,
-                cfg.rope_freq_base,
-                RopeKind::Neox,
-            )?;
-            ctx.rope(
-                &st.k_roped,
-                &st.k_normed,
-                &st.pos,
-                1,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                cfg.n_rot,
-                cfg.rope_freq_base,
-                RopeKind::Neox,
-            )?;
+            {
+                let _p = profile::scope("attn.rope");
+                ctx.rope(
+                    &st.q_roped,
+                    &st.q_normed,
+                    &st.pos,
+                    1,
+                    cfg.n_head,
+                    cfg.head_dim,
+                    cfg.n_rot,
+                    cfg.rope_freq_base,
+                    RopeKind::Neox,
+                )?;
+                ctx.rope(
+                    &st.k_roped,
+                    &st.k_normed,
+                    &st.pos,
+                    1,
+                    cfg.n_head_kv,
+                    cfg.head_dim,
+                    cfg.n_rot,
+                    cfg.rope_freq_base,
+                    RopeKind::Neox,
+                )?;
+            }
 
-            ctx.kv_append(
-                &st.k_pages[bi],
-                &st.v_pages[bi],
-                &st.k_roped,
-                &st.v,
-                page,
-                slot,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                PAGE_TOKENS,
-                KV,
-            )?;
-            ctx.attn_decode(
-                &st.attn,
-                &st.q_roped,
-                &st.k_pages[bi],
-                &st.v_pages[bi],
-                &st.block_table,
-                cfg.n_head,
-                cfg.n_head_kv,
-                cfg.head_dim,
-                st.n_kv,
-                PAGE_TOKENS,
-                scale,
-                KV,
-            )?;
-            matvec(ctx, &st.proj, &b.attn_output, &st.attn)?;
-            // `add` writes each index from the same index of both inputs, so aliasing the
-            // accumulator into the left operand is well defined.
-            ctx.add(&st.h, &st.h, &st.proj, n_embd)?;
+            {
+                let _p = profile::scope("attn.kv_append");
+                ctx.kv_append(
+                    &st.k_pages[bi],
+                    &st.v_pages[bi],
+                    &st.k_roped,
+                    &st.v,
+                    page,
+                    slot,
+                    cfg.n_head_kv,
+                    cfg.head_dim,
+                    PAGE_TOKENS,
+                    KV,
+                )?;
+            }
+            {
+                let _p = profile::scope("attn.attend");
+                ctx.attn_decode(
+                    &st.attn,
+                    &st.q_roped,
+                    &st.k_pages[bi],
+                    &st.v_pages[bi],
+                    &st.block_table,
+                    cfg.n_head,
+                    cfg.n_head_kv,
+                    cfg.head_dim,
+                    st.n_kv,
+                    PAGE_TOKENS,
+                    scale,
+                    KV,
+                )?;
+            }
+            {
+                let _p = profile::scope("attn.proj");
+                matvec(ctx, &st.proj, &b.attn_output, &st.attn)?;
+                // `add` writes each index from the same index of both inputs, so aliasing the
+                // accumulator into the left operand is well defined.
+                ctx.add(&st.h, &st.h, &st.proj, n_embd)?;
+            }
             tap_record(&mut st.tap, format!("ffn_inp-{bi}"), ctx, &st.h, n_embd)?;
 
             // ---- MoE FFN ---------------------------------------------------------------
-            ctx.rmsnorm(&st.x, &st.h, Some(&b.ffn_norm), 1, n_embd, eps)?;
-            matvec(ctx, &st.router, &b.ffn_gate_inp, &st.x)?;
+            {
+                let _p = profile::scope("moe.norm");
+                ctx.rmsnorm(&st.x, &st.h, Some(&b.ffn_norm), 1, n_embd, eps)?;
+            }
+            {
+                let _p = profile::scope("moe.router");
+                matvec(ctx, &st.router, &b.ffn_gate_inp, &st.x)?;
+            }
             tap_record(&mut st.tap, format!("ffn_moe_logits-{bi}"), ctx, &st.router, cfg.n_expert)?;
             // `normalize = false`: llama.cpp calls `build_moe_ffn` with `norm_w = false` for
             // OLMoE, so the weights are raw softmax probabilities and do not sum to one.
-            ctx.topk_router(
-                &st.idx,
-                &st.weights,
-                &st.router,
-                1,
-                cfg.n_expert,
-                cfg.n_expert_used,
-                false,
-            )?;
-            ctx.download_slice(&mut st.idx_host, &st.idx)?;
-            ctx.download_slice(&mut st.w_host, &st.weights)?;
+            {
+                let _p = profile::scope("moe.topk");
+                ctx.topk_router(
+                    &st.idx,
+                    &st.weights,
+                    &st.router,
+                    1,
+                    cfg.n_expert,
+                    cfg.n_expert_used,
+                    false,
+                )?;
+            }
+            {
+                let _p = profile::scope("moe.readback");
+                ctx.download_slice(&mut st.idx_host, &st.idx)?;
+                ctx.download_slice(&mut st.w_host, &st.weights)?;
+            }
             if let Some(t) = st.tap.as_mut() {
                 t.items.push((
                     format!("ffn_moe_topk-{bi}"),
@@ -1098,45 +1149,78 @@ impl<'c, 'm> Model<'c, 'm> {
             }
 
             // Ask the cache what is resident and what must move.
-            st.wanted.clear();
-            for e in &st.idx_host {
-                if *e as usize >= cfg.n_expert {
-                    return Err(EngineError::Unsupported(format!(
-                        "the router named expert {e}, past the {} in block {bi}",
-                        cfg.n_expert
-                    )));
+            let plan = {
+                let _p = profile::scope("moe.admit");
+                st.wanted.clear();
+                for e in &st.idx_host {
+                    if *e as usize >= cfg.n_expert {
+                        return Err(EngineError::Unsupported(format!(
+                            "the router named expert {e}, past the {} in block {bi}",
+                            cfg.n_expert
+                        )));
+                    }
+                    st.wanted.push(ExpertRef::new(bi as u16, *e as u16));
                 }
-                st.wanted.push(ExpertRef::new(bi as u16, *e as u16));
-            }
-            let plan = admission.admit(&st.wanted)?;
+                admission.admit(&st.wanted)?
+            };
 
             // 🔴 Every miss is staged BEFORE anything computes. A matmul against a slot still
             // being filled does not fail — it returns plausible wrong output — so this ordering
             // is the difference between a bug that is caught and one that is never found.
-            for load in &plan.loads {
-                st.bytes_staged += stage(ctx, mapped, pool, load.expert, load.into_slot)?;
+            {
+                let _p = profile::scope("moe.stage");
+                for load in &plan.loads {
+                    st.bytes_staged += stage(ctx, mapped, pool, load.expert, load.into_slot)?;
+                }
             }
             let slots = plan.slots_for(&st.wanted);
 
-            ctx.upload_slice(&st.ffn, &st.zeros)?;
+            {
+                let _p = profile::scope("moe.zero");
+                ctx.zero(&st.ffn, n_embd)?;
+            }
             for (j, &slot) in slots.iter().enumerate() {
                 let weight = st.w_host[j];
                 let sl = slot as usize;
-                matvec_bank(ctx, &st.gate, &pool.gate[sl], &b.gate, &st.x)?;
-                matvec_bank(ctx, &st.up, &pool.up[sl], &b.up, &st.x)?;
-                ctx.swiglu(&st.act, &st.gate, &st.up, cfg.n_ff)?;
-                matvec_bank(ctx, &st.expert_out, &pool.down[sl], &b.down, &st.act)?;
-                ctx.axpy(&st.ffn, &st.expert_out, weight, n_embd)?;
+                {
+                    let _p = profile::scope("moe.expert_matvec");
+                    matvec_bank(ctx, &st.gate, &pool.gate[sl], &b.gate, &st.x)?;
+                    matvec_bank(ctx, &st.up, &pool.up[sl], &b.up, &st.x)?;
+                }
+                {
+                    let _p = profile::scope("moe.swiglu");
+                    ctx.swiglu(&st.act, &st.gate, &st.up, cfg.n_ff)?;
+                }
+                {
+                    let _p = profile::scope("moe.expert_down");
+                    matvec_bank(ctx, &st.expert_out, &pool.down[sl], &b.down, &st.act)?;
+                }
+                {
+                    let _p = profile::scope("moe.axpy");
+                    ctx.axpy(&st.ffn, &st.expert_out, weight, n_embd)?;
+                }
             }
             tap_record(&mut st.tap, format!("ffn_moe_out-{bi}"), ctx, &st.ffn, n_embd)?;
-            ctx.add(&st.h, &st.h, &st.ffn, n_embd)?;
+            {
+                let _p = profile::scope("moe.add");
+                ctx.add(&st.h, &st.h, &st.ffn, n_embd)?;
+            }
             tap_record(&mut st.tap, format!("l_out-{bi}"), ctx, &st.h, n_embd)?;
         }
 
-        ctx.rmsnorm(&st.x, &st.h, Some(&w.output_norm), 1, n_embd, eps)?;
+        {
+            let _p = profile::scope("out.norm");
+            ctx.rmsnorm(&st.x, &st.h, Some(&w.output_norm), 1, n_embd, eps)?;
+        }
         tap_record(&mut st.tap, "result_norm".to_string(), ctx, &st.x, n_embd)?;
-        matvec(ctx, &st.logits_dev, &w.output, &st.x)?;
-        ctx.download_slice(&mut st.logits, &st.logits_dev)?;
+        {
+            let _p = profile::scope("out.matvec");
+            matvec(ctx, &st.logits_dev, &w.output, &st.x)?;
+        }
+        {
+            let _p = profile::scope("out.readback");
+            ctx.download_slice(&mut st.logits, &st.logits_dev)?;
+        }
         Ok(&st.logits)
     }
 }
