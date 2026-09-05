@@ -327,9 +327,34 @@ pub struct Sources {
     /// True while any of the above is a fixture. Surfaced in the footer and in `--json`,
     /// because output that looks like a measurement and is not is worse than no output.
     pub stubbed: bool,
+    /// Which parts are still fixtures, named.
+    ///
+    /// 🔴 This is a field rather than a constant because the first version was a hardcoded
+    /// sentence, and the moment device detection was wired in it began telling users that
+    /// `moearc-device` was not wired in. A provenance note that goes stale is worse than none:
+    /// it is trusted precisely because it looks like bookkeeping nobody would get wrong.
+    pub stub_note: &'static str,
 }
 
 impl Sources {
+    /// The real backends, where they exist.
+    ///
+    /// `stubbed` stays true while ANY source is a fixture, so the footer and the `--json`
+    /// payload keep saying so. Devices are real now; models, transfers and serving are not.
+    /// Reporting "not stubbed" the moment the first backend lands would be the more
+    /// flattering claim and the false one.
+    pub fn real() -> Self {
+        Self {
+            devices: Box::new(crate::detect::LevelZeroDevices),
+            models: Box::new(StubCatalog),
+            transfers: Box::new(StubTransfers),
+            serve: Box::new(StubServeStats),
+            stubbed: true,
+            stub_note: "device detection is real; the model list, downloads and serving stats \
+                        are still fixtures",
+        }
+    }
+
     /// Fixture data, for building and testing the interface ahead of the backends.
     pub fn stub() -> Self {
         Self {
@@ -338,6 +363,7 @@ impl Sources {
             transfers: Box::new(StubTransfers),
             serve: Box::new(StubServeStats),
             stubbed: true,
+            stub_note: "every number is a fixture — no hardware or model was consulted",
         }
     }
 }

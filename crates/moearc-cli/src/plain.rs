@@ -407,9 +407,6 @@ fn provenance(sources: &Sources) -> &'static str {
 fn print_provenance(sources: &Sources) {
     if sources.stubbed {
         println!();
-        println!(
-            "  note: stub data — moearc-device and moearc-model are not wired in yet, so \
-             every number above is a fixture."
-        );
+        println!("  note: {}.", sources.stub_note);
     }
 }

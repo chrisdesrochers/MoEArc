@@ -16,6 +16,7 @@
 //!   snapshot-tested before `moearc-device` and `moearc-model` exist.
 
 mod cli;
+mod detect;
 mod fit;
 mod format;
 mod plain;
@@ -29,7 +30,13 @@ use clap::Parser;
 
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
-    let sources = source::Sources::stub();
+    // Real detection, with the fixture available behind MOEARC_STUB for interface work
+    // on a machine with no Arc card.
+    let sources = if std::env::var_os("MOEARC_STUB").is_some() {
+        source::Sources::stub()
+    } else {
+        source::Sources::real()
+    };
 
     let result =
         if cli.plain_output() { plain::run(&cli, &sources) } else { tui::run(&cli, &sources) };
