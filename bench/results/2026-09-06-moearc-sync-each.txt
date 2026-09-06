@@ -1,0 +1,24 @@
+=== BEFORE:  09:19:54 up 3 days,  8:11,  3 users,  load average: 1.11, 5.78, 10.62
+
+### MOEARC_SYNC_EACH=1 -- the queue waits after every launch, so each host phase IS its
+### device time. Absolute throughput is meaningless here (no overlap); the SHAPE of
+### attn.attend against depth is the whole point, and it is the one thing the device
+### event counters cannot say, because only matvec kernels are instrumented.
+residency `600`, host `frac:0.5`, 64 generated tokens per depth
+16384 token ids available
+
+| depth | n_ctx | KV MiB | slots | load | prefill tok/s | **cold tok/s** | **warm tok/s** | hit (all) | staged MiB (all) | p50 ms | first 1/8 | last 1/8 | drift |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 512 | 577 | 26 | 600 | 1.10 | 2.09 | **2.02** | **3.78** | 75.9% | 176521 | 179.2 | 106.7 | 399.6 | +274.3% |
+| 2048 | 2113 | 80 | 600 | 20.03 | 1.85 | **4.73** | **1.26** | 73.8% | 695568 | 746.7 | 646.4 | 741.6 | +14.7% |
+
+| depth | decode.total | attn.attend | attn.qkv | attn.proj | moe.stage | moe.expert_matvec | moe.host_sync | moe.readback |
+|---|---|---|---|---|---|---|---|---|
+| 512 | 264.70 | 15.21 | 10.42 | 6.01 | 123.36 | 20.34 | 59.46 | 0.75 |
+| 2048 | 795.11 | 49.51 | 22.15 | 7.20 | 547.56 | 24.81 | 87.66 | 1.26 |
+
+ms per decode step, warm pass, **decode steps only** -- `profile::reset()` runs at the first mark, so prefill is excluded from every column above.
+
+⚠ `hit (all)` and `staged MiB (all)` cover the WHOLE pass, prompt included: the cache counters can only be zeroed through the session, and `generate_with` holds its lock. At depth 8192 the 8,192 prefill steps outnumber the 63 decode steps 130 to 1, so those two columns describe prefill and must not be read as a decode hit rate. The decode-only staging cost is `moe.stage` in the phase table, which is fenced correctly.
+
+=== AFTER:  10:08:56 up 3 days,  9:00,  4 users,  load average: 22.24, 23.02, 22.13

@@ -1,0 +1,15 @@
+=== BEFORE:  08:28:58 up 3 days,  7:20,  3 users,  load average: 0.60, 2.99, 10.95
+
+### 1. threads at depth 0, -ncmoe 31 -- llama-bench defaults to 4, and -ncmoe 31 puts 31
+###    of 36 blocks' experts on the CPU, so this is not a detail. The incumbent gets its
+###    best thread count or the comparison is rigged.
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | --------------: | -------------------: |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       4 |            tg64 |          6.68 ± 2.84 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |            tg64 |         15.21 ± 0.81 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      12 |            tg64 |         22.06 ± 0.12 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |            tg64 |         24.85 ± 0.94 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      20 |            tg64 |         21.91 ± 0.46 |
+
+
+=== AFTER THREADS:  08:31:30 up 3 days,  7:23,  4 users,  load average: 9.05, 4.49, 10.22

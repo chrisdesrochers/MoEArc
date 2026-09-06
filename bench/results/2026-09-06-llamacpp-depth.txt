@@ -1,0 +1,38 @@
+=== BEFORE:  08:38:02 up 3 days,  7:29,  3 users,  load average: 0.87, 1.82, 6.98
+
+### 2a. the thread sweep again, to show 24.85 was not a fluke
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | --------------: | -------------------: |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       4 |            tg64 |          4.31 ± 1.04 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |            tg64 |         10.97 ± 1.23 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      12 |            tg64 |         19.97 ± 0.29 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |            tg64 |         23.12 ± 1.34 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      20 |            tg64 |         20.46 ± 1.56 |
+
+
+=== MID:  08:40:33 up 3 days,  7:32,  4 users,  load average: 10.49, 4.31, 7.07
+
+### 2b. depth, at the winning thread count
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | --------------: | -------------------: |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |            tg64 |         12.99 ± 2.64 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |     tg64 @ d128 |         23.25 ± 1.19 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |     tg64 @ d512 |         26.65 ± 0.33 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |    tg64 @ d2048 |         28.24 ± 0.56 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |      16 |    tg64 @ d8192 |         28.15 ± 0.27 |
+
+
+=== MID2:  08:44:11 up 3 days,  7:36,  4 users,  load average: 5.80, 5.10, 6.83
+
+### 2c. depth at -t 8, the thread count the published 15.47 baseline used --
+###     so the curve can be read against the number already in the doc.
+| model                          |       size |     params | backend    | ngl |  n_cpu_moe | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | ------: | --------------: | -------------------: |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |            tg64 |          6.73 ± 3.14 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |     tg64 @ d128 |         16.32 ± 1.03 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |     tg64 @ d512 |         20.78 ± 0.55 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |    tg64 @ d2048 |         22.00 ± 0.38 |
+| gpt-oss 120B MXFP4 MoE         |  59.02 GiB |   116.83 B | SYCL       |  -1 |         31 |       8 |    tg64 @ d8192 |         22.25 ± 0.15 |
+
+
+=== AFTER:  08:48:19 up 3 days,  7:40,  4 users,  load average: 3.35, 4.48, 6.21

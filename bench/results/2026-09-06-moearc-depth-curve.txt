@@ -1,0 +1,22 @@
+=== BEFORE:  06:03:27 up 3 days,  4:55,  3 users,  load average: 3.64, 7.39, 5.59
+residency `600`, host `frac:0.5`, 64 generated tokens per depth
+16384 token ids available
+
+| depth | n_ctx | KV MiB | slots | load | prefill tok/s | **cold tok/s** | **warm tok/s** | hit (all) | staged MiB (all) | p50 ms | first 1/8 | last 1/8 | drift |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 128 | 193 | 12 | 600 | 3.64 | 5.78 | **5.62** | **12.12** | 72.7% | 64950 | 82.5 | 69.8 | 100.4 | +43.8% |
+| 512 | 577 | 26 | 600 | 14.45 | 8.77 | **7.63** | **12.62** | 75.9% | 176521 | 77.3 | 71.6 | 79.6 | +11.2% |
+| 2048 | 2113 | 80 | 600 | 21.05 | 6.48 | **4.74** | **5.69** | 73.8% | 695568 | 145.2 | 128.7 | 152.9 | +18.8% |
+| 8192 | 8257 | 296 | 600 | 19.57 | 2.51 | **1.64** | **2.14** | 72.4% | 2837818 | 405.6 | 445.4 | 795.4 | +78.6% |
+
+| depth | decode.total | attn.attend | attn.qkv | attn.proj | moe.stage | moe.expert_matvec | moe.host_sync | moe.readback |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 82.43 | 0.07 | 0.43 | 0.22 | 29.68 | 0.24 | 6.93 | 37.15 |
+| 512 | 79.10 | 0.08 | 0.44 | 0.22 | 16.98 | 0.25 | 10.05 | 43.56 |
+| 2048 | 175.54 | 0.09 | 0.46 | 0.26 | 58.09 | 0.38 | 12.13 | 88.25 |
+| 8192 | 466.91 | 0.11 | 0.49 | 0.24 | 170.45 | 0.58 | 58.25 | 219.90 |
+
+ms per decode step, warm pass, **decode steps only** -- `profile::reset()` runs at the first mark, so prefill is excluded from every column above.
+
+⚠ `hit (all)` and `staged MiB (all)` cover the WHOLE pass, prompt included: the cache counters can only be zeroed through the session, and `generate_with` holds its lock. At depth 8192 the 8,192 prefill steps outnumber the 63 decode steps 130 to 1, so those two columns describe prefill and must not be read as a decode hit rate. The decode-only staging cost is `moe.stage` in the phase table, which is fenced correctly.
+=== AFTER:  08:18:08 up 3 days,  7:10,  4 users,  load average: 21.11, 21.31, 21.41

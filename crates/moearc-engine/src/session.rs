@@ -39,10 +39,29 @@ use crate::cache::CacheStats;
 use crate::host_experts::HostPolicy;
 use crate::moe::{Config, EngineError, KvGeometry, Model, Residency, ResidencyReport, Tap};
 
+/// Context length a session takes when the caller expressed no opinion.
+///
+/// 🔴 **Not the model's trained maximum, and the difference is a bug waiting to happen.**
+/// gpt-oss-120B declares `context_length = 131072`. Planning a cache for it costs **4.51 GiB**
+/// on an 11.33 GiB card — 4.51 GiB the expert pool does not get — in answer to a caller who
+/// never mentioned context. The load succeeds, so nothing says the pool was gutted; throughput
+/// just comes out wrong, which is the *succeeds and lies* shape this project keeps meeting.
+///
+/// Until sliding-window attention landed, a `n_ctx > 128` refusal in `moe.rs` was accidentally
+/// standing guard over this: an unwanted 131,072 could not be allocated because it could not be
+/// *run*. Removing the refusal removed the guard, and this is the replacement — a default that
+/// is a decision rather than a leftover.
+///
+/// 4,096 because it is a context worth serving and it costs 148.5 MiB on this model, about
+/// twelve expert slots. A caller who wants more says so, and [`SessionOptions::n_ctx`] is
+/// never capped — this bounds the **default**, not the knob.
+pub const DEFAULT_N_CTX: usize = 4096;
+
 /// How to build a session.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionOptions {
-    /// Context length. `None` means the model's trained maximum.
+    /// Context length. `None` means [`DEFAULT_N_CTX`], or the model's trained maximum if that is
+    /// shorter — **not** the trained maximum outright. See [`DEFAULT_N_CTX`] for why.
     pub n_ctx: Option<usize>,
     /// How much of the expert bank stays in VRAM.
     pub residency: Residency,
@@ -145,9 +164,9 @@ pub struct Session {
 impl Session {
     /// Load a GGUF and upload it to the default GPU.
     ///
-    /// The context length defaults to the model's trained maximum. Pass
-    /// [`Session::load_with_context`] to use less, which is the only knob that changes how much
-    /// device memory the KV cache takes.
+    /// The context length defaults to [`DEFAULT_N_CTX`], or the model's trained maximum if that
+    /// is shorter. Pass [`Session::load_with_context`] for anything else — it is the only knob
+    /// that changes how much device memory the KV cache takes, in either direction.
     pub fn load(path: &Path) -> Result<Self, EngineError> {
         Self::load_with(path, SessionOptions::default())
     }
@@ -508,8 +527,9 @@ fn worker(
 
     let n_ctx = match n_ctx {
         Some(n) => n,
+        // Capped, not trusted. See `DEFAULT_N_CTX`.
         None => match Config::from_model(&mapped) {
-            Ok(c) => c.n_ctx_train,
+            Ok(c) => c.n_ctx_train.min(DEFAULT_N_CTX),
             Err(e) => {
                 let _ = tx.send(Reply::Failed(failure_text(&e)));
                 return;

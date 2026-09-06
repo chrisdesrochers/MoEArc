@@ -47,3 +47,11 @@ required-features = ["gpu"]
 [[example]]
 name = "hybrid_sweep"
 required-features = ["gpu"]
+
+[[example]]
+name = "ctx_curve"
+required-features = ["gpu"]
+
+[[example]]
+name = "ctx_attrib"
+required-features = ["gpu"]

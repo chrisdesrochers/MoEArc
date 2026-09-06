@@ -1,0 +1,76 @@
+=== BEFORE:  08:53:34 up 3 days,  7:45,  3 users,  load average: 0.92, 2.02, 4.61
+
+### A. control: the published 17.97 row, re-run verbatim, to connect old doc to new
+prompt [976, 9029, 5030, 328, 10128, 382], 64 tokens, 128 ctx
+
+| slots | host | threads | cold tok/s | cold hit | cold staged MiB | warm tok/s | vs stream | hit | staged MiB | cpu/step | cpu share | busy ms/tok | wait ms/tok | ids |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 600 | `frac:0.5` | 19 | 7.37 | 86.9% | 12254 | 17.90 | — | 91.4% | 8270 | 32.40 | 22.8% | 18.90 | 12.80 | control, ref 64/64 |
+
+`cpu/step` counts experts, not blocks. `busy` is the pool's own wall time per token; `wait` is what the device thread lost to it. Their difference is the overlap.
+
+=== AFTER CONTROL:  08:53:51 up 3 days,  7:45,  4 users,  load average: 5.85, 3.04, 4.89
+
+### B. device-time attribution, decode steps only, by differencing
+residency `600`, host `frac:0.5`, 64 generated tokens per depth
+device time and cache counters, DECODE STEPS ONLY, by differencing
+
+## depth 128 (load 12.51 before the pair, 193 n_ctx)
+
+decode-only cache: **72.8% hit** over 6235 demands, 339.0 MiB staged per step, 45.0 experts/step to the CPU
+
+| kernel | ms/step (decode) | ms/step (prefill) |
+|---|---|---|
+| `mvq_batched MXFP4 r2880 m6` | 8.641 | 8.959 |
+| `mvq Q8_0 r201088 m1` | 5.042 | 5.042 |
+| `mvq Q8_0 r2880 m1` | 4.921 | 4.919 |
+| `mvq Q8_0 r4096 m1` | 4.561 | 4.560 |
+| `mvq_batched MXFP4 r2880 m3` | 4.415 | 4.580 |
+| `mvq_batched MXFP4 r2880 m4` | 3.844 | 3.632 |
+| `mvq_batched MXFP4 r2880 m2` | 1.664 | 1.605 |
+| `mvq_batched MXFP4 r2880 m8` | 1.459 | 1.249 |
+| `mvq Q8_0 r512 m1` | 1.337 | 1.337 |
+| **tracked device busy** | **35.884** | |
+
+⚠️ The prefill column divides by `depth` steps and is there to show a kernel's cost *scaling*, not as a comparison of like with like: a prefill step at depth 128 attends over a cache that is filling, so it averages shallower positions than the decode steps do.
+
+## depth 512 (load 18.99 before the pair, 577 n_ctx)
+
+decode-only cache: **87.1% hit** over 7011 demands, 181.5 MiB staged per step, 32.7 experts/step to the CPU
+
+| kernel | ms/step (decode) | ms/step (prefill) |
+|---|---|---|
+| `mvq_batched MXFP4 r2880 m6` | 10.630 | 8.863 |
+| `mvq_batched MXFP4 r2880 m3` | 5.432 | 4.528 |
+| `mvq Q8_0 r201088 m1` | 5.027 | 5.045 |
+| `mvq Q8_0 r2880 m1` | 4.923 | 4.925 |
+| `mvq Q8_0 r4096 m1` | 4.535 | 4.569 |
+| `mvq_batched MXFP4 r2880 m8` | 3.445 | 1.639 |
+| `mvq_batched MXFP4 r2880 m4` | 2.596 | 3.715 |
+| `mvq Q8_0 r512 m1` | 1.319 | 1.340 |
+| `mvq_batched MXFP4 r2880 m2` | 0.455 | 1.542 |
+| **tracked device busy** | **38.361** | |
+
+⚠️ The prefill column divides by `depth` steps and is there to show a kernel's cost *scaling*, not as a comparison of like with like: a prefill step at depth 512 attends over a cache that is filling, so it averages shallower positions than the decode steps do.
+
+## depth 2048 (load 21.60 before the pair, 2113 n_ctx)
+
+decode-only cache: **68.9% hit** over 6098 demands, 379.2 MiB staged per step, 47.2 experts/step to the CPU
+
+| kernel | ms/step (decode) | ms/step (prefill) |
+|---|---|---|
+| `mvq_batched MXFP4 r2880 m6` | 8.337 | 8.894 |
+| `mvq Q8_0 r201088 m1` | 5.224 | 5.046 |
+| `mvq Q8_0 r2880 m1` | 5.053 | 4.926 |
+| `mvq Q8_0 r4096 m1` | 4.686 | 4.570 |
+| `mvq_batched MXFP4 r2880 m3` | 4.280 | 4.546 |
+| `mvq_batched MXFP4 r2880 m4` | 4.227 | 3.689 |
+| `mvq_batched MXFP4 r2880 m2` | 1.931 | 1.571 |
+| `mvq Q8_0 r512 m1` | 1.361 | 1.341 |
+| `mvq_batched MXFP4 r2880 m8` | 1.249 | 1.496 |
+| **tracked device busy** | **36.348** | |
+
+⚠️ The prefill column divides by `depth` steps and is there to show a kernel's cost *scaling*, not as a comparison of like with like: a prefill step at depth 2048 attends over a cache that is filling, so it averages shallower positions than the decode steps do.
+
+
+=== AFTER:  09:11:42 up 3 days,  8:03,  4 users,  load average: 22.98, 21.77, 16.56

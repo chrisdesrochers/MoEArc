@@ -8,13 +8,37 @@ memory strategy and the host executor are both load-bearing rather than optional
 `n_ff_exp` 2880, 64 query heads over 8 KV heads at `head_dim` 64.
 **Split:** 56.73 GiB of experts (96.1%) against 2.29 GiB of dense weights (3.9%).
 **Slot:** 12.607 MiB — **4.3x** Qwen3-30B-A3B's 2.92 MiB. 4,608 slots is **56.7 GiB**.
-**Date:** 2026-09-05. **llama.cpp** `e107984bcffcfd701e82738092a2b000b6fda7a2`.
+**Date:** 2026-09-05, revised 2026-09-06. **llama.cpp** `e107984bcffcfd701e82738092a2b000b6fda7a2`.
 
 ---
 
-## 1. The incumbent: llama.cpp
+## 0. 🔴 Read this before quoting any number below
+
+Everything in sections 1 to 3 was measured **at one context depth — effectively zero** — and
+with llama.cpp on **its default thread count**. Both of those turn out to decide the result, so
+every figure below now carries its depth and its thread count, and **section 6 is the one to
+quote.** Two corrections, in order of how much they matter:
+
+1. **llama.cpp's 15.47 is llama.cpp on 4 of the machine's 20 cores.** `llama-bench`'s default
+   `n_threads` is **4** — read out of its own `-o csv` output, not inferred — and `-ncmoe 31`
+   puts 31 of 36 blocks' experts on the CPU, so the thread count is not a detail: it is most of
+   the incumbent's throughput. Running the *published test verbatim* at `-t 16`, five
+   repetitions, three separate invocations, gives **28.39 / 28.42 / 28.58 tok/s** — **about 84%
+   above the number in this document.** Nothing was measured wrongly; the tool's default was
+   taken for its best.
+2. **Both engines were measured with an empty KV cache.** Sliding-window attention (`80c6f7d`)
+   removed the `n_ctx > 128` refusal that made a longer context impossible, so the question can
+   now be asked — and the two engines answer it in opposite directions. llama.cpp is **flat in
+   depth**; MoEArc **falls by 5.9x** between depth 512 and depth 8192.
+
+📌 The result of the two together is that **the headline in `README.md` does not survive**, and
+it does not survive at *any* depth, not merely at long ones. Section 6 has the curve.
+
+## 1. The incumbent: llama.cpp — **at depth 0, on default threads**
 
 `llama-bench -m <model> -n 128 -r 2 -ncmoe <N>`, `ONEAPI_DEVICE_SELECTOR=level_zero:0`.
+⚠️ **No `-d`, so the KV cache is empty, and no `-t`, so this is 8 threads of 20.** Section 6
+re-measures both. The table stands as a record of what was run; it is not the number to beat.
 
 | `-ncmoe` | prefill pp512 | decode tg128 |
 | ---: | ---: | ---: |
@@ -27,6 +51,9 @@ memory strategy and the host executor are both load-bearing rather than optional
 | 36 | 110.11 ± 0.69 | 14.69 ± 0.00 |
 
 **llama.cpp cannot run this model with fewer than 31 of its 36 MoE layers on the CPU.**
+⚠️ *Not re-tested at depth.* Section 6 runs `-ncmoe 31` only. A lower value cannot become viable
+at longer context — the KV cache grows and takes device memory from the same pool — so the floor
+can only rise, but that is an argument, not a measurement.
 Only five blocks' experts fit beside the dense weights and the KV cache. As on Qwen3-30B-A3B,
 throughput falls monotonically as more work moves host-side, so 31 is the minimum it must offload
 rather than a tuning choice.
@@ -36,12 +63,20 @@ rather than a tuning choice.
 changed; the box did. **The number to beat is therefore taken as the *higher* of the two
 measurements, 15.47** — the conservative choice, since it is the one MoEArc has to clear.
 
+🔴 **Superseded 2026-09-06.** 15.47 is not the number to beat; it is llama.cpp at `tg128 @ d0`
+on 8 threads. The same build reaches **24.85 tok/s at `-t 16`, and holds ~28 tok/s out to depth
+8192.** See section 6.
+
 ---
 
-## 2. MoEArc
+## 2. MoEArc — **at depth 6**
 
 `examples/hybrid_sweep`, prompt `[976, 9029, 5030, 328, 10128, 382]`
 (`The capital city of France is`), 64 generated tokens, `n_ctx = 128`.
+🔴 **The prompt is six tokens long, so every row below is throughput at a context depth of
+six**, generating into a cache that never exceeds 70 entries. That was not a choice at the time
+— `moe.rs` refused anything past the 128-token window — but it is the single most important
+qualifier on the table, and section 6 measures what happens without it.
 `tok/s` is `(6 prompt + 64 generated) / seconds` — this engine has no batched prefill, so a
 prompt token goes through the same decode path and a step is a step.
 
@@ -70,7 +105,10 @@ prompt token goes through the same decode path and a step is a step.
 | 600 | `frac:0.75` | 14.26 | 88.0% | 5181 | 14.92 | +98.9% | 100.0% | 0 | 85.81 | 43.39 | 44.79 |
 | 600 | `frac:1.0` | 9.70 | 0.0% | 0 | 11.15 | +48.6% | 0.0% | 0 | 141.94 | 67.17 | 68.17 |
 
-**Best: 600 slots at `frac:0.5` — 17.97 tok/s warm, 16.03 cold, against llama.cpp's 15.47.**
+**Best: 600 slots at `frac:0.5` — 17.97 tok/s warm, 16.03 cold, at depth 6.**
+✅ **Reproduced 2026-09-06 at 17.90 warm** (cold 7.37 — the pool was cold *and* the model file
+was not in the page cache, which the original sweep's earlier rows had already warmed). The
+engine measurement stands; what does not stand is the comparison it was put against.
 600 slots is 7.39 GiB of pool beside 2.29 GiB of dense weights: **13.0% of the expert bank
 resident, and the whole model runs.**
 
@@ -160,17 +198,21 @@ and is wrong if omitted** — the model stays fluent. All six are implemented an
   scale 1.3466. 🔴 llama.cpp's `rope_yarn` has **no position gate**: this applies from token 0,
   and there is no short-sequence regime in which plain RoPE is equivalent.
 
-🔴 **Sliding-window attention is declared and NOT implemented.** The file states
-`attention.sliding_window = 128`, which llama.cpp applies to **alternating** blocks
-(`set_swa_pattern(2)`: even blocks windowed, odd blocks full causal). `moe.rs` **refuses a
-context longer than the window by name** rather than attending to keys llama.cpp masks. Below
-128 tokens the two masks are identical — `is_masked_swa` masks when `p1 - p0 >= n_swa`, which no
-pair of positions inside one window satisfies — so everything above is exact, not approximate.
-Implementing it means two masks and two KV caches, not one shorter cache.
+- ✅ **Sliding-window attention — implemented in `80c6f7d`**, and the `n_ctx > 128` refusal
+  is gone with it. The file states `attention.sliding_window = 128`, which llama.cpp applies to
+  **alternating** blocks (`set_swa_pattern(2)`: even blocks windowed, odd blocks full causal).
+  `attn_decode_ext` now takes a `kv_begin`, so the span is `[kv_begin, n_kv)` — the same
+  arithmetic as an additive mask, one reduction cheaper. Windowed blocks get a short ring of
+  `ceil(n_swa/32)` pages instead of `ceil(n_ctx/32)`.
+
+  🔴 **The memory consequence is the good news in this document.** The KV cache is *not* what
+  makes long context expensive here: measured at load, it is **12 MiB at depth 128, 26 MiB at
+  512, 80 MiB at 2048 and 296 MiB at 8192**, against an expert pool of 7.39 GiB. Context costs
+  almost nothing in VRAM on this model. Everything section 6 measures happens anyway.
 
 ---
 
-## 5. Reproducing
+## 5. Reproducing sections 1 and 2 (depth 0 and depth 6)
 
 ```text
 # llama.cpp
@@ -185,4 +227,218 @@ cargo run --release -p moearc-engine --features gpu --example hybrid_sweep -- \
     bench/references/gpt-oss-120b.capital.ids 976 9029 5030 328 10128 382
 ```
 
-⚠️ **Run it on an idle machine and check `uptime` first** — see 3.4.
+⚠️ **Run it on an idle machine and check `uptime` first** — see 3.4. And note what these
+two commands do *not* pass: no `-d` and no `-t` on the llama.cpp side, and a six-token prompt
+on MoEArc's. **For the comparison that matters, use the protocol in 6.1.**
+
+---
+
+## 6. Depth: the comparison at a context anyone would actually use
+
+**Date:** 2026-09-06. This section supersedes sections 1 and 2 as the head-to-head result.
+
+### 6.1 Protocol — identical question to both engines
+
+The thing being measured is **decode throughput with `depth` tokens already in the KV cache**.
+Prefill is excluded from the timer on both sides; only the generated tokens are timed. Generated
+tokens are held at **64 for every depth**, so the amount of router churn that generation itself
+causes is constant and depth is the only thing varying.
+
+```text
+# llama.cpp -- llama-bench starts its timer AFTER the -d prefill, so tg is decode-only at depth
+ONEAPI_DEVICE_SELECTOR=level_zero:0 llama-bench \
+    -m /zfs/swift/models/gpt-oss-120b-MXFP4.gguf \
+    -ncmoe 31 -p 0 -n 64 -t 16 -d 0,128,512,2048,8192 -r 3
+
+# MoEArc -- 64 generated tokens after a `depth`-token real prompt, decode steps only
+MOEARC_PROFILE=1 MOEARC_TEST_GPU=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
+cargo run --release -p moearc-engine --features gpu --example ctx_curve -- \
+    /zfs/swift/models/gpt-oss-120b-MXFP4.gguf 128,512,2048,8192 64 600 frac:0.5 \
+    bench/references/gpt-oss-120b.longctx.ids
+```
+
+Three details are load-bearing:
+
+- **MoEArc's `ctx_curve` times only the decode steps.** `generate` runs prompt tokens through the
+  same path as generated ones, so a stopwatch over the whole call would divide by
+  `depth + n` steps and report mostly prefill. The sampling closure is called once per generated
+  token; its first call lands the instant prefill finished, and the marks it records fence the
+  decode phase exactly.
+- **The prompt is real text, not a repeated phrase** — `bench/references/gpt-oss-120b.longctx.ids`
+  is 16,384 ids made by tokenising this repository's own documentation, so the file is
+  reproducible from the repo. A tiled prompt would revisit the same experts and flatter the hit
+  rate. ⚠️ llama-bench's `-d` prefill uses **random** tokens; that is irrelevant to it, because
+  `-ncmoe` pins experts to the CPU by layer and its per-token cost does not depend on routing.
+  It does mean MoEArc is being asked the harder and more realistic question of the two.
+- **Threads.** MoEArc's host pool reports **19 threads**; llama.cpp is given **16**, its best of
+  `4,8,12,16,20`. The original baseline let llama.cpp take its default, which is **8**.
+
+### 6.2 llama.cpp: threads first, because the default was leaving 16 cores idle
+
+**`llama-bench`'s default `n_threads` on this box is 4.** That is read out of the tool's own
+`-o csv` output (field `n_threads`), not inferred from a timing. Section 1's command line passes
+no `-t`, so section 1 is a four-core measurement.
+
+Running **section 1's exact test** — `-ncmoe 31 -n 128` — at `-r 5`, in **three separate
+invocations**, because one measurement of this configuration is not enough (see 6.2.1):
+
+| threads | run 1 | run 2 | run 3 |
+| ---: | ---: | ---: | ---: |
+| **4** *(the default; what section 1 ran)* | 13.58 ± 0.55 | 12.73 ± 0.69 | 14.66 ± 0.21 |
+| 8 | 21.07 ± 0.71 | 20.46 ± 0.62 | 22.33 ± 0.28 |
+| **16** | **28.39 ± 0.31** | **28.42 ± 0.28** | **28.58 ± 0.25** |
+
+🔴 **The number to beat was never 15.47. It is about 28.5**, and at `-t 16` it is the most stable
+figure in this document — three invocations inside 0.2 tok/s of each other. With 31 of 36 blocks'
+experts on the CPU, four threads leaves sixteen cores idle; the incumbent was being judged on a
+quarter of the machine while MoEArc's host pool used **19 threads**. *(The published 15.47 sits
+just above this session's `-t 4` range of 12.73–14.66 — close enough to confirm section 1 ran at
+the default, not close enough to call an exact reproduction.)*
+
+#### 6.2.1 ⚠️ Why three invocations, and one run that must not be quoted
+
+**The model is 59.03 GiB, on ZFS, with `arc c_max` set to 16 GiB on a 91 GiB box.** It cannot be
+fully cached, and `-ncmoe 31` reads 31 of 36 blocks' experts host-side *every token*. Throughput
+therefore depends on what happens to be resident, and that is not constant between processes.
+
+A single `-r 2` sweep run earlier in this session gave **17.59 ± 5.56** at `-t 16` and
+**13.67 ± 2.86** at `-t 8` — far below the table above, with error bars 20 times as wide. It was
+not discarded for being inconvenient; it is reported here because **its own error bars say it is
+not a measurement**, and because the `-r 5` triplicate that replaced it agrees with itself to
+0.2 tok/s. This is the same failure mode section 3.4 records, arriving by a third route: not a
+busy box and not an unfair thread count, but **a model that does not fit in RAM.**
+
+📌 It applies to *both* engines. MoEArc reads the same 59 GiB file for its staging and its host
+experts, so its absolute numbers carry the same dependence. What survives it is the **shape**:
+llama.cpp's flatness in depth and MoEArc's 5.9x fall are both far larger than this variance, and
+MoEArc's fall is corroborated by the staging counters in 6.4, which are not timings at all.
+
+📌 **This is a measurement-hygiene failure of the same family as section 3.4, not a new one.**
+There it was *the box was busy*; here it is *the baseline was given a quarter of the machine and
+the challenger nearly all of it*. Both produce a number that is real, reproducible, and answers
+the wrong question.
+
+### 6.3 The curve
+
+llama.cpp, `-ncmoe 31`, `-r 3`, decode-only at each depth. MoEArc, 600 slots at `frac:0.5`,
+64 generated tokens, decode-only, cold and warm reported separately.
+
+| depth | llama.cpp `-t 16` | llama.cpp `-t 8` | **MoEArc warm** | MoEArc cold | MoEArc KV | MoEArc vs best llama.cpp |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 / 6 | 28.39–28.58 † | 20.46–22.33 † | **17.90** *(depth 6)* | 7.37 | 12 MiB | **0.63x** |
+| 128 | 23.25 ± 1.19 | 16.32 ± 1.03 | **12.12** | 5.62 | 12 MiB | **0.52x** |
+| 512 | 26.65 ± 0.33 | 20.78 ± 0.55 | **12.62** | 7.63 | 26 MiB | **0.47x** |
+| 2048 | 28.24 ± 0.56 | 22.00 ± 0.38 | **5.69** | 4.74 | 80 MiB | **0.20x** |
+| 8192 | 28.15 ± 0.27 | 22.25 ± 0.15 | **2.14** | 1.64 | 296 MiB | **0.076x** |
+
+† **The depth-0 row is the `tg128` triplicate from section 6.2, not `tg64 @ d0` from this
+sweep.** The `tg64 @ d0` cells of the depth sweep are warm-up contaminated (12.99 ± 2.64 at
+`-t 16`, 6.73 ± 3.14 at `-t 8` — error bars 5 to 20 times every other row's), because
+llama-bench's *first* test in a process pays the warm-up and 64 generated tokens amortise it far
+less than 128 do. The range quoted is three invocations at `-r 5`, and it is section 1's own
+test. ⚠️ It is still the least like-for-like row here: MoEArc's 17.90 is a **warm second pass at
+depth 6**, so if anything this row flatters MoEArc. **Depth 128 onwards is the clean
+comparison.**
+
+**Answer to the question this was run to settle: the comparison does not hold, does not merely
+narrow, and does not merely become context-dependent. It inverts, at every depth measured.**
+
+- **llama.cpp is flat in depth.** 23.25 → 28.15 from depth 128 to 8192 at `-t 16`; it gets
+  *faster* with depth and then levels off. Nothing about 8192 tokens troubles it on this card.
+- **MoEArc falls 5.9x** over the same span, 12.62 → 2.14.
+- The gap goes from **1.9x against us at depth 128 to 13.2x against us at depth 8192.**
+
+### 6.4 Attributing the fall: staging, not attention
+
+Two explanations fit a falling curve, and they call for opposite fixes: attention over more keys
+costs more, or a deeper prompt leaves the resident pool holding a more diluted working set so the
+decode steps that follow miss more. **They are separable here, and the answer is staging.**
+
+**First, what does not explain it.** Device time in the tracked matvec kernels is *flat*, measured
+by `examples/ctx_attrib`, which differences the SYCL event counters between a prefill-only pass
+and a full pass so the result is decode steps and nothing else:
+
+| depth | tracked device busy (ms/step) | decode-only hit rate | staged MiB/step | experts/step to CPU |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 35.884 | 72.8% | 339.0 | 45.0 |
+| 512 | 38.361 | 87.1% | 181.5 | 32.7 |
+| 2048 | 36.348 | 68.9% | 379.2 | 47.2 |
+
+The counters are internally consistent, which is the check that they mean what they say: the
+router names 36 blocks x 4 = **144 experts per step**, and at depth 128 that is 45.0 sent to the
+CPU plus 99 cache demands; 27.0 of those miss at a 72.8% hit rate, and 27.0 x 12.607 MiB =
+**340 MiB**, against 339.0 measured.
+
+🔴 **But the tracked device counters cannot see attention at all** — `moearc_track` is called
+only from the matvec paths, so `attn_decode` contributes to no row above. And the ordinary
+`profile` phases are *host* wall time around a submit on an asynchronous queue, which charges
+attention's device cost to whichever phase later drains the queue. Neither instrument, alone,
+can answer the question.
+
+**So it was measured with `MOEARC_SYNC_EACH=1`,** which waits after every launch and therefore
+makes each phase's host time equal its device time. Decode steps only, warm pass:
+
+| depth | `decode.total` | `attn.attend` | `attn.qkv` | **`moe.stage`** | `moe.host_sync` |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 264.70 | 15.21 | 10.42 | 123.36 | 59.46 |
+| 2048 | 795.11 | 49.51 | 22.15 | **547.56** | 87.66 |
+| **growth** | **+530.41** | **+34.30** | +11.73 | **+424.20** | +28.20 |
+
+**Of the 530 ms a decode step gains between depth 512 and depth 2048, `moe.stage` is 424 ms —
+80%. `attn.attend` is 34 ms — 6.5%.** Attention is a real cost and it is growing, but it is not
+what is happening to this engine at depth.
+
+⚠️ **Three limits on that conclusion, stated rather than buried.**
+
+- `MOEARC_SYNC_EACH=1` destroys overlap, so **every absolute number in that table is inflated**
+  and its throughput columns are meaningless (the run reported a warm pass *slower* than its cold
+  one). The **ratio of growth** is the finding, not the milliseconds.
+- Under sync-each, `attn.attend` is 36 launches per step, so its 15.21 ms at depth 512 is mostly
+  **launch latency, not work** — which is why the growth term, not the total, is the number
+  quoted against `moe.stage`.
+- The two depths are 512 and 2048. Depth 8192 was not run under sync-each: three prefills at
+  ~2 tok/s is over two hours, and the 512→2048 pair already separates the causes.
+
+**A cross-check from the ordinary asynchronous profile agrees.** There, `attn.attend` never
+exceeds **0.11 ms/step** at any depth (0.07 / 0.08 / 0.09 / 0.11 at 128 / 512 / 2048 / 8192) —
+submit cost only — while `moe.stage` goes 29.68 → 16.98 → 58.09 → **170.45** and `moe.readback`,
+the phase that drains the queue, goes 37.15 → 43.56 → 88.25 → **219.90**. The growth lives in
+staging and in the drain that follows it.
+
+### 6.5 Two smaller findings worth keeping
+
+- **The pool degrades *within* a single run at constant depth.** Comparing the first eighth of a
+  warm run's decode steps against the last eighth: **+43.8%** at depth 128, +11.2% at 512,
+  +18.8% at 2048 and **+78.6%** at 8192. Depth moves by at most 64 positions across those steps,
+  so attention is very nearly constant over the comparison — this is the working set losing to
+  the pool, measured directly.
+- **Cold and warm converge as depth grows**, from 2.2x apart at depth 128 (5.62 → 12.12) to
+  1.3x at 8192 (1.64 → 2.14). Where the pool cannot hold a useful fraction of what a deep prompt
+  touched, the second pass is nearly as cold as the first — which is the same finding from the
+  other side.
+
+### 6.6 Raw output
+
+Every table in this section is derived from these, which are the unedited stdout of the runs:
+
+| file | what |
+| --- | --- |
+| `bench/results/2026-09-06-moearc-depth-curve.txt` | MoEArc 128/512/2048/8192, the 6.3 curve |
+| `bench/results/2026-09-06-llamacpp-threads-tg128.txt` | the 6.2 triplicate, `-r 5` x 3 |
+| `bench/results/2026-09-06-llamacpp-depth.txt` | llama.cpp at depth, `-t 16` and `-t 8` |
+| `bench/results/2026-09-06-llamacpp-threads-tg64.txt` | ⚠️ the warm-up-contaminated `-n 64` sweep, kept because 6.2.1 cites it |
+| `bench/results/2026-09-06-moearc-control-and-attribution.txt` | the 17.90 control, and 6.4's differenced device counters |
+| `bench/results/2026-09-06-moearc-sync-each.txt` | 6.4's `MOEARC_SYNC_EACH=1` phase table |
+
+### 6.7 Measurement hygiene for this section
+
+Load average was read before every timed run and printed with it. The 1-minute average was
+**0.60 to 1.29 before each llama.cpp sweep** and **1.11 to 3.64 before the MoEArc sweeps**; the
+box's idle baseline is ~1.2 with its ordinary daemons (an Incus VM, Forgejo, AdGuard, OpenBao).
+No other agent was working on the machine, and the two engines were never run concurrently.
+
+⚠️ **The `load` column inside `ctx_curve`'s own table reads high (14–21) at the later depths, and
+that is the sweep measuring itself**: `frac:0.5` drives the host pool across 19 threads, so the
+1-minute average carries the *previous* depth's own work. It is reported because a row that
+cannot say what else was running is not evidence — but the number that shows the box was quiet
+is the pre-run one, not the mid-sweep one.

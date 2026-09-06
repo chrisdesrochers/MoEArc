@@ -2640,6 +2640,49 @@ mod tests {
     }
 
     #[test]
+    fn the_default_context_is_a_decision_and_not_the_trained_maximum() {
+        // 🔴 The regression gate on `session::DEFAULT_N_CTX`. gpt-oss declares a trained context
+        // of 131,072, and a `Session` built with `n_ctx: None` used to take it literally --
+        // planning a KV cache of 4.5 GiB on an 11.33 GiB card for a caller who never mentioned
+        // context, and taking those bytes straight out of the expert pool. It did not fail; it
+        // succeeded and ran slower, which is the harder bug to find.
+        //
+        // Until sliding-window attention landed, the `n_ctx > 128` refusal stood accidental
+        // guard over this: an unwanted 131,072 could not be allocated because it could not be
+        // run. Removing the refusal removed the guard. This asserts the replacement.
+        let cfg = swa_config(36, Some(128), 2);
+        let per_page = (PAGE_TOKENS * cfg.n_embd_kv() * KV.elem_bytes() * 2) as u64;
+
+        let trained = KvGeometry::plan(&cfg, cfg.n_ctx_train);
+        let default = KvGeometry::plan(&cfg, crate::session::DEFAULT_N_CTX);
+
+        // 18 full-attention blocks at the full page count, 18 windowed at four pages each.
+        assert_eq!(trained.bytes, per_page * (18 * 4096 + 18 * 4));
+        assert_eq!(default.bytes, per_page * (18 * 128 + 18 * 4));
+
+        // The gap is the point: taking the trained maximum by default costs **31x** the cache.
+        assert!(
+            trained.bytes > 30 * default.bytes,
+            "if these converge the default has stopped doing anything: {} vs {}",
+            trained.bytes,
+            default.bytes
+        );
+
+        // One expert slot on this model is 12.607 MiB. The default has to be worth paying by
+        // default, which means costing a few slots rather than hundreds.
+        let slot_bytes = 12_607 * 1024;
+        assert!(
+            default.bytes < 16 * slot_bytes,
+            "the default context costs {} expert slots",
+            default.bytes / slot_bytes
+        );
+        assert!(
+            trained.bytes > 300 * slot_bytes,
+            "the trained maximum should cost hundreds of slots, which is why it is not the default"
+        );
+    }
+
+    #[test]
     fn a_model_with_no_window_allocates_exactly_what_it_used_to() {
         // The regression gate for OLMoE and Qwen3: no window means no second table, no short
         // pools, and byte-for-byte the cache these models had before SWA existed.

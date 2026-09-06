@@ -4,18 +4,39 @@
 One command to install, one command to run, OpenAI- and Anthropic-compatible
 out of the box.
 
-> **Status: it beats llama.cpp on a 59 GiB model, on a 12 GB card.**
+> **Status: the residency mechanism works. Every comparison against llama.cpp in this
+> repo is WITHDRAWN pending re-measurement.**
 >
-> ✅ **gpt-oss-120B — 59.0 GiB of weights — runs on an 11.33 GiB Arc B580 at 17.2 tok/s**,
-> with **13% of the expert bank resident** and greedy output matching llama.cpp for all
-> 64 tokens. Independently re-verified.
+> 🔴 **We benchmarked llama.cpp on a quarter of the machine.** `llama-bench` defaults to
+> **4 threads** on this box (read from its own `-o csv`, field `n_threads`, on a 20-core
+> CPU), and **no `llama-bench` invocation recorded anywhere in this repo passes `-t`.**
+> With `-ncmoe 31` putting 31 of 36 blocks' experts on the CPU, llama.cpp ran on 4 threads
+> while MoEArc's host pool used 19. **Every llama.cpp figure previously published here —
+> including "15.47" for gpt-oss-120B and "50.13" for Qwen3-30B — was produced that way and
+> should not be quoted, including by us.**
 >
-> ✅ **llama.cpp does 15.47 tok/s on the same model and card — and cannot run it at all
-> below `--n-cpu-moe 31`.** Below that it crashes with `OUT_OF_DEVICE_MEMORY`. Only 5 of
-> its 36 blocks fit in VRAM.
+> 🔴 **The corrected figure is not yet settled, so none is claimed.** Two attempts at
+> `-t 16` on gpt-oss-120B disagree by 2×: **28.5 ± 0.2** (`-r 5`, three invocations) and
+> **14.7 ± 4.7** (`-r 3`). The second is disqualified by its own error bars, but it was not
+> a busy box — the 59 GiB model exceeds ZFS `arc c_max` (16 GiB), so it streams off
+> encrypted disk on every run and the load is I/O wait. A clean protocol is outstanding.
+> **What is certain is that the old comparison was structurally unfair; what is not
+> certain is by how much.**
 >
-> ✅ **On Qwen3-30B, dynamic residency beats a static split 45.08 vs 13.44 tok/s at matched
-> capacity**, with 24× less data crossing the bus and identical output.
+> ✅ **What survives, because it does not involve llama.cpp's throughput at all:**
+> gpt-oss-120B — **59.0 GiB of weights — runs on an 11.33 GiB Arc B580** out of a
+> **7.4 GiB expert pool**, with 13% of the bank resident and greedy output matching
+> llama.cpp **token for token**. Correctness comparisons are unaffected by threading.
+>
+> ✅ **Dynamic residency beats a static split 45.08 vs 13.44 tok/s at matched capacity**
+> on Qwen3-30B, with **24× less data staged** and identical output. This is a
+> MoEArc-vs-MoEArc comparison and the error above does not touch it.
+>
+> 🔴 **Throughput falls 5.9× with prompt depth** — 17.9 tok/s at 128 tokens of context,
+> 12.6 at 2k, **2.1 at 8k** — and the cause is **expert staging, not attention** (80% vs
+> 6.5% of the growth, measured under `MOEARC_SYNC_EACH=1`). Sliding-window attention made
+> KV nearly free (296 MiB at 8k depth against that 7.4 GiB pool), so **context is not a
+> memory problem here; staging is a throughput problem.** That is the next thing to fix.
 >
 > 🔴 **Not yet:** no batched prefill, so there is no counterpart to llama.cpp's prefill
 > throughput. Matvecs run at 25–29% of the card's peak bandwidth against llama.cpp's 63%.
