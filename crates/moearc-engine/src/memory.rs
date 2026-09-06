@@ -226,8 +226,9 @@ impl fmt::Display for Reason {
             }
             Self::ExpertsYieldedToContext { resident, would_have_been } => write!(
                 f,
-                "gave up {} expert slots to reach the requested context ({resident} resident)",
-                would_have_been - resident
+                "gave up {} expert slots to reach the requested context ({} resident)",
+                count(would_have_been - resident),
+                count(*resident)
             ),
             Self::ContextAtPolicyFloor { tokens } => write!(
                 f,
@@ -238,6 +239,21 @@ impl fmt::Display for Reason {
             Self::Slack { bytes } => write!(f, "{} unallocated after rounding", gib(*bytes)),
         }
     }
+}
+
+/// Thousands-separated counts: `2,040`. Deliberately the same spelling as `moearc-cli`'s
+/// `format::count`, because this sentence is rendered directly beside the table it explains and
+/// one number written two ways there reads as a rendering bug.
+fn count(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn gib(bytes: u64) -> String {
@@ -289,7 +305,13 @@ pub enum PlanError {
     InvalidModel(&'static str),
     /// `page_tokens` was zero.
     InvalidPolicy(&'static str),
-    /// The dense weights alone do not fit.
+    /// The dense weights alone do not fit in the VRAM that is free at this moment.
+    ///
+    /// 🔴 **Not a statement about the model's size**, and the wording of its `Display` is
+    /// load-bearing for that reason: this engine runs a 59.0 GiB model on an 11.33 GiB card,
+    /// because the expert bank pages. What has to fit outright is the always-resident half,
+    /// against whatever the card happens to have free — it has fired at 1.3 GiB free while
+    /// another process held the device, on a model that runs fine when it does not.
     WeightsDoNotFit { need: u64, have: u64 },
     /// Weights fit, but not with the minimum viable expert residency.
     CannotHoldActiveExperts { need: u64, have: u64, active_experts: u32 },
@@ -306,15 +328,18 @@ impl fmt::Display for PlanError {
             Self::InvalidPolicy(m) => write!(f, "invalid policy: {m}"),
             Self::WeightsDoNotFit { need, have } => write!(
                 f,
-                "the model's dense weights need {} but only {} is usable — this model is too \
-                 large for this device",
+                "the model's dense weights need {} and only {} is usable after headroom right \
+                 now — free VRAM on this device and retry. That is a shortage at this moment, \
+                 not a verdict on the model: the expert bank pages, so models far larger than \
+                 this card do run here",
                 gib(*need),
                 gib(*have)
             ),
             Self::CannotHoldActiveExperts { need, have, active_experts } => write!(
                 f,
-                "cannot hold the {active_experts} experts active per token: needs {} but only \
-                 {} is usable — a smaller quantisation would fit",
+                "cannot hold the {active_experts} experts one token activates: needs {} and \
+                 only {} is usable right now — free VRAM on this device, or load a smaller \
+                 quantisation of the same model",
                 gib(*need),
                 gib(*have)
             ),
@@ -324,8 +349,8 @@ impl fmt::Display for PlanError {
             ),
             Self::ContextDoesNotFit { requested, achievable } => write!(
                 f,
-                "{requested} tokens of context does not fit; {achievable} is the most this \
-                 device can serve for this model"
+                "{requested} tokens of context does not fit beside this model's experts in the \
+                 VRAM free right now; {achievable} is the most this run can serve"
             ),
         }
     }
@@ -630,11 +655,49 @@ mod tests {
     }
 
     #[test]
-    fn a_model_too_large_for_the_card_says_so_plainly() {
+    fn a_card_short_of_room_names_the_shortage_and_never_calls_the_model_too_large() {
+        // 🔴 The claim this project exists to disprove must not appear in this project's own
+        // error text. A 59.0 GiB model runs on an 11.33 GiB card here; what this error reports
+        // is transient free VRAM, and it was seen live at 1.3 GiB free while GPU tests held
+        // the device. "This model is too large for this device" was both off-message and, as a
+        // description of the condition, wrong.
         let m = ModelFootprint { dense_weights_bytes: 40 * GIB, ..model() };
         let e = plan(card(12 * GIB), &m, &Policy::default(), Context::Largest).unwrap_err();
         assert!(matches!(e, PlanError::WeightsDoNotFit { .. }));
-        assert!(e.to_string().contains("too large for this device"));
+        let s = e.to_string();
+        assert!(!s.contains("too large"), "{s}");
+        assert!(s.contains("dense weights need"), "it names what is short: {s}");
+        assert!(s.contains("right now"), "and that the shortage is a moment: {s}");
+        assert!(s.contains("free VRAM"), "and what to do about it: {s}");
+    }
+
+    #[test]
+    fn no_planner_error_tells_a_user_their_model_is_too_big() {
+        // The whole surface, not one variant: every refusal here is about this device at this
+        // moment, and none of them is a verdict on the model.
+        let p = Policy::default();
+        let big = ModelFootprint { dense_weights_bytes: 40 * GIB, ..model() };
+        let fat = ModelFootprint { per_expert_bytes: GIB, ..model() };
+        let errs = [
+            plan(card(12 * GIB), &big, &p, Context::Largest),
+            plan(card(6 * GIB), &fat, &p, Context::Largest),
+            plan(card(8 * GIB), &model(), &p, Context::Tokens(4_000_000)),
+        ];
+        for e in errs {
+            let s = e.unwrap_err().to_string();
+            for banned in ["too large", "too big", "will not fit", "won't fit"] {
+                assert!(!s.contains(banned), "`{banned}` in: {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_yield_line_separates_its_thousands_like_every_other_count_on_screen() {
+        let s =
+            Reason::ExpertsYieldedToContext { resident: 1_068, would_have_been: 3_108 }.to_string();
+        assert!(s.contains("2,040"), "{s}");
+        assert!(s.contains("1,068"), "{s}");
+        assert!(!s.contains("2040"), "{s}");
     }
 
     #[test]

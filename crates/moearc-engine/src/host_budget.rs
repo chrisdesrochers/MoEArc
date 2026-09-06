@@ -465,6 +465,116 @@ pub fn host_residency(
     }
 }
 
+/// Measure this machine's memory, from `/proc/meminfo`.
+///
+/// `None` when the file is unreadable or does not carry both figures — a machine that cannot
+/// be measured gets no budget rather than an invented one. 🔴 There is deliberately **no
+/// fallback constant**: a guessed `MemAvailable` is indistinguishable in the output from a
+/// measured one, and every number this module prints is meant to be one the user can check.
+///
+/// `MemAvailable` rather than `total - used`, for the reason [`HostMemory`] gives: page cache
+/// counts as used and is reclaimable, so the subtraction understates the budget by however
+/// much of the model is already cached, which is exactly backwards.
+pub fn read_host_memory() -> Option<HostMemory> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    // `/proc/meminfo` labels its figures `kB` and reports kibibytes. Following the label
+    // instead of the format would understate every machine by 2.4%.
+    let field = |name: &str| {
+        text.lines().find_map(|l| {
+            let v = l.strip_prefix(name)?.trim().strip_suffix(" kB")?;
+            v.trim().parse::<u64>().ok().map(|kib| kib * 1024)
+        })
+    };
+    Some(HostMemory { total_bytes: field("MemTotal:")?, available_bytes: field("MemAvailable:")? })
+}
+
+// =======================================================================================
+// Where the budget meets the routing policy
+// =======================================================================================
+
+/// Whether the host RAM budget can back the experts a host policy routes to the CPU.
+///
+/// 🔴 **Two knobs that look independent and are not.** `host_experts::HostPolicy` places
+/// *compute* — which of a block's misses the CPU computes instead of the card. [`HostBudget`]
+/// places *data* — how much of the expert bank host RAM holds. The host executor reads expert
+/// weights **straight out of the mapping**, so an expert routed to the CPU whose pages the
+/// budget does not cover is a **drive read on the critical path**: strictly worse than the
+/// PCIe copy the routing was meant to avoid. `frac:1.0` against a zero budget is the worst
+/// combination this engine can be put in, and until this type existed nothing in the code
+/// could tell it from two reasonable settings.
+///
+/// ⬜ **Reported, not enforced — on purpose.** The fix on file is that the budget should
+/// *bound* the routing fraction, because routing an expert host-side only pays when its
+/// weights are already in RAM. That changes which experts run where, which is a change to a
+/// measured behaviour, so it is a separate decision from making the hazard visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRouting {
+    /// Host memory could not be measured, so nothing can be said. See [`read_host_memory`].
+    Unknown,
+    /// Nothing is routed host-side, so routing cannot outrun the budget.
+    NotRouting,
+    /// Every slot the card does not hold is inside the budget: every host-executed expert
+    /// reads from RAM.
+    FullyBacked,
+    /// `cold_slots` of the `of` slots the card does not hold are outside the budget, so an
+    /// expert routed to the CPU may be read from the drive.
+    ///
+    /// 🔴 *May*, not *is*. The budget is a whole-model quantity — [`host_residency`] says how
+    /// many slots fit, never which — so this names a hazard for the run and never a verdict on
+    /// one expert.
+    PartlyUnbacked { cold_slots: u32, of: u32 },
+}
+
+impl HostRouting {
+    /// Whether this combination can put a drive read on the critical path.
+    pub fn is_hazardous(self) -> bool {
+        matches!(self, Self::PartlyUnbacked { .. })
+    }
+
+    /// The words, fixed here so a report and an interface cannot spell the same state twice.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "host memory not measured",
+            Self::NotRouting => "nothing routed host-side",
+            Self::FullyBacked => "host routing backed by RAM",
+            Self::PartlyUnbacked { .. } => "host routing exceeds the RAM budget",
+        }
+    }
+}
+
+impl fmt::Display for HostRouting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PartlyUnbacked { cold_slots, of } => write!(
+                f,
+                "{} of {of} non-resident expert slots are outside the host RAM budget, so an \
+                 expert routed to the CPU may be read from the drive rather than from RAM",
+                cold_slots
+            ),
+            other => f.write_str(other.label()),
+        }
+    }
+}
+
+/// Judge one run's host routing against one run's budget.
+///
+/// `routes_host_side` rather than a `HostPolicy` because this module is device-independent and
+/// `host_experts` sits behind the `gpu` feature; `HostPolicy::backing` is the wrapper on the
+/// other side of that seam.
+///
+/// The discriminator is `cold_slots` rather than [`HostResidency::covers_all_misses`]: a
+/// degenerate footprint returns `covers_all_misses: false` with nothing actually cold, and
+/// reporting a hazard where no slot can miss would be a false alarm.
+pub fn routing_backing(routes_host_side: bool, residency: HostResidency) -> HostRouting {
+    match (routes_host_side, residency.cold_slots) {
+        (false, _) => HostRouting::NotRouting,
+        (true, 0) => HostRouting::FullyBacked,
+        (true, cold) => {
+            HostRouting::PartlyUnbacked { cold_slots: cold, of: residency.slots + cold }
+        }
+    }
+}
+
 /// Binary sizes, matching [`crate::memory`]'s so the two planners read as one output.
 fn size(bytes: u64) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
@@ -696,5 +806,89 @@ mod tests {
         // A reserve larger than the machine leaves nothing, rather than underflowing.
         let greedy = BudgetPolicy { reserve: Reserve::Bytes(1024 * GIB) };
         assert_eq!(HostBudget::ceiling(machine(), &greedy), 0);
+    }
+
+    // ---- the machine, measured ---------------------------------------------------------
+
+    #[test]
+    fn host_memory_is_read_from_the_kernel_and_is_never_invented() {
+        // On Linux this must produce a plausible machine; anywhere else it must produce
+        // nothing rather than a constant. Either way there is no third answer.
+        match read_host_memory() {
+            Some(m) => {
+                assert!(m.total_bytes > 0, "a machine with no memory is not running this test");
+                assert!(m.available_bytes <= m.total_bytes, "available cannot exceed fitted");
+                // kibibytes, not kilobytes: a machine reporting whole GiB should land on one.
+                assert_eq!(m.total_bytes % 1024, 0);
+            }
+            None => assert!(
+                !std::path::Path::new("/proc/meminfo").exists(),
+                "a machine with /proc/meminfo must be measurable"
+            ),
+        }
+    }
+
+    // ---- the budget against the routing policy ------------------------------------------
+
+    fn residency(slots: u32, cold: u32) -> HostResidency {
+        HostResidency { slots, bytes: 0, cold_slots: cold, covers_all_misses: cold == 0 }
+    }
+
+    #[test]
+    fn routing_nothing_host_side_can_never_be_the_hazard() {
+        let r = routing_backing(false, residency(0, 4096));
+        assert_eq!(r, HostRouting::NotRouting);
+        assert!(!r.is_hazardous());
+    }
+
+    #[test]
+    fn routing_into_a_budget_that_covers_every_miss_is_backed() {
+        let r = routing_backing(true, residency(4096, 0));
+        assert_eq!(r, HostRouting::FullyBacked);
+        assert!(!r.is_hazardous());
+    }
+
+    #[test]
+    fn routing_past_the_budget_is_the_hazard_and_says_how_far() {
+        // 🔴 The combination the engine could not see: every miss sent to the CPU, and a
+        // budget that backs none of them. The host executor reads from the mapping, so each
+        // of those is a drive read on the critical path.
+        let r = routing_backing(true, residency(0, 3976));
+        assert_eq!(r, HostRouting::PartlyUnbacked { cold_slots: 3976, of: 3976 });
+        assert!(r.is_hazardous());
+        let s = r.to_string();
+        assert!(s.contains("3976"), "{s}");
+        assert!(s.contains("may be read from the drive"), "and it says *may*, not *is*: {s}");
+    }
+
+    #[test]
+    fn a_budget_that_backs_most_of_the_bank_is_still_a_hazard_and_is_not_rounded_away() {
+        // 3,900 of 3,976 in RAM is a good machine and still not a safe one: the policy has no
+        // idea which experts it is routing, so 76 cold slots are 76 chances at a drive read.
+        let r = routing_backing(true, residency(3900, 76));
+        assert_eq!(r, HostRouting::PartlyUnbacked { cold_slots: 76, of: 3976 });
+        assert!(r.is_hazardous());
+    }
+
+    #[test]
+    fn the_hazard_is_derived_from_a_real_budget_and_a_real_footprint() {
+        // End to end through the module's own types rather than a hand-built `HostResidency`:
+        // a 4 GiB budget over a bank of 64 one-GiB slots backs four of them, and the card
+        // holds two, so 58 are cold.
+        let m = ModelFootprint {
+            dense_weights_bytes: GIB,
+            per_expert_bytes: GIB,
+            total_experts: 64,
+            active_experts: 8,
+            kv_bytes_per_token: 1024,
+        };
+        let hr = host_residency(budget(4 * GIB), &m, 2);
+        assert_eq!(hr.slots, 4);
+        assert_eq!(hr.cold_slots, 58);
+        assert!(!hr.covers_all_misses);
+        assert_eq!(
+            routing_backing(true, hr),
+            HostRouting::PartlyUnbacked { cold_slots: 58, of: 62 }
+        );
     }
 }

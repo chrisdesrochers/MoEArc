@@ -137,6 +137,7 @@ use moearc_model::tensors::{ExpertBank, MappedModel, TensorView, names};
 use moearc_model::{ModelError, ModelInfo};
 
 use crate::cache::{CacheError, CacheStats, ExpertCache, Load, Slot, StepPlan};
+use crate::host_budget::{self, BudgetPolicy, HostBudget, HostResidency, HostRouting};
 use crate::host_experts::{
     self, BankSpec, BlockSpec, Geometry, HostError, HostExecutor, HostPolicy, HostStats,
 };
@@ -1465,6 +1466,10 @@ pub struct State<'c> {
     /// Expert bytes copied host-to-device since the last `reset_traffic`. Counted from the
     /// slices actually uploaded, not from a per-expert constant times a miss count.
     bytes_staged: u64,
+    /// Of those, the bytes staged while the host RAM budget did not cover every non-resident
+    /// slot. See [`ResidencyReport::bytes_staged_uncovered`] — it is a bound, not a count of
+    /// drive reads.
+    bytes_staged_uncovered: u64,
     /// Scratch for the experts one block wants, reused so the hot loop does not allocate.
     wanted: Vec<ExpertRef>,
     /// The last token's logits.
@@ -1548,6 +1553,7 @@ impl<'c> State<'c> {
             gpu_wanted: Vec::with_capacity(cfg.n_expert_used),
             w_sub: Vec::with_capacity(cfg.n_expert_used),
             bytes_staged: 0,
+            bytes_staged_uncovered: 0,
             wanted: Vec::with_capacity(cfg.n_expert_used),
             logits: vec![0.0; cfg.n_vocab],
             tap: None,
@@ -1584,6 +1590,13 @@ pub struct Model<'c, 'm> {
     /// The host-side expert executor, present only when a policy asked for one.
     host: Option<HostExecutor>,
     host_policy: HostPolicy,
+    /// What host RAM can hold behind the VRAM pool — measured once at load.
+    ///
+    /// 🔴 **The tier under the cache, and until now the engine could not see it.** A miss on
+    /// the expert pool is served from the mapping, and whether that is a copy out of the page
+    /// cache or a read off the drive differs by an order of magnitude in latency. This is
+    /// `host_budget`'s answer to that question. `None` when host memory could not be measured.
+    host_ram: Option<HostResidency>,
     /// Each block's expert geometry, in the shape the executor wants. Built once because it is
     /// per block and does not change.
     host_specs: Vec<BlockSpec>,
@@ -1703,6 +1716,31 @@ impl<'c, 'm> Model<'c, 'm> {
         let pool = ExpertPool::new(ctx, weights.slot_bank_bytes, admission.capacity())?;
         let state = State::new(ctx, &weights.cfg, n_ctx)?;
 
+        // The host tier, settled once, here, because every input to it is final by this point:
+        // the machine, the model, and how many slots the pool ended up with.
+        //
+        // 🔴 Every failure is `None`, never a substituted number. A machine whose memory cannot
+        // be read and a model whose header will not parse are both "we do not know", and the
+        // one thing this must not do is answer them with a plausible constant — the whole value
+        // of the figure is that a reader can check it against their own machine.
+        //
+        // ⬜ The budget is `BudgetPolicy::default()`'s ceiling: the engine has no `--host-budget`
+        // plumbed through to it yet, so a user who moved the dial in the interface is not
+        // reflected here. That is a wiring gap, not a modelling one.
+        let host_ram = host_budget::read_host_memory().and_then(|mem| {
+            let info = ModelInfo::from_header(model.header()).ok()?;
+            let footprint = memory::ModelFootprint {
+                dense_weights_bytes: info.dense_weights_bytes,
+                per_expert_bytes: info.per_expert_bytes,
+                // Slots, not experts — the same distinction the planner arm above makes.
+                total_experts: info.moe_block_count * info.total_experts,
+                active_experts: info.moe_block_count * info.active_experts,
+                kv_bytes_per_token: info.kv_bytes_per_token,
+            };
+            let budget = HostBudget::default_for(mem, &BudgetPolicy::default());
+            Some(host_budget::host_residency(budget, &footprint, pool.capacity()))
+        });
+
         let bank = |b: &BankShape| BankSpec { ty: b.ty, n_rows: b.n_rows, n_cols: b.n_cols };
         let host_specs: Vec<BlockSpec> = weights
             .blocks
@@ -1738,6 +1776,7 @@ impl<'c, 'm> Model<'c, 'm> {
             admission,
             host,
             host_policy,
+            host_ram,
             host_specs,
         })
     }
@@ -1761,6 +1800,11 @@ impl<'c, 'm> Model<'c, 'm> {
             bytes_staged: self.state.bytes_staged,
             host_threads: self.host.as_ref().map_or(0, HostExecutor::n_threads),
             host: self.host.as_ref().map(HostExecutor::stats).unwrap_or_default(),
+            host_ram: self.host_ram,
+            host_routing: self
+                .host_ram
+                .map_or(HostRouting::Unknown, |r| self.host_policy.backing(r)),
+            bytes_staged_uncovered: self.state.bytes_staged_uncovered,
         }
     }
 
@@ -1778,12 +1822,14 @@ impl<'c, 'm> Model<'c, 'm> {
             h.reset_stats();
         }
         self.state.bytes_staged = 0;
+        self.state.bytes_staged_uncovered = 0;
     }
 
     /// Forget everything resident, so the next token pays a cold cache.
     pub fn clear_residency(&mut self) -> Result<(), EngineError> {
         self.admission.clear()?;
         self.state.bytes_staged = 0;
+        self.state.bytes_staged_uncovered = 0;
         Ok(())
     }
 
@@ -1821,6 +1867,10 @@ impl<'c, 'm> Model<'c, 'm> {
         let pool = &self.pool;
         let host = self.host.as_ref();
         let host_policy = self.host_policy;
+        // 🔴 The host tier, in hand at the miss path for the first time. Constant for the run —
+        // it is a property of the machine, the model and the pool, none of which move inside a
+        // token — so it is read once here rather than per block.
+        let host_uncovered = self.host_ram.is_some_and(|r| r.cold_slots > 0);
         let host_specs = &self.host_specs;
         let admission = &mut self.admission;
         let st = &mut self.state;
@@ -2179,7 +2229,21 @@ impl<'c, 'm> Model<'c, 'm> {
             {
                 let _p = profile::scope("moe.stage");
                 for load in &plan.loads {
-                    st.bytes_staged += stage(ctx, mapped, pool, load.expert, load.into_slot)?;
+                    let moved = stage(ctx, mapped, pool, load.expert, load.into_slot)?;
+                    st.bytes_staged += moved;
+                    // ⬜ **The seam, wired but not yet steering.** `host_uncovered` says this
+                    // run has slots that live neither in VRAM nor inside the host RAM budget,
+                    // so some of these bytes are a drive read rather than a page-cache copy —
+                    // the one fact that would let this path decide between waiting for the
+                    // copy and routing the expert to the CPU instead. It is only counted here,
+                    // on purpose: acting on it changes which experts run where, and that is a
+                    // change to measured behaviour rather than to what the engine can see.
+                    //
+                    // 🔴 A bound, not a measurement. The budget says how many slots fit in RAM,
+                    // never which, so nothing here knows that *this* expert was one of them.
+                    if host_uncovered {
+                        st.bytes_staged_uncovered += moved;
+                    }
                 }
             }
             let slots = plan.slots_for(&st.gpu_wanted);
@@ -2418,6 +2482,25 @@ pub struct ResidencyReport {
     pub host_threads: usize,
     /// What it actually did.
     pub host: HostStats,
+    /// What host RAM can hold behind the pool: how many of the slots VRAM does not have are
+    /// covered by the host budget, and whether **any** miss on this run can reach the drive.
+    /// `None` when host memory could not be measured.
+    pub host_ram: Option<HostResidency>,
+    /// Whether the host **routing** policy is backed by the host **RAM** budget.
+    ///
+    /// 🔴 The two are set independently and their worst combination is silent — see
+    /// [`crate::host_budget::HostRouting`]. Reported so it can be seen; nothing acts on it.
+    pub host_routing: HostRouting,
+    /// Of [`Self::bytes_staged`], the bytes moved while the host budget did not cover every
+    /// non-resident slot.
+    ///
+    /// 🔴 **An upper bound, not a measurement.** The budget is a whole-model quantity — it says
+    /// how many slots fit in RAM, never which — so this is the traffic that *could* have come
+    /// off the drive, and on a machine whose budget covers the bank it is exactly zero. Warm
+    /// decode on the reference box measured **0 MiB** of actual disk reads at every depth from
+    /// 128 to 8192 tokens, so here the two numbers are expected to disagree; the bound earns
+    /// its place on the machines where they do not.
+    pub bytes_staged_uncovered: u64,
 }
 
 impl ResidencyReport {

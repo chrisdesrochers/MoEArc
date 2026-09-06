@@ -55,6 +55,7 @@ use moearc_kernels::QuantType;
 use moearc_kernels::reference::{KVALUES_MXFP4, e8m0_half, f16_to_f32};
 use moearc_model::tensors::{ExpertBank, MappedModel, names};
 
+use crate::host_budget::{self, HostResidency, HostRouting};
 use crate::moe::Activation;
 
 /// Why the host executor could not start or run.
@@ -123,6 +124,18 @@ impl HostPolicy {
             Self::Fraction(f) => f <= 0.0,
             Self::Over(_) => false,
         }
+    }
+
+    /// Whether the host RAM budget can back what this policy routes to the CPU.
+    ///
+    /// 🔴 This policy places **compute**; [`crate::host_budget::HostBudget`] places **data**;
+    /// and the executor below reads expert weights straight out of the mapping. So the two are
+    /// coupled and the coupling has no other expression in the code:
+    /// [`HostPolicy::Fraction`]`(1.0)` against a budget that backs nothing sends **every**
+    /// host-executed expert to the drive. See [`HostRouting`] — this reports that state and
+    /// deliberately does not act on it.
+    pub fn backing(self, residency: HostResidency) -> HostRouting {
+        host_budget::routing_backing(!self.is_off(), residency)
     }
 }
 
@@ -1429,5 +1442,25 @@ mod tests {
         assert_eq!(HostPolicy::Fraction(0.25).host_count(3), 1);
         assert_eq!(HostPolicy::Over(4).host_count(8), 4);
         assert_eq!(HostPolicy::Over(4).host_count(2), 0);
+    }
+
+    #[test]
+    fn a_policy_knows_whether_the_ram_budget_can_back_what_it_routes() {
+        use crate::host_budget::HostResidency;
+
+        let covered =
+            HostResidency { slots: 512, bytes: 0, cold_slots: 0, covers_all_misses: true };
+        let cold = HostResidency { slots: 0, bytes: 0, cold_slots: 512, covers_all_misses: false };
+
+        // 🔴 The combination this pins: `all` — every miss to the CPU — against a budget that
+        // backs none of it. The executor reads expert weights straight out of the mapping, so
+        // that is a drive read on the critical path, and before `backing` existed nothing in
+        // the engine could tell it from two sensible settings.
+        assert!(HostPolicy::Fraction(1.0).backing(cold).is_hazardous());
+        // The same routing over a budget that holds the bank is the intended configuration.
+        assert!(!HostPolicy::Fraction(1.0).backing(covered).is_hazardous());
+        // And routing nothing cannot be the hazard however cold the budget is.
+        assert!(!HostPolicy::Off.backing(cold).is_hazardous());
+        assert_eq!(HostPolicy::Fraction(0.0).backing(cold), HostRouting::NotRouting);
     }
 }
