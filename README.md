@@ -169,11 +169,19 @@ leaves just 6% of KV off the card, and that 6% alone costs 0.36 GB per token -- 
 the entire expert miss traffic -- because an unresident KV byte is re-read on every
 subsequent token. An expert miss is paid once, occasionally.
 
-`memory::plan` already implements both orderings (`Bias::Context` / `Bias::Experts`) and
-yields expert slots back one at a time when an explicit context request cannot otherwise be
-met. **It defaults to experts-first, which this measurement says is the wrong default past
-roughly 32K of context.** The default is unchanged pending an end-to-end run; the evidence
-is committed ahead of it.
+`memory::plan` exposes a `Bias` policy, and **that policy is not the axis** -- a claim an
+earlier version of this section got wrong. Probed directly rather than reasoned about,
+`Bias::Experts` and `Bias::Context` produce **byte-identical** allocations for every model and
+context tested: at `Context::Largest` both arms evaluate the same expression, and with an
+explicit request the experts-first yield-back loop lands on exactly the residency the
+context-first arm computes outright. Only the *explanation* differs.
+
+The axis that actually moves the plan is **`Context::Largest` vs `Context::Tokens(n)`** -- the
+first and last rows of that table. `Largest` means *experts take everything above the
+`min_context_tokens` floor*, and that floor is **2,048**, so every model on the reference box
+plans 2,048 tokens of context unless asked otherwise. That, not the bias field, is what
+produces the bottom row. The fix is a larger floor or a different meaning for `Largest`; it is
+unchanged pending an end-to-end run, and the evidence is committed ahead of it.
 
 ### What is not measured
 
