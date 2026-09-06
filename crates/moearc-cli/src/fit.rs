@@ -15,7 +15,7 @@
 //!   reasoning behind a debug flag — which `docs/ux.md` rules out.
 
 use moearc_engine::memory::{
-    Allocation, Context, DeviceMemory, ModelFootprint, Policy, plan as engine_plan,
+    Allocation, Context, DeviceMemory, ModelFootprint, Policy, Reason, plan as engine_plan,
 };
 use serde::Serialize;
 
@@ -51,12 +51,26 @@ pub enum FitOutcome {
         /// -expert floor — the other end of the tradeoff, so the number above reads as a
         /// choice rather than a limit.
         ceiling_tokens: Option<u32>,
+        /// Whether `context_tokens` is the policy minimum rather than what the card could
+        /// serve.
+        ///
+        /// 🔴 The engine is explicit that these are different things, and on a real directory
+        /// the floor is the common case, not an edge one: experts are small next to a KV page,
+        /// so a greedy residency fill leaves exactly the reserved minimum and no more. Four
+        /// rows all reading the same context then look like a constant the tool forgot to
+        /// compute. They are not — but nothing on the row says which of the two numbers it is,
+        /// so the panel has to.
+        context_at_floor: bool,
         /// The planner's own reasoning, one line per step.
         rationale: Vec<String>,
     },
-    /// No allocation satisfies the request. `reason` is the engine's message, which names the
-    /// shortfall in gigabytes and, where it can, what would fix it.
-    DoesNotFit { reason: String },
+    /// No allocation satisfies the request.
+    ///
+    /// `reason` is the full sentence — usually the engine's, which names the shortfall in
+    /// gigabytes and, where it can, what would fix it. `headline` is the three words that fit
+    /// in a table cell, because "will not fit" is right for a model too large for the card and
+    /// wrong for one asked to do something it was never trained to do.
+    DoesNotFit { headline: &'static str, reason: String },
 }
 
 impl Fit {
@@ -64,15 +78,53 @@ impl Fit {
         matches!(self.outcome, FitOutcome::Fits { .. })
     }
 
+    /// Whether this row's context is the configured minimum rather than a capacity.
+    pub fn context_at_floor(&self) -> bool {
+        matches!(self.outcome, FitOutcome::Fits { context_at_floor: true, .. })
+    }
+
     /// One line, for a table cell or a plain-text row.
     pub fn summary(&self) -> String {
         match &self.outcome {
             FitOutcome::Fits { resident_experts, total_experts, context_tokens, .. } => format!(
-                "{resident_experts}/{total_experts} experts resident · {} ctx",
+                // Separated, because a real model has thousands of residency slots and
+                // `4128/10240` is two numbers a reader has to count digits to compare.
+                "{} / {} experts resident · {} ctx",
+                crate::format::count(*resident_experts as i64),
+                crate::format::count(*total_experts as i64),
                 crate::format::count(*context_tokens as i64)
             ),
-            FitOutcome::DoesNotFit { .. } => "will not fit".to_string(),
+            FitOutcome::DoesNotFit { headline, .. } => (*headline).to_string(),
         }
+    }
+}
+
+/// Column widths for the "what will fit" table, measured from the rows that will go in it.
+///
+/// A constant was fine while the models were fixtures with short handles. Real handles come
+/// from real filenames — `olmoe-1b-7b-0924-instruct` is 25 characters, twice the fixture it
+/// replaced — and a fixed column either truncates the name or leaves half the row empty. Both
+/// renderers take their widths from here so the plain output and the interface stay one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Columns {
+    pub id: usize,
+    pub quant: usize,
+    pub size: usize,
+}
+
+impl Columns {
+    /// Floors, so a one-model directory still produces a table rather than a ragged line.
+    const MIN: Self = Self { id: 13, quant: 5, size: 9 };
+
+    pub fn of(models: &[ModelCard]) -> Self {
+        let mut c = Self::MIN;
+        for m in models {
+            // Characters, not bytes: a handle is a filename and filenames are not ASCII.
+            c.id = c.id.max(m.id.chars().count());
+            c.quant = c.quant.max(m.quant.chars().count());
+            c.size = c.size.max(crate::format::bytes(m.file_bytes).chars().count());
+        }
+        c
     }
 }
 
@@ -80,12 +132,18 @@ fn device_memory(d: &DeviceRow) -> DeviceMemory {
     DeviceMemory { total_bytes: d.total_bytes, free_bytes: d.free_bytes }
 }
 
+/// The planner's view of the model.
+///
+/// 🔴 `total_experts` here is the model's **residency slot** count, one per *(block, expert)*
+/// pair, because that is what `per_expert_bytes` sizes and what the cache pages. Passing the
+/// per-block expert count instead would understate a 36-block model by 36x and produce plans
+/// that allocate a thirty-sixth of the memory they need.
 fn footprint(card: &ModelCard) -> ModelFootprint {
     ModelFootprint {
         dense_weights_bytes: card.dense_weights_bytes,
         per_expert_bytes: card.per_expert_bytes,
-        total_experts: card.experts_total,
-        active_experts: card.experts_active,
+        total_experts: card.expert_slots_total,
+        active_experts: card.expert_slots_active,
         kv_bytes_per_token: card.kv_bytes_per_token,
     }
 }
@@ -123,24 +181,113 @@ fn build(
     slot_override: Option<u32>,
 ) -> Fit {
     let (mem, model) = (device_memory(device), footprint(card));
+
+    // Checked before the planner, because the planner cannot catch it: it reasons about bytes,
+    // and the bytes are there. A 4,096-token model asked for 32,768 allocates 128 KV pages
+    // quite happily and then answers from positions it has never seen. Trimming the request to
+    // 4,096 and reporting success would be the worst kind of success; the request is refused
+    // instead, and the refusal names the model's own limit.
+    if let Some(asked) = ctx
+        && card.trained_context_tokens > 0
+        && asked > card.trained_context_tokens
+    {
+        return Fit {
+            model: card.id.clone(),
+            requested_ctx: ctx,
+            slot_override,
+            calibrated: false,
+            outcome: FitOutcome::DoesNotFit {
+                headline: "past its trained context",
+                reason: format!(
+                    "{} tokens were asked for and this model was trained for {}. The pages \
+                     would allocate; the answers past that point would not mean anything.",
+                    crate::format::count(asked as i64),
+                    crate::format::count(card.trained_context_tokens as i64)
+                ),
+            },
+        };
+    }
+
     let outcome = match engine_plan(mem, &model, &policy, want(ctx)) {
-        Ok(a) => fits(&a, card, ceiling_tokens(device, card, &policy)),
-        Err(e) => FitOutcome::DoesNotFit { reason: e.to_string() },
+        Ok(a) => {
+            let (a, capped) = cap_to_trained_context(mem, &model, &policy, card, ctx, a);
+            let ceiling = ceiling_tokens(device, card, &policy, a.context_tokens);
+            fits(&a, card, ceiling, capped)
+        }
+        Err(e) => FitOutcome::DoesNotFit { headline: "will not fit", reason: e.to_string() },
     };
     Fit { model: card.id.clone(), requested_ctx: ctx, slot_override, calibrated: false, outcome }
 }
 
-fn fits(a: &Allocation, card: &ModelCard, ceiling_tokens: Option<u32>) -> FitOutcome {
+/// Hold the reported context down to what the model was actually trained for.
+///
+/// [`Context::Largest`] asks for every KV page the card can hold, and the planner has no idea
+/// what the model can use. Measured: `olmoe-1b-7b` is a **4,096-token** model, and a B580 with
+/// 11.3 GiB free has room for 47,360 tokens of its KV cache. Printing 47,360 in a column
+/// headed "what will fit" would be a claim about the model that the model does not make — the
+/// single most quotable wrong number this screen could produce.
+///
+/// Only the *unrequested* case is capped. A context the user typed is still answered by the
+/// planner, so `--ctx 8192` against a 4,096-token model fails there rather than being quietly
+/// trimmed here — which is the same rule `docs/ux.md` applies to every other silent success.
+fn cap_to_trained_context(
+    mem: DeviceMemory,
+    model: &ModelFootprint,
+    policy: &Policy,
+    card: &ModelCard,
+    requested: Option<u32>,
+    planned: Allocation,
+) -> (Allocation, bool) {
+    if requested.is_some()
+        || card.trained_context_tokens == 0
+        || planned.context_tokens <= card.trained_context_tokens
+    {
+        return (planned, false);
+    }
+    // Floored to a whole page, so the re-plan lands on or below the trained ceiling rather
+    // than rounding back up over it.
+    let page = policy.page_tokens.max(1);
+    let target = (card.trained_context_tokens / page) * page;
+    if target == 0 {
+        return (planned, false);
+    }
+    match engine_plan(mem, model, policy, Context::Tokens(target)) {
+        Ok(capped) => (capped, true),
+        // Asking for less than already fits cannot fail; if it somehow does, keep the plan we
+        // have rather than losing the row entirely.
+        Err(_) => (planned, false),
+    }
+}
+
+fn fits(
+    a: &Allocation,
+    card: &ModelCard,
+    ceiling_tokens: Option<u32>,
+    context_capped: bool,
+) -> FitOutcome {
+    let context_at_floor =
+        a.rationale.iter().any(|r| matches!(r, Reason::ContextAtPolicyFloor { .. }));
+    let mut rationale: Vec<String> = a.rationale.iter().map(ToString::to_string).collect();
+    if context_capped {
+        // Appended by this crate, not by the engine. The engine reasons about bytes; this is
+        // the one fact about the model that is not in its footprint.
+        rationale.push(format!(
+            "context held at {} tokens, the longest this model was trained for — the card \
+             could hold more KV pages than the model can use",
+            crate::format::count(card.trained_context_tokens as i64)
+        ));
+    }
     FitOutcome::Fits {
         resident_experts: a.resident_experts,
-        total_experts: card.experts_total,
+        total_experts: card.expert_slots_total,
         context_tokens: a.context_tokens,
         kv_pages: a.kv_pages,
         expert_bytes: a.expert_bytes,
         kv_bytes: a.kv_bytes,
         headroom_bytes: a.headroom_bytes,
         ceiling_tokens,
-        rationale: a.rationale.iter().map(ToString::to_string).collect(),
+        context_at_floor,
+        rationale,
     }
 }
 
@@ -149,11 +296,26 @@ fn fits(a: &Allocation, card: &ModelCard, ceiling_tokens: Option<u32>) -> FitOut
 /// Asked of the planner rather than derived, so it cannot drift from the plan it sits beside.
 /// It is the answer to "what am I giving up by keeping experts resident?", which is the
 /// question the headline number provokes and would otherwise leave hanging.
-fn ceiling_tokens(device: &DeviceRow, card: &ModelCard, policy: &Policy) -> Option<u32> {
-    let floor = Policy { max_resident_experts: Some(card.experts_active), ..*policy };
-    engine_plan(device_memory(device), &footprint(card), &floor, Context::Largest)
+fn ceiling_tokens(
+    device: &DeviceRow,
+    card: &ModelCard,
+    policy: &Policy,
+    planned_tokens: u32,
+) -> Option<u32> {
+    let floor = Policy { max_resident_experts: Some(card.expert_slots_active), ..*policy };
+    let reachable = engine_plan(device_memory(device), &footprint(card), &floor, Context::Largest)
         .ok()
-        .map(|a| a.context_tokens)
+        .map(|a| a.context_tokens)?;
+    // Same ceiling the plan itself is held to, and for the same reason.
+    let reachable = if card.trained_context_tokens == 0 {
+        reachable
+    } else {
+        reachable.min(card.trained_context_tokens)
+    };
+    // Once both are at the model's own limit there is no tradeoff left to describe, and
+    // printing "ceiling 4,096" beside "context 4,096" invites the reader to look for a
+    // difference that is not there.
+    (reachable > planned_tokens).then_some(reachable)
 }
 
 #[cfg(test)]
@@ -221,7 +383,7 @@ mod tests {
     #[test]
     fn a_model_too_large_for_the_card_names_the_shortfall_and_a_way_out() {
         let f = plan(&card(), &model("qwen3-235b-a22b"), None);
-        let FitOutcome::DoesNotFit { reason } = &f.outcome else {
+        let FitOutcome::DoesNotFit { reason, .. } = &f.outcome else {
             panic!("expected a miss, got {:?}", f.outcome);
         };
         assert!(reason.contains("GiB"), "the shortfall is in bytes, not 'out of memory'");
@@ -233,6 +395,34 @@ mod tests {
         // Silently serving 3k when 4M was asked for would be the worst kind of success.
         let f = plan(&card(), &model("qwen3-30b-a3b"), Some(4_000_000));
         assert!(!f.fits());
+    }
+
+    #[test]
+    fn a_context_beyond_the_model_is_refused_even_when_the_memory_is_there() {
+        // The one the planner cannot catch. `mixtral-8x7b` is a 32,768-token fixture; the
+        // bytes for 65,536 exist on this card, so the engine would say yes.
+        let m = model("mixtral-8x7b");
+        assert_eq!(m.trained_context_tokens, 32_768);
+        let f = plan(&card(), &m, Some(65_536));
+        let FitOutcome::DoesNotFit { headline, reason } = &f.outcome else {
+            panic!("a context the model never saw is not a fit: {:?}", f.outcome)
+        };
+        assert_eq!(*headline, "past its trained context", "and not `will not fit`, which it does");
+        assert!(reason.contains("32,768"), "the refusal names the model's limit: {reason}");
+        // At its own limit it plans normally.
+        assert!(plan(&card(), &m, Some(32_768)).fits());
+    }
+
+    #[test]
+    fn a_context_at_the_policy_minimum_is_flagged_as_one() {
+        // The engine distinguishes "this is all that fits" from "experts took everything above
+        // the configured minimum". Dropping that distinction on the way to the screen would
+        // turn a policy restatement into a capacity claim.
+        let f = plan(&card(), &model("qwen3-30b-a3b"), None);
+        let FitOutcome::Fits { context_tokens, context_at_floor, .. } = f.outcome else {
+            panic!("expected a fit")
+        };
+        assert_eq!(context_at_floor, context_tokens == 2_048);
     }
 
     #[test]

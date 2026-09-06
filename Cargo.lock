@@ -1971,6 +1971,7 @@ dependencies = [
  "crossterm",
  "moearc-device",
  "moearc-engine",
+ "moearc-model",
  "ratatui",
  "serde",
  "serde_json",

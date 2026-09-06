@@ -18,6 +18,7 @@
 //! | expert-slot override        | `--moe-cache <slots>`                       |
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -46,6 +47,13 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Args)]
 pub struct GlobalArgs {
+    /// Where the GGUF files are. Defaults to $MOEARC_MODELS, then a cache directory.
+    ///
+    /// 🔴 There is no compiled-in path. Models live where the user put them, which is nowhere
+    /// this program can guess — see [`crate::catalog::models_dir`] for the order it resolves.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub models_dir: Option<PathBuf>,
+
     /// Plain text instead of the interface. Implied by --json, and by a non-terminal stdout.
     #[arg(long, global = true)]
     pub no_tui: bool,
@@ -158,6 +166,15 @@ mod tests {
     fn no_arguments_is_the_device_report() {
         let cli = Cli::parse_from(["moearc"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn the_model_directory_is_a_flag_and_defaults_to_unset() {
+        // Unset here, not defaulted here: the resolution order lives in one place, and a
+        // clap default would quietly win over $MOEARC_MODELS.
+        assert!(Cli::parse_from(["moearc"]).global.models_dir.is_none());
+        let cli = Cli::parse_from(["moearc", "ls", "--models-dir", "/srv/models"]);
+        assert_eq!(cli.global.models_dir.as_deref(), Some(std::path::Path::new("/srv/models")));
     }
 
     #[test]

@@ -113,14 +113,21 @@ pub struct Model {
     pub throbber: ThrobberState,
     pub help: bool,
     pub status: Option<String>,
-    /// True while the data behind the screens is fixture data. Rendered in the footer,
-    /// because a plausible number with no provenance is worse than no number.
-    pub stubbed: bool,
+    /// Which parts of what is on screen are fixtures, or `None` when none are.
+    ///
+    /// One field rather than a flag plus a string. The flag and the string were briefly both
+    /// here, and two fields describing one fact is how a footer ends up reading "stub data"
+    /// over measured numbers: nothing makes the second one move when the first does. See
+    /// `Sources::stub_parts`.
+    pub provenance: Option<&'static str>,
+    /// Where the catalogue looked for models. Shown only when it found none — "no models" is
+    /// a symptom, and the directory it searched is the cause.
+    pub catalog_location: Option<String>,
     pub quit: bool,
 }
 
 impl Model {
-    pub fn new(ctx_request: Option<u32>, stubbed: bool) -> Self {
+    pub fn new(ctx_request: Option<u32>, provenance: Option<&'static str>) -> Self {
         Self {
             screen: Screen::Devices,
             report: None,
@@ -137,7 +144,8 @@ impl Model {
             throbber: ThrobberState::default(),
             help: false,
             status: None,
-            stubbed,
+            provenance,
+            catalog_location: None,
             quit: false,
         }
     }
@@ -465,7 +473,7 @@ pub(crate) mod tests {
 
     /// A model in the state the runtime hands to `view` once startup has settled.
     pub(crate) fn loaded() -> Model {
-        let mut m = Model::new(None, true);
+        let mut m = Model::new(None, Some(crate::source::Sources::stub().stub_parts));
         update(&mut m, Msg::Detected(StubDeviceSource.detect().unwrap()));
         update(&mut m, Msg::Catalog(StubCatalog.curated().unwrap()));
         m

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 moearc-engine.workspace = true
 moearc-device.workspace = true
+moearc-model.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

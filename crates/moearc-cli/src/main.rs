@@ -12,9 +12,12 @@
 //!   [`cli`] and re-stated in the interface's own help overlay, so it is visible from both
 //!   sides.
 //! * **The interface owns no facts.** Device enumeration and model metadata arrive through
-//!   the traits in [`source`], which is what lets this crate compile and its screens be
-//!   snapshot-tested before `moearc-device` and `moearc-model` exist.
+//!   the traits in [`source`], and are answered by [`detect`] and [`catalog`] against the real
+//!   machine. The seam is not scaffolding left over from before those crates existed: a UI
+//!   wired straight to hardware cannot be snapshot-tested, because its frames would change
+//!   with the card, the driver and the free VRAM at the moment the test ran.
 
+mod catalog;
 mod cli;
 mod detect;
 mod fit;
@@ -35,7 +38,7 @@ fn main() -> ExitCode {
     let sources = if std::env::var_os("MOEARC_STUB").is_some() {
         source::Sources::stub()
     } else {
-        source::Sources::real()
+        source::Sources::real(catalog::models_dir(cli.global.models_dir.as_deref()))
     };
 
     let result =

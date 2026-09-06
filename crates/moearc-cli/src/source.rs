@@ -206,32 +206,78 @@ impl DeviceReport {
 
 /// What we know about one model — and specifically, the numbers the cache planner needs.
 ///
-/// The expert geometry fields exist so the user never types them. They come out of the GGUF
-/// header, which is `moearc-model`'s job; nothing here asks a person for an expert count.
+/// Every field is read out of the GGUF file by `moearc-model`; none of it is asked of a user.
+/// That is the point of the type: expert geometry is exactly the sort of number a person
+/// should never have to look up, and every runtime that asks for one is asking them to be
+/// wrong occasionally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelCard {
     /// Short handle, the thing a user types.
     pub id: String,
-    /// Hugging Face repo id, the thing a user pastes.
-    pub repo: String,
+    /// Hugging Face repo id, the thing a user pastes — when there is one.
+    ///
+    /// 🔴 `None` for a model found on disk, and that is the ordinary case rather than an edge
+    /// one. A GGUF's `general.repo_url` is written by whoever quantised it, and across the
+    /// files this was developed against it is either absent or names an *organisation*
+    /// (`huggingface.co/unsloth`) rather than a repo. Rendering that in a field labelled
+    /// "repo" would hand the user a string that does not work in `moearc pull`.
+    pub repo: Option<String>,
+    /// The file this card was read from, name only.
+    ///
+    /// The directory is the user's own and does not belong on every row; the name is what
+    /// tells them which of several quantisations they are looking at.
+    pub file: Option<String>,
+    /// The ggml type holding most of the expert weights: `q4_K`, `mxfp4`.
+    ///
+    /// ggml's spelling, from the tensor index — not the filename's tag. A "Q4_K_M" file is a
+    /// mixture, and saying so is more use than repeating a label nobody verified.
     pub quant: String,
-    /// Size of the download.
+    /// Size of the file on disk.
     pub file_bytes: u64,
-    /// Total and active parameter counts in millions, kept integral so the type stays `Eq`.
-    pub params_total_m: u32,
-    pub params_active_m: u32,
-    /// Non-expert weights: embeddings, attention, norms. Resident unconditionally, so they
-    /// come off the budget before any split is planned.
+    /// Total parameters, summed over the tensor index.
+    ///
+    /// 🔴 The total only, deliberately. An "active parameters" figure looks derivable from the
+    /// same index and is not: it turns on whether the embedding matrix counts as active, which
+    /// is a convention rather than a measurement, and publishers do not agree on it. The two
+    /// conventions differ by enough to be visible in the first decimal place. The expert
+    /// geometry below carries the same meaning and is exact.
+    pub parameters: u64,
+    /// Non-expert weights: embeddings, attention, norms, the output head. Resident
+    /// unconditionally, so they come off the budget before any split is planned.
     pub dense_weights_bytes: u64,
-    /// Bytes one resident expert occupies.
+    /// Bytes one resident expert *slot* occupies.
     pub per_expert_bytes: u64,
-    /// Experts the model has.
-    pub experts_total: u32,
-    /// Experts routed to per token — the floor on residency.
-    pub experts_active: u32,
-    /// KV cache bytes for one token, across all layers. Pages are the planner's granularity,
-    /// not a property of the model, so the per-token figure is what belongs on the card.
+    /// Whether every MoE block agreed on [`Self::per_expert_bytes`].
+    ///
+    /// `false` means the file mixes quantisation types across blocks — three of the four real
+    /// files here do — and the figure is a conservative maximum. The plan then holds slightly
+    /// fewer slots than the card could, which is the safe direction to be wrong in, but it is
+    /// worth saying rather than leaving as an unexplained few percent.
+    pub per_expert_bytes_uniform: bool,
+    /// Residency slots the model has: one per *(block, expert)* pair.
+    ///
+    /// 🔴 Not the expert count. A 128-expert model with 36 MoE blocks has **4,608** slots, and
+    /// the cache pages slots. Putting 128 here would understate the model by the block count
+    /// and make every residency figure on screen wrong by the same factor.
+    pub expert_slots_total: u32,
+    /// Slots one token touches: `active experts × MoE blocks`. The floor on residency.
+    pub expert_slots_active: u32,
+    /// Experts per MoE block, as the model's own metadata states it.
+    pub experts_per_block: u32,
+    /// Experts routed to per token, per block.
+    pub active_experts_per_block: u32,
+    /// Blocks carrying an expert bank. Not necessarily every block.
+    pub moe_blocks: u32,
+    /// KV cache bytes for one token, across every block that caches. Pages are the planner's
+    /// granularity, not a property of the model, so the per-token figure is what belongs here.
     pub kv_bytes_per_token: u64,
+    /// The longest context the model was trained for.
+    ///
+    /// 🔴 A plan is never reported above it. The card can hold more KV pages than the model
+    /// can use — `olmoe` is a 4,096-token model and this B580 has room for eleven times that —
+    /// and printing the page count as a context length would be a capability claim the model
+    /// does not support.
+    pub trained_context_tokens: u32,
     /// Present on this machine.
     pub local: bool,
     /// Whether the footprint above was *measured on an Arc card* rather than derived from the
@@ -240,14 +286,34 @@ pub struct ModelCard {
 }
 
 impl ModelCard {
-    /// "30.5B total / 3.3B active" — the pair, because for an MoE model either number alone
-    /// misleads: total predicts the download, active predicts the speed.
+    /// "116.8B" — total parameters. See [`Self::parameters`] for why there is no second half.
     pub fn params(&self) -> String {
+        let billions = self.parameters as f64 / 1e9;
+        if billions >= 1.0 {
+            format!("{billions:.1}B")
+        } else {
+            format!("{:.0}M", self.parameters as f64 / 1e6)
+        }
+    }
+
+    /// "128 per block, 4 routed" — the model's own geometry, before it meets a card.
+    pub fn experts(&self) -> String {
+        format!("{} per block, {} routed", self.experts_per_block, self.active_experts_per_block)
+    }
+
+    /// "4,608 across 36 MoE blocks" — what residency is actually counted in.
+    pub fn slots(&self) -> String {
         format!(
-            "{:.1}B / {:.1}B",
-            self.params_total_m as f64 / 1000.0,
-            self.params_active_m as f64 / 1000.0
+            "{} across {} blocks",
+            format::count(self.expert_slots_total as i64),
+            self.moe_blocks
         )
+    }
+
+    /// Where this model came from, for a single column: a repo id if we have one, else the
+    /// file it was read from.
+    pub fn origin(&self) -> &str {
+        self.repo.as_deref().or(self.file.as_deref()).unwrap_or("—")
     }
 }
 
@@ -295,7 +361,7 @@ pub trait DeviceSource {
     fn detect(&self) -> anyhow::Result<DeviceReport>;
 }
 
-/// Find models, locally and in the curated list. Implemented by `moearc-model`.
+/// Find models, locally and in the curated list. Implemented by [`crate::catalog`].
 pub trait ModelCatalog {
     /// Models present on this machine.
     fn installed(&self) -> anyhow::Result<Vec<ModelCard>>;
@@ -303,6 +369,19 @@ pub trait ModelCatalog {
     fn curated(&self) -> anyhow::Result<Vec<ModelCard>>;
     /// Resolve a handle or a Hugging Face repo id to a card.
     fn resolve(&self, id: &str) -> anyhow::Result<ModelCard>;
+
+    /// Files that look like models and could not be read, each with its reason.
+    ///
+    /// Rendered, not swallowed. A truncated download and a model that was never there produce
+    /// the same empty list, and "no models found" sends a user looking in the wrong place.
+    fn skipped(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Where the catalogue looked, for the message it prints when it found nothing.
+    fn location(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Size a download before starting it. Implemented by `moearc-model`.
@@ -334,24 +413,35 @@ pub struct Sources {
     /// `moearc-device` was not wired in. A provenance note that goes stale is worse than none:
     /// it is trusted precisely because it looks like bookkeeping nobody would get wrong.
     pub stub_note: &'static str,
+    /// The same fact, short enough for a keybind footer.
+    ///
+    /// 🔴 These two fields say one thing at two lengths and must move together. They exist as
+    /// a pair because the interface's footer had room for "stub data" and nothing else, and
+    /// once devices and models became real that marker was wrong in the *other* direction —
+    /// it labelled measurements as fixtures, which is its own kind of lie. A test asserts
+    /// every word here also appears in [`Self::stub_note`], so editing one and forgetting the
+    /// other fails rather than ships.
+    pub stub_parts: &'static str,
 }
 
 impl Sources {
     /// The real backends, where they exist.
     ///
     /// `stubbed` stays true while ANY source is a fixture, so the footer and the `--json`
-    /// payload keep saying so. Devices are real now; models, transfers and serving are not.
-    /// Reporting "not stubbed" the moment the first backend lands would be the more
-    /// flattering claim and the false one.
-    pub fn real() -> Self {
+    /// payload keep saying so. Devices and models are real now; transfers and serving are not.
+    /// Reporting "not stubbed" the moment a backend lands would be the more flattering claim
+    /// and the false one — and the note has to move with the code, or it becomes a lie that
+    /// looks like bookkeeping.
+    pub fn real(models_dir: std::path::PathBuf) -> Self {
         Self {
             devices: Box::new(crate::detect::LevelZeroDevices),
-            models: Box::new(StubCatalog),
+            models: Box::new(crate::catalog::LocalCatalog::new(models_dir)),
             transfers: Box::new(StubTransfers),
             serve: Box::new(StubServeStats),
             stubbed: true,
-            stub_note: "device detection is real; the model list, downloads and serving stats \
-                        are still fixtures",
+            stub_note: "devices and models are read from this machine; downloads and serving \
+                        stats are still fixtures",
+            stub_parts: "fixtures: downloads, serving",
         }
     }
 
@@ -364,6 +454,7 @@ impl Sources {
             serve: Box::new(StubServeStats),
             stubbed: true,
             stub_note: "every number is a fixture — no hardware or model was consulted",
+            stub_parts: "fixture: every number",
         }
     }
 }
@@ -411,68 +502,203 @@ impl DeviceSource for StubDeviceSource {
 pub struct StubCatalog;
 
 impl StubCatalog {
+    /// The interface's own fixture: four models with short handles and a single-block expert
+    /// geometry, kept deliberately small so the frames it produces are easy to read.
+    ///
+    /// It is **not** the shape of a real file — see [`Self::as_measured`] for that. Both exist
+    /// because they test different things: this one pins the screens, that one pins the widths.
     fn all() -> Vec<ModelCard> {
         vec![
             ModelCard {
                 id: "qwen3-30b-a3b".to_string(),
-                repo: "Qwen/Qwen3-30B-A3B-GGUF".to_string(),
+                repo: Some("Qwen/Qwen3-30B-A3B-GGUF".to_string()),
+                file: Some("Qwen3-30B-A3B-Q4_K_M.gguf".to_string()),
                 quant: "Q4_K_M".to_string(),
                 file_bytes: 18_600_000_000,
-                params_total_m: 30_500,
-                params_active_m: 3_300,
+                parameters: 30_500_000_000,
                 dense_weights_bytes: 1_700_000_000,
                 per_expert_bytes: 137_000_000,
-                experts_total: 128,
-                experts_active: 8,
+                per_expert_bytes_uniform: true,
+                expert_slots_total: 128,
+                expert_slots_active: 8,
+                experts_per_block: 128,
+                active_experts_per_block: 8,
+                moe_blocks: 1,
                 kv_bytes_per_token: 98_304,
+                trained_context_tokens: 131_072,
                 local: true,
                 measured: true,
             },
             ModelCard {
                 id: "gpt-oss-20b".to_string(),
-                repo: "openai/gpt-oss-20b-GGUF".to_string(),
+                repo: Some("openai/gpt-oss-20b-GGUF".to_string()),
+                file: Some("gpt-oss-20b-MXFP4.gguf".to_string()),
                 quant: "MXFP4".to_string(),
                 file_bytes: 12_100_000_000,
-                params_total_m: 20_900,
-                params_active_m: 3_600,
+                parameters: 20_900_000_000,
                 dense_weights_bytes: 1_100_000_000,
                 per_expert_bytes: 320_000_000,
-                experts_total: 32,
-                experts_active: 4,
+                per_expert_bytes_uniform: true,
+                expert_slots_total: 32,
+                expert_slots_active: 4,
+                experts_per_block: 32,
+                active_experts_per_block: 4,
+                moe_blocks: 1,
                 kv_bytes_per_token: 49_152,
+                trained_context_tokens: 131_072,
                 local: true,
                 measured: true,
             },
             ModelCard {
                 id: "mixtral-8x7b".to_string(),
-                repo: "mistralai/Mixtral-8x7B-Instruct-v0.1-GGUF".to_string(),
+                repo: Some("mistralai/Mixtral-8x7B-Instruct-v0.1-GGUF".to_string()),
+                file: None,
                 quant: "Q4_K_M".to_string(),
                 file_bytes: 26_400_000_000,
-                params_total_m: 46_700,
-                params_active_m: 12_900,
+                parameters: 46_700_000_000,
                 dense_weights_bytes: 1_300_000_000,
                 per_expert_bytes: 3_100_000_000,
-                experts_total: 8,
-                experts_active: 2,
+                per_expert_bytes_uniform: true,
+                expert_slots_total: 8,
+                expert_slots_active: 2,
+                experts_per_block: 8,
+                active_experts_per_block: 2,
+                moe_blocks: 1,
                 kv_bytes_per_token: 32_768,
+                trained_context_tokens: 32_768,
                 local: false,
                 measured: false,
             },
             ModelCard {
                 id: "qwen3-235b-a22b".to_string(),
-                repo: "Qwen/Qwen3-235B-A22B-GGUF".to_string(),
+                repo: Some("Qwen/Qwen3-235B-A22B-GGUF".to_string()),
+                file: None,
                 quant: "Q4_K_M".to_string(),
                 file_bytes: 142_000_000_000,
-                params_total_m: 235_000,
-                params_active_m: 22_000,
+                parameters: 235_000_000_000,
                 dense_weights_bytes: 4_800_000_000,
                 per_expert_bytes: 1_070_000_000,
-                experts_total: 128,
-                experts_active: 8,
+                per_expert_bytes_uniform: true,
+                expert_slots_total: 128,
+                expert_slots_active: 8,
+                experts_per_block: 128,
+                active_experts_per_block: 8,
+                moe_blocks: 1,
                 kv_bytes_per_token: 98_304,
+                trained_context_tokens: 131_072,
                 local: false,
                 measured: false,
             },
+        ]
+    }
+
+    /// The four GGUF files this was developed against, as [`ModelCard`]s.
+    ///
+    /// 🔴 **Every number here was read out of the real file** by `moearc-model` on 2026-09-05 —
+    /// geometry, byte counts, parameter totals and all. It is a fixture only in the sense that
+    /// it is frozen: no header is parsed when it is used.
+    ///
+    /// It exists because the widths are the interesting part and the widths cannot be tested
+    /// against a machine's contents. `olmoe-1b-7b-0924-instruct` is a 25-character handle,
+    /// `gpt-oss-120b` is 59 GiB against an 11.3 GiB card, and `qwen3.6-35b-a3b-ud` has 10,240
+    /// residency slots. A row sized for `qwen3-30b-a3b` and `128` fits none of them, and a
+    /// column that overflows on the one screen anybody looks at is the defect this fixture is
+    /// here to catch.
+    #[cfg(test)]
+    pub fn as_measured() -> Vec<ModelCard> {
+        let card = |id: &str,
+                    file: &str,
+                    quant: &str,
+                    file_bytes: u64,
+                    parameters: u64,
+                    dense_weights_bytes: u64,
+                    per_expert_bytes: u64,
+                    uniform: bool,
+                    experts_per_block: u32,
+                    active_experts_per_block: u32,
+                    moe_blocks: u32,
+                    kv_bytes_per_token: u64,
+                    trained_context_tokens: u32| ModelCard {
+            id: id.to_string(),
+            repo: None,
+            file: Some(file.to_string()),
+            quant: quant.to_string(),
+            file_bytes,
+            parameters,
+            dense_weights_bytes,
+            per_expert_bytes,
+            per_expert_bytes_uniform: uniform,
+            expert_slots_total: moe_blocks * experts_per_block,
+            expert_slots_active: moe_blocks * active_experts_per_block,
+            experts_per_block,
+            active_experts_per_block,
+            moe_blocks,
+            kv_bytes_per_token,
+            trained_context_tokens,
+            local: true,
+            measured: false,
+        };
+        vec![
+            card(
+                "gpt-oss-120b",
+                "gpt-oss-120b-MXFP4.gguf",
+                "mxfp4",
+                63_387_346_208,
+                116_829_156_672,
+                2_460_250_368,
+                13_219_200,
+                true,
+                128,
+                4,
+                36,
+                73_728,
+                131_072,
+            ),
+            card(
+                "qwen3.6-35b-a3b-ud",
+                "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+                "q4_K",
+                22_134_528_992,
+                34_660_610_688,
+                2_555_013_632,
+                2_039_808,
+                false,
+                256,
+                8,
+                40,
+                20_480,
+                262_144,
+            ),
+            card(
+                "qwen3-30b-a3b",
+                "Qwen3-30B-A3B-Q4_K_M.gguf",
+                "q4_K",
+                18_556_686_912,
+                30_532_122_624,
+                997_554_176,
+                3_059_712,
+                false,
+                128,
+                8,
+                48,
+                98_304,
+                40_960,
+            ),
+            card(
+                "olmoe-1b-7b-0924-instruct",
+                "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+                "q4_K",
+                4_213_512_672,
+                6_919_161_856,
+                311_027_712,
+                4_079_616,
+                false,
+                64,
+                8,
+                16,
+                131_072,
+                4_096,
+            ),
         ]
     }
 }
@@ -487,14 +713,15 @@ impl ModelCatalog for StubCatalog {
     }
 
     fn resolve(&self, id: &str) -> anyhow::Result<ModelCard> {
-        Self::all().into_iter().find(|m| m.id == id || m.repo.eq_ignore_ascii_case(id)).ok_or_else(
-            || {
+        Self::all()
+            .into_iter()
+            .find(|m| m.id == id || m.repo.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(id)))
+            .ok_or_else(|| {
                 anyhow::anyhow!(
                     "unknown model `{id}` — run `moearc ls --all` for the curated list, or \
                      pass a full Hugging Face repo id"
                 )
-            },
-        )
+            })
     }
 }
 
@@ -505,11 +732,11 @@ impl TransferSource for StubTransfers {
         // A curated handle resolves to the repo it names. Echoing the handle back would print
         // `mixtral-8x7b` in a field labelled "repo", which is not a repo id and would not
         // work if a user copied it.
-        let known = StubCatalog::all()
-            .into_iter()
-            .find(|m| m.id == repo || m.repo.eq_ignore_ascii_case(repo));
+        let known = StubCatalog::all().into_iter().find(|m| {
+            m.id == repo || m.repo.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        });
         Ok(TransferPlan {
-            repo: known.as_ref().map_or_else(|| repo.to_string(), |m| m.repo.clone()),
+            repo: known.as_ref().and_then(|m| m.repo.clone()).unwrap_or_else(|| repo.to_string()),
             total_bytes: known.as_ref().map_or(9_400_000_000, |m| m.file_bytes),
             bytes_per_sec: 92 * 1024 * 1024,
             resume_from: 0,
@@ -530,6 +757,65 @@ impl ServeStats for StubServeStats {
             active_requests: 1 + (tick % 3) as u32,
             kv_utilisation: 0.62 + 0.22 * (phase * 0.4).sin(),
             expert_hit_rate: 0.87 + 0.04 * (phase * 0.7).sin(),
+        }
+    }
+}
+
+/// Bare cards for tests that only care about one or two fields.
+#[cfg(test)]
+pub mod testing {
+    use super::ModelCard;
+
+    /// A card with nothing in it but a handle and a quantisation.
+    ///
+    /// For tests about naming and layout, where every other field is noise. Anything that
+    /// plans against a card wants [`super::StubCatalog`] instead: the numbers here are zero,
+    /// and a zeroed footprint is rejected by the planner rather than mis-planned.
+    pub fn card(id: &str, quant: &str) -> ModelCard {
+        ModelCard {
+            id: id.to_string(),
+            repo: None,
+            file: Some(format!("{id}.gguf")),
+            quant: quant.to_string(),
+            file_bytes: 0,
+            parameters: 0,
+            dense_weights_bytes: 0,
+            per_expert_bytes: 0,
+            per_expert_bytes_uniform: true,
+            expert_slots_total: 0,
+            expert_slots_active: 0,
+            experts_per_block: 0,
+            active_experts_per_block: 0,
+            moe_blocks: 0,
+            kv_bytes_per_token: 0,
+            trained_context_tokens: 0,
+            local: true,
+            measured: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_footer_marker_cannot_drift_from_the_note_it_abbreviates() {
+        // The failure this guards against already happened once: a hardcoded provenance
+        // sentence outlived the thing it described and began telling users a real backend was
+        // a fixture. Checking the short form against the long one makes the pair maintainable
+        // by making it impossible to update only half.
+        for sources in [Sources::real(std::path::PathBuf::new()), Sources::stub()] {
+            assert!(sources.stubbed, "both of these still have a fixture in them");
+            for word in
+                sources.stub_parts.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 3)
+            {
+                assert!(
+                    sources.stub_note.contains(word),
+                    "the footer says `{word}` and the note does not: {:?}",
+                    sources.stub_note
+                );
+            }
         }
     }
 }

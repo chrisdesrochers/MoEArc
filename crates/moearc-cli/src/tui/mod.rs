@@ -40,7 +40,8 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
-    let mut m = Model::new(cli.ctx, sources.stubbed);
+    let mut m = Model::new(cli.ctx, sources.stubbed.then_some(sources.stub_parts));
+    m.catalog_location = sources.models.location();
     let mut pending = vec![Action::Detect];
 
     // Each subcommand opens on its own screen. That is the other half of the mapping in
@@ -128,6 +129,17 @@ fn perform(action: Action, sources: &Sources, m: &mut Model) -> Vec<Msg> {
             match sources.models.curated() {
                 Ok(c) => out.push(Msg::Catalog(c)),
                 Err(e) => out.push(Msg::Failed(format!("{e:#}"))),
+            }
+            // A file that could not be read is the difference between "you have no models"
+            // and "one of your models is a truncated download". The plain renderer lists them
+            // in full; here there is one line, so it says how many and names them.
+            let unreadable = sources.models.skipped();
+            if !unreadable.is_empty() {
+                out.push(Msg::Failed(format!(
+                    "could not read {} file(s) in the model directory — {}",
+                    unreadable.len(),
+                    unreadable.join("; ")
+                )));
             }
             out
         }

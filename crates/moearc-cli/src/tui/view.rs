@@ -17,7 +17,7 @@ use ratatui::widgets::{
 use throbber_widgets_tui::{Throbber, symbols::throbber};
 
 use super::model::{Model, Screen};
-use crate::fit::{Fit, FitOutcome};
+use crate::fit::{Columns, Fit, FitOutcome};
 use crate::format;
 use crate::source::{DeviceRow, ModelCard, Verdict};
 use crate::theme;
@@ -96,11 +96,12 @@ fn footer_line(m: &Model) -> Paragraph<'_> {
     }
     if let Some(status) = &m.status {
         spans.push(Span::styled(format!("   ⚠ {status}"), Style::new().fg(theme::BAD)));
-    } else if m.stubbed {
-        // Provenance, permanently visible. Everything on screen is fixture data until the
-        // device and model backends are wired, and a number that looks measured and is not
-        // is worse than a blank panel.
-        spans.push(Span::styled("   stub data", Style::new().fg(theme::FAINT)));
+    } else if let Some(parts) = m.provenance {
+        // Provenance, permanently visible — and *specific*. It used to read "stub data" for
+        // everything, which was right when everything was. Now that the device table and the
+        // model list are read off this machine, a blanket marker would label measurements as
+        // fixtures, and under-claiming is no more honest than over-claiming.
+        spans.push(Span::styled(format!("   {parts}"), Style::new().fg(theme::FAINT)));
     }
     Paragraph::new(Line::from(spans))
 }
@@ -234,12 +235,27 @@ fn fit_panel(m: &Model) -> Paragraph<'_> {
         Some(ctx) => format!("What will fit at {} ctx", format::count(ctx as i64)),
         None => "What will fit".to_string(),
     };
+    let cols = Columns::of(&m.models);
     let mut lines = Vec::new();
     for (card, fit) in m.models.iter().zip(&m.fits) {
-        lines.push(fit_line(card, fit));
+        lines.push(fit_line(card, fit, cols));
     }
     if lines.is_empty() {
-        lines.push(Line::styled("No models in the catalog yet.", theme::subtle()));
+        // Where it looked, not just that it found nothing. `docs/ux.md` rules out an error
+        // that reports a symptom without naming the cause, and the cause is nearly always
+        // that the files are in a different directory.
+        lines.push(Line::styled(
+            m.catalog_location.as_ref().map_or_else(
+                || "No models in the catalog yet.".to_string(),
+                |dir| format!("No GGUF files in {dir}"),
+            ),
+            theme::subtle(),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Point moearc at them with --models-dir <DIR>, or set MOEARC_MODELS.",
+            Style::new().fg(theme::FAINT),
+        ));
     } else {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -247,6 +263,13 @@ fn fit_panel(m: &Model) -> Paragraph<'_> {
              behind them is provisional, not measured on Arc.",
             Style::new().fg(theme::WARN),
         ));
+        if m.fits.iter().any(Fit::context_at_floor) {
+            lines.push(Line::styled(
+                "A context at the minimum is not the card's limit — experts took everything \
+                 above it. Ask for a longer one with --ctx and it trades slots back.",
+                theme::subtle(),
+            ));
+        }
     }
     Paragraph::new(lines).wrap(Wrap { trim: true }).block(
         theme::panel(title).title_bottom(
@@ -256,7 +279,13 @@ fn fit_panel(m: &Model) -> Paragraph<'_> {
     )
 }
 
-fn fit_line<'a>(card: &'a ModelCard, fit: &Fit) -> Line<'a> {
+/// One row of "what will fit".
+///
+/// The widths come from [`Columns`], which the plain renderer uses too. They used to be
+/// constants, and constants were fine for fixtures with thirteen-character handles: a real
+/// directory produced rows that ran past the panel border, on the one screen the whole tool is
+/// judged by.
+fn fit_line<'a>(card: &'a ModelCard, fit: &Fit, cols: Columns) -> Line<'a> {
     let (mark, style) = if fit.fits() {
         ("✓", Style::new().fg(theme::GOOD))
     } else {
@@ -264,9 +293,12 @@ fn fit_line<'a>(card: &'a ModelCard, fit: &Fit) -> Line<'a> {
     };
     Line::from(vec![
         Span::styled(format!("{mark} "), style),
-        Span::styled(format!("{:<20}", card.id), theme::text()),
-        Span::styled(format!("{:<10}", card.quant), theme::subtle()),
-        Span::styled(format!("{:>10}  ", format::bytes(card.file_bytes)), theme::subtle()),
+        Span::styled(format!("{:<w$} ", card.id, w = cols.id), theme::text()),
+        Span::styled(format!("{:<w$} ", card.quant, w = cols.quant), theme::subtle()),
+        Span::styled(
+            format!("{:>w$}  ", format::bytes(card.file_bytes), w = cols.size),
+            theme::subtle(),
+        ),
         Span::styled(fit.summary(), if fit.fits() { theme::text() } else { theme::subtle() }),
     ])
 }
@@ -285,11 +317,12 @@ fn models_screen(m: &Model, f: &mut Frame, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(5)])
         .areas(left);
 
+    let cols = Columns::of(&m.models);
     let items: Vec<ListItem> = m
         .models
         .iter()
         .zip(m.fits.iter().map(Some).chain(std::iter::repeat(None)))
-        .map(|(card, fit)| ListItem::new(model_list_line(card, fit)))
+        .map(|(card, fit)| ListItem::new(model_list_line(card, fit, cols)))
         .collect();
     let mut state = ListState::default().with_selected(Some(m.model_row));
     f.render_stateful_widget(
@@ -305,7 +338,7 @@ fn models_screen(m: &Model, f: &mut Frame, area: Rect) {
     f.render_widget(model_detail(m), right);
 }
 
-fn model_list_line<'a>(card: &'a ModelCard, fit: Option<&Fit>) -> Line<'a> {
+fn model_list_line<'a>(card: &'a ModelCard, fit: Option<&Fit>, cols: Columns) -> Line<'a> {
     // `docs/ux.md`: a model we have not run does not get a green checkmark. The three states
     // are distinguished by glyph as well as colour, so the distinction survives a pipe.
     let (mark, style) = match (card.measured, fit.is_some_and(Fit::fits)) {
@@ -315,7 +348,7 @@ fn model_list_line<'a>(card: &'a ModelCard, fit: Option<&Fit>) -> Line<'a> {
     };
     Line::from(vec![
         Span::styled(format!("{mark} "), style),
-        Span::styled(format!("{:<20}", card.id), theme::text()),
+        Span::styled(format!("{:<w$} ", card.id, w = cols.id), theme::text()),
         Span::styled(if card.local { "local" } else { "remote" }, theme::subtle()),
     ])
 }
@@ -341,14 +374,27 @@ fn model_detail(m: &Model) -> Paragraph<'_> {
         return Paragraph::new(Line::styled("No model selected.", theme::subtle()))
             .block(theme::panel("Detail"));
     };
-    let mut lines = vec![
-        theme::field("repo", Span::styled(card.repo.as_str(), theme::text()), LABEL_W),
+    let mut lines = Vec::new();
+    // A repo id when we have one, the file when we do not — never a field labelled "repo"
+    // holding something a user cannot paste into `moearc pull`.
+    if let Some(repo) = &card.repo {
+        lines.push(theme::field("repo", Span::styled(repo.as_str(), theme::text()), LABEL_W));
+    }
+    if let Some(file) = &card.file {
+        lines.push(theme::field("file", Span::styled(file.as_str(), theme::subtle()), LABEL_W));
+    }
+    lines.extend([
         theme::field("quantisation", card.quant.clone(), LABEL_W),
-        theme::field("parameters", format!("{} active", card.params()), LABEL_W),
+        theme::field("parameters", card.params(), LABEL_W),
         theme::field("download", format::bytes(card.file_bytes), LABEL_W),
+        theme::field("experts", card.experts(), LABEL_W),
+        // The number residency is counted in, next to the number the model is described by,
+        // because 4,608 slots and 128 experts are both true and only one of them is the plan's
+        // denominator.
+        theme::field("slots", card.slots(), LABEL_W),
         theme::field(
-            "experts",
-            format!("{} of {} per token", card.experts_active, card.experts_total),
+            "trained ctx",
+            format!("{} tok", format::count(card.trained_context_tokens as i64)),
             LABEL_W,
         ),
         theme::field(
@@ -361,7 +407,7 @@ fn model_detail(m: &Model) -> Paragraph<'_> {
             LABEL_W,
         ),
         Line::raw(""),
-    ];
+    ]);
 
     match m.selected_fit().map(|f| &f.outcome) {
         Some(FitOutcome::Fits { rationale, .. }) => {
@@ -376,8 +422,10 @@ fn model_detail(m: &Model) -> Paragraph<'_> {
                 lines.push(Line::styled(format!("· {step}"), theme::subtle()));
             }
         }
-        Some(FitOutcome::DoesNotFit { reason }) => {
-            lines.push(Line::styled("Will not fit on this card", Style::new().fg(theme::BAD)));
+        Some(FitOutcome::DoesNotFit { headline, reason }) => {
+            // The glyph carries the emphasis the capital used to.  is one string
+            // used in a table cell and here, and two spellings of it would drift.
+            lines.push(Line::styled(format!("✗ {headline}"), Style::new().fg(theme::BAD)));
             lines.push(Line::raw(""));
             lines.push(Line::styled(reason.clone(), theme::subtle()));
         }
@@ -408,7 +456,11 @@ fn split_fields(outcome: &FitOutcome) -> Vec<Line<'static>> {
         theme::field(
             "residency",
             format!(
-                "{resident_experts} / {total_experts}  ({})",
+                // Separated to match the row in "What will fit". Four thousand six hundred
+                // and eight is the sort of number a reader compares by eye, once.
+                "{} / {}  ({})",
+                format::count(*resident_experts as i64),
+                format::count(*total_experts as i64),
                 format::percent(*resident_experts as i64, *total_experts as i64)
             ),
             LABEL_W,
@@ -539,7 +591,7 @@ fn serving_screen(m: &Model, f: &mut Frame, area: Rect) {
     ];
     match &s.fit.outcome {
         FitOutcome::Fits { .. } => server.extend(split_fields(&s.fit.outcome)),
-        FitOutcome::DoesNotFit { reason } => {
+        FitOutcome::DoesNotFit { reason, .. } => {
             server.push(Line::styled(reason.clone(), Style::new().fg(theme::BAD)))
         }
     }
@@ -715,8 +767,8 @@ mod tests {
     use super::snapshot::{frame, show};
     use super::*;
     use crate::source::{
-        CpuOnlyCause, DeviceReport, ModelCatalog, ServeStats, StubCatalog, StubServeStats,
-        StubTransfers, TransferSource,
+        CpuOnlyCause, DeviceReport, DeviceSource, ModelCatalog, ServeStats, StubCatalog,
+        StubDeviceSource, StubServeStats, StubTransfers, TransferSource,
     };
     use crate::tui::model::{Msg, Serving, update};
 
@@ -725,6 +777,21 @@ mod tests {
 
     fn loaded() -> Model {
         crate::tui::model::tests::loaded()
+    }
+
+    /// The interface holding the four real GGUF files, planned against the reference card.
+    ///
+    /// The rows are wider than the fixtures in every column that has one — a 25-character
+    /// handle, a 59 GiB file, a five-digit slot count — which is the point. See
+    /// [`StubCatalog::as_measured`].
+    fn measured() -> Model {
+        let mut m = Model::new(
+            None,
+            Some(crate::source::Sources::real(std::path::PathBuf::new()).stub_parts),
+        );
+        update(&mut m, Msg::Detected(StubDeviceSource.detect().unwrap()));
+        update(&mut m, Msg::Catalog(StubCatalog::as_measured()));
+        m
     }
 
     #[test]
@@ -738,7 +805,10 @@ mod tests {
         assert!(dump.contains("is ready"), "the verdict line, not just a table");
         assert!(dump.contains("What will fit"));
         assert!(dump.contains("╭") && dump.contains("╮"), "rounded borders, per docs/ux.md");
-        assert!(dump.contains("stub data"), "provenance is always on screen");
+        assert!(
+            dump.contains(crate::source::Sources::stub().stub_parts),
+            "provenance is always on screen, and says which parts"
+        );
     }
 
     #[test]
@@ -808,7 +878,7 @@ mod tests {
         m.model_row = 3; // qwen3-235b-a22b
         let dump = frame(&m, W, H);
         show("moearc info — a model that will not fit", &dump);
-        assert!(dump.contains("Will not fit on this card"));
+        assert!(dump.contains("will not fit"), "the headline names why there is no plan");
         // The engine names the shortfall and a way out; "out of memory" would not.
         assert!(dump.contains("quantisation"), "the miss should say what would fix it");
     }
@@ -920,14 +990,120 @@ mod tests {
     }
 
     #[test]
+    fn every_real_model_keeps_its_whole_row_on_one_line() {
+        // The regression this file already caught four of: a column sized for a fixture and
+        // overrun by real data. `olmoe-1b-7b-0924-instruct` is twice the handle
+        // `gpt-oss-20b` is, `qwen3.6-35b-a3b-ud` has 10,240 residency slots where the fixture
+        // has 128, and this is the screen the tool is judged by.
+        //
+        // Asserted per line, not per dump: a wrapped row still puts every substring somewhere
+        // in the frame, and wrapping is the failure being tested for.
+        for width in [100, 120, 160] {
+            let m = measured();
+            let dump = frame(&m, width, 36);
+            show(&format!("moearc — real models at {width} columns"), &dump);
+            assert!(
+                !dump.contains("stub data"),
+                "the device table and the model list are read from the machine; a blanket \
+                 fixture marker over them under-claims, which is its own kind of wrong"
+            );
+            for (card, fit) in m.models.iter().zip(&m.fits) {
+                let row = dump
+                    .lines()
+                    .find(|l| l.contains(card.id.as_str()))
+                    .unwrap_or_else(|| panic!("no row for {} at width {width}", card.id));
+                for part in [&card.quant, &format::bytes(card.file_bytes), &fit.summary()] {
+                    assert!(
+                        row.contains(part.as_str()),
+                        "`{part}` is not on {}'s row at width {width}: {row:?}",
+                        card.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_five_times_the_size_of_the_card_reports_its_residency_rather_than_refusing() {
+        // The whole thesis on one line: a 59 GiB model on an 11 GiB card, with the fraction
+        // actually resident stated. Hiding the fraction would make the claim prettier and
+        // unverifiable; it is the number that makes it credible.
+        let m = measured();
+        let card = &m.models[0];
+        assert_eq!(card.id, "gpt-oss-120b", "the largest model sorts first");
+        let fit = &m.fits[0];
+        let FitOutcome::Fits { resident_experts, total_experts, .. } = fit.outcome else {
+            panic!("a 59 GiB model must plan, not bail: {:?}", fit.outcome)
+        };
+        assert_eq!(total_experts, 4_608, "36 MoE blocks x 128 experts, not 128");
+        assert!(
+            resident_experts > card.expert_slots_active && resident_experts < total_experts,
+            "a partial residency is the interesting case: {resident_experts} of {total_experts}"
+        );
+        let dump = frame(&m, 100, 36);
+        assert!(dump.contains("59.0 GiB"));
+        assert!(dump.contains(&fit.summary()), "the residency figure reaches the screen");
+    }
+
+    #[test]
+    fn the_detail_pane_names_the_slot_count_the_plan_is_denominated_in() {
+        // 128 experts and 4,608 slots are both true, and only one of them is the denominator
+        // of the residency figure two lines below it.
+        let mut m = measured();
+        m.screen = Screen::Models;
+        m.model_row = 0;
+        let dump = frame(&m, 120, 36);
+        show("moearc ls — a real model's detail", &dump);
+        assert!(dump.contains("128 per block, 4 routed"), "the model's own geometry");
+        assert!(dump.contains("4,608 across 36 blocks"), "and what residency counts");
+        assert!(dump.contains("gpt-oss-120b-MXFP4.gguf"), "the file it was read from");
+    }
+
+    #[test]
+    fn a_context_the_model_cannot_use_is_never_offered() {
+        // olmoe is a 4,096-token model and this card has room for eleven times that. The
+        // number on screen is a claim about the model, so it stops where the model does.
+        let m = measured();
+        let (card, fit) = m
+            .models
+            .iter()
+            .zip(&m.fits)
+            .find(|(c, _)| c.id.starts_with("olmoe"))
+            .expect("olmoe is in the measured set");
+        assert_eq!(card.trained_context_tokens, 4_096);
+        let FitOutcome::Fits { context_tokens, ceiling_tokens, .. } = fit.outcome else {
+            panic!("olmoe fits comfortably")
+        };
+        assert!(context_tokens <= 4_096, "{context_tokens} tokens is more than it was trained for");
+        assert!(
+            ceiling_tokens.is_none_or(|c| c <= 4_096),
+            "the ceiling is held to the same limit, or it re-tells the same lie"
+        );
+        assert!(frame(&m, 120, 36).contains("4,096 ctx"));
+    }
+
+    #[test]
+    fn an_empty_model_directory_says_where_it_looked() {
+        let mut m = Model::new(None, None);
+        m.catalog_location = Some("/srv/models".to_string());
+        update(&mut m, Msg::Detected(StubDeviceSource.detect().unwrap()));
+        update(&mut m, Msg::Catalog(Vec::new()));
+        let dump = frame(&m, 100, 30);
+        show("moearc — nothing in the model directory", &dump);
+        assert!(dump.contains("/srv/models"), "the directory is the cause, not a detail");
+        assert!(dump.contains("--models-dir"), "and there is one thing to do about it");
+    }
+
+    #[test]
     fn every_screen_survives_a_terminal_too_small_to_hold_it() {
         // Ratatui panics on out-of-bounds writes, so a cramped terminal is a crash risk in
         // exactly the situation where a crash is least excusable: a split pane.
-        let mut m = loaded();
-        for screen in [Screen::Devices, Screen::Models, Screen::Download, Screen::Serving] {
-            m.screen = screen;
-            for (w, h) in [(20, 6), (40, 10), (200, 60)] {
-                let _ = frame(&m, w, h);
+        for mut m in [loaded(), measured()] {
+            for screen in [Screen::Devices, Screen::Models, Screen::Download, Screen::Serving] {
+                m.screen = screen;
+                for (w, h) in [(20, 6), (40, 10), (200, 60)] {
+                    let _ = frame(&m, w, h);
+                }
             }
         }
     }
