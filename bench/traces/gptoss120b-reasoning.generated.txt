@@ -1,0 +1,15 @@
+We need to parse problem. Freight train leaves station A at 6:00 traveling at 40 km/h towards B (presumably). Passenger train leaves station B (300 km away from A) at 7:30 traveling towards A at 90 km/h. There's a single siding 180 km from A (i.e., at distance 180 km from A along the line, presumably between A and B). The siding can hold one train. We need to determine whether the trains can pass without a collision, at what time and place they would meet on open track, and what the latest departure time from B would be for the passenger train to reach A without the freight ever having to wait more than twenty minutes in the siding. Show reasoning.
+
+Interpretation: Freight from A to B, passenger from B to A. The line is single track except a siding at 180 km from A (i.e., 120 km from B). The siding can hold one train at a time, presumably to allow passing.
+
+We need to consider that they could meet on open track (i.e., not at siding) if timing works out; else one may need to wait in siding for up to 20 min.
+
+First part: "Work out, step by step, whether the trains can pass without a collision, at what time and place they would meet on open track". This suggests we compute if they would meet before the siding, etc. Let's compute positions as functions of time.
+
+Set t = time in hours after 6:00 (so t=0 at 6:00). Freight leaves A at t=0, speed v_f = 40 km/h. Its position from A: x_f = 40 t (km) (0 ≤ x_f ≤ 300). Passenger leaves B at 7:30, which is 1.5 hours after 6:00, so passenger departure time t_p0 = 1.5 h. Speed v_p = 90 km/h towards A, i.e., decreasing distance from A. Its position from A: x_p = 300 - 90 (t - 1.5) for t ≥ 1.5. For t < 1.5, passenger not yet started, but we can treat as not moving.
+
+Find meeting time solving x_f = x_p.
+
+Set 40 t = 300 - 90 (t - 1.5) for t ≥ 1.5.
+
+Compute: RHS = 300 - 90 t +

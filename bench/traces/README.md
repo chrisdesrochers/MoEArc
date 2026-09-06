@@ -200,3 +200,88 @@ over 192 steps, which costs nothing while almost everything fits and costs 6 poi
 
 Note also that an engine run is 197 steps — 5 prompt tokens decoded one at a time, then 192 —
 where the trace file holds the 192 decode steps only.
+
+---
+
+# gpt-oss traces — the engine's own geometry
+
+Added 2026-09-06 for `bench/policy-sweep.md`. Everything above is Qwen; **these are the model
+MoEArc's published baselines are measured on**, so a residency result taken from them needs no
+transfer argument.
+
+| | gpt-oss-120B | gpt-oss-20B |
+|---|---|---|
+| File | `gpt-oss-120b-MXFP4.gguf` | `gpt-oss-20b-MXFP4.gguf` |
+| Architecture | `gpt-oss`, **36 blocks, all MoE, 128 experts, 4 active ⇒ 144 activations/token** | **24 blocks, 32 experts, 4 active ⇒ 96 activations/token** |
+| Quantisation | MXFP4 | MXFP4 |
+| Expert footprint | **12.607 MiB** (`bench/README.md`) | — |
+| Decode steps | **512** | **1024** |
+| Prompts | `prompts/gptoss120b-*.txt` | `prompts/gptoss20b-*.txt` |
+| llama.cpp | `e107984bcffcfd701e82738092a2b000b6fda7a2` + `llama.cpp-eval-callback-moearc.patch` | same |
+| Backend | CPU (`-ngl 0`), `-t 6`, `nice -n 19`, `ionice -c3` | same |
+| Sampling | `--temp 0.7 --top-k 20 --top-p 0.8`, seed **20260906** (prose) / **20260904** (code, reasoning) | seed 20260904 |
+| Captured | 2026-09-06 UTC | 2026-09-06 UTC |
+
+| trace | working set | as % of model | top 10% of experts hold | step-to-step reuse |
+|---|---:|---:|---:|---:|
+| `gptoss120b-prose` | 2442 / 4608 | 53.0% | 52.4% | 34.3% |
+| `gptoss120b-code` | 3685 / 4608 | 80.0% | 40.9% | 26.0% |
+| `gptoss120b-reasoning` | 3486 / 4608 | 75.7% | 41.7% | 22.7% |
+| `gptoss20b-prose` | 630 / 768 | 82.0% | 34.0% | 46.8% |
+| `gptoss20b-code` | 746 / 768 | 97.1% | 37.8% | 45.8% |
+| `gptoss20b-reasoning` | 710 / 768 | 92.4% | 36.8% | 43.4% |
+
+🔴 **gpt-oss-120B is a much tighter residency problem than anything above.** The engine's 600-slot
+pool is **13.0%** of its 4608 experts, where Qwen3.5's 3976 slots are **38.8%** of 10240; and
+step-to-step reuse is **22.7–34.3%** against Qwen's 35.5–47.1%, because four active experts per
+block overlap the previous token less than eight do. Conclusions carried from the Qwen tables into
+this regime will be optimistic.
+
+## Capture — not via `capture.sh`
+
+`capture.sh` hardcodes `-t 20`, `"quantisation":"Q4_K_M"` and `"n_expert":256` into the header,
+all three wrong for these models, so a separate driver was used with the same binary, the same
+patch and the same conventions. It differs only in threads (6, to leave a concurrent GPU
+measurement on the same host alone), the header metadata, and a `SEED` override.
+
+⚠️ **Chat template.** gpt-oss uses **harmony**, not ChatML, so these prompts are not the `prose.txt`
+/ `code.txt` / `reasoning.txt` above:
+
+```
+<|start|>system<|message|>You are a helpful assistant. Reasoning: low<|end|>
+<|start|>user<|message|>…<|end|><|start|>assistant<|channel|>final<|message|>
+```
+
+`reasoning` uses `Reasoning: high` and opens the **`analysis`** channel instead, which is how the
+third content type stays genuinely distinct — the same trap the Qwen set documents with `<think>`.
+
+🔴 **The gpt-oss-120B prose prompt is prefilled and that is load-bearing.** With the plain prompt
+the 120B model **refuses the length**: three attempts produced 512 steps of degenerate
+`... ... ...`, then `... (the rest of the essay... )` followed by EOG at **10** and at **21**
+decode steps. The degenerate 512-step capture was **discarded, not used** — routing through a
+collapsed token loop is not a decode trace of anything. The committed file prefills the assistant's
+`final` channel with an opening clause (`"The story of lighthouse building around the North
+Atlantic begins"`) and adds an explicit no-placeholder instruction, which produces real continuous
+prose for the full 512 steps. The exact prompt is in the trace header, as always. The 20B model
+needed none of this — **the same prompt is not equally answerable by two models of the same
+family**, and a capture script that does not check its own output would have silently produced
+a worthless trace.
+
+```sh
+MOEARC_TRACE_OUT=bench/traces/gptoss120b-prose \
+MOEARC_TRACE_META='…' \
+MOEARC_TEXT_OUT=bench/traces/gptoss120b-prose.generated.txt \
+nice -n 19 ionice -c3 llama-eval-callback \
+  -m /zfs/swift/models/gpt-oss-120b-MXFP4.gguf -ngl 0 \
+  -f bench/traces/prompts/gptoss120b-prose.txt -n 512 \
+  -t 6 -c 4096 -b 2048 -ub 512 --temp 0.7 --top-k 20 --top-p 0.8 --seed 20260906
+```
+
+`llama-eval-callback` needs `source /opt/intel/oneapi/setvars.sh` on this host or it fails to find
+`libsvml.so`.
+
+## Measured results
+
+See **`bench/policy-sweep.md`** — nine policies plus Belady, nine capacities, on these traces and
+the Qwen ones. Headline: at the engine's 600 slots, LRU reaches 54.6–72.8% against Belady's
+75.0–85.6%, and no online policy tested closes more than a quarter of that gap.

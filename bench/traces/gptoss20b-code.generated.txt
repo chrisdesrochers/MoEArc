@@ -1,0 +1,124 @@
+```rust
+//! A self‑contained, heavily commented implementation of a red‑black tree in Rust.
+//! The code is intentionally verbose to aid understanding and is written in a
+//! single file so it can be copied straight into a Rust project.
+//!
+//! Features:
+//! - Node representation with color, key, value, and child/parent pointers.
+//! - Full insertion with rebalancing (cases 1‑3 from CLRS).
+//! - Full deletion with rebalancing (cases 1‑5 from CLRS).
+//! - In‑order iterator that implements `Iterator`.
+//! - `Debug` implementation that prints the tree in a readable format.
+//! - A module of unit tests that exercise insertion, deletion, and invariants.
+
+use std::cell::RefCell;
+use std::fmt;
+use std::rc::{Rc, Weak};
+
+/// A convenient alias for a reference counted, mutable node.
+type NodeRef<K, V> = Rc<RefCell<Node<K, V>>>;
+
+/// The color of a node in a red‑black tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Color {
+    Red,
+    Black,
+}
+
+/// Representation of a node in the tree.
+/// The tree is generic over a key `K` and a value `V`.  The key must
+/// implement `Ord` so that it can be compared to other keys.
+struct Node<K, V> {
+    key: K,
+    value: V,
+    color: Color,
+    left: Option<NodeRef<K, V>>,
+    right: Option<NodeRef<K, V>>,
+    parent: Option<Weak<RefCell<Node<K, V>>>>,
+}
+
+impl<K, V> Node<K, V> {
+    /// Create a new node that is initially red.
+    fn new(key: K, value: V, parent: Option<Weak<RefCell<Node<K, V>>>>) -> NodeRef<K, V> {
+        Rc::new(RefCell::new(Node {
+            key,
+            value,
+            color: Color::Red,
+            left: None,
+            right: None,
+            parent,
+        }))
+    }
+
+    /// Helper to get the color of a node.  A `None` pointer is treated as black.
+    fn color_of(node: &Option<NodeRef<K, V>>) -> Color {
+        node.as_ref()
+            .map(|n| n.borrow().color)
+            .unwrap_or(Color::Black)
+    }
+
+    /// Helper to get the grandparent of a node.
+    fn grandparent(node: &NodeRef<K, V>) -> Option<NodeRef<K, V>> {
+        node.borrow()
+            .parent
+            .as_ref()
+            .and_then(|wp| wp.upgrade())
+            .and_then(|p| p.borrow().parent.as_ref().and_then(|wp| wp.upgrade()))
+    }
+
+    /// Helper to get the sibling of a node.
+    fn sibling(node: &NodeRef<K, V>) -> Option<NodeRef<K, V>> {
+        let parent = node.borrow().parent.as_ref()?.upgrade()?;
+        if Rc::ptr_eq(&parent.borrow().left.as_ref()?, node) {
+            parent.borrow().right.clone()
+        } else {
+            parent.borrow().left.clone()
+        }
+    }
+
+    /// Helper to get the uncle of a node.
+    fn uncle(node: &NodeRef<K, V>) -> Option<NodeRef<K, V>> {
+        Node::sibling(&node.borrow().parent.as_ref()?.upgrade()?)
+    }
+
+    /// Helper to get the other child of a node (the child that is not the given one).
+    fn other_child(node: &NodeRef<K, V>, child: &NodeRef<K, V>) -> Option<NodeRef<K, V>> {
+        if Rc::ptr_eq(&node.borrow().left.as_ref()?, child) {
+            node.borrow().right.clone()
+        } else {
+            node.borrow().left.clone()
+        }
+    }
+}
+
+/// The main red‑black tree structure.
+/// It contains a root pointer and a size counter.
+pub struct RBTree<K, V> {
+    root: Option<NodeRef<K, V>>,
+    size: usize,
+}
+
+impl<K: Ord, V> RBTree<K, V> {
+    /// Create an empty tree.
+    pub fn new() -> Self {
+        RBTree { root: None, size: 0 }
+    }
+
+    /// Return the number of nodes in the tree.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Check whether the tree is empty.
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Find a node with a given key.  Returns `None` if not found.
+    pub fn get(&self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let mut node = self.root.clone();
+        while let Some(n) = node {
+            let n

@@ -1,0 +1,65 @@
+```rust
+// ===========================
+//  Red‑Black Tree in Rust
+// ===========================
+//
+// This file contains a *single* module that implements a generic
+// red‑black tree (`RBTree<K, V>`) with the following features:
+//
+//   * Node representation using a `Box` and raw pointers for parent links.
+//   * Insertion with the classic rebalancing cases (uncle red / black).
+//   * Deletion with full rebalancing (including the “double black” cases).
+//   * An in‑order iterator that implements `Iterator<Item = (&K, &V)>`.
+//   * `Debug` implementation that prints the tree in a human readable way.
+//   * A comprehensive test suite exercising insertion, deletion and the
+//     red‑black invariants.
+//
+// The implementation is intentionally verbose and heavily commented so that
+// every step of the algorithm is clear.  The code is written for educational
+// purposes and does **not** aim for ultimate performance or ergonomics.
+//
+// The tree stores keys that implement `Ord` and values of any type.
+//
+// ---------------------------------------------------------------------------
+
+#![allow(dead_code)] // Some helper functions are only used in tests.
+
+// ---------------------------------------------------------------------------
+// Imports
+// ---------------------------------------------------------------------------
+use std::cmp::Ordering;
+use std::fmt::{self, Debug, Formatter};
+use std::ptr::NonNull;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// A red‑black tree mapping keys of type `K` to values of type `V`.
+pub struct RBTree<K, V> {
+    root: Link<K, V>,
+    len: usize,
+}
+
+// A nullable pointer to a node. `None` represents a leaf (NIL) node.
+type Link<K, V> = Option<NonNull<Node<K, V>>>;
+
+/// The colour of a node.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Color {
+    Red,
+    Black,
+}
+
+/// A node in the red‑black tree.
+///
+/// The node is allocated on the heap (`Box<Node<...>>`) and referenced by
+/// raw pointers (`NonNull`).  Raw pointers are required because a node needs
+/// a mutable reference to its parent while we also hold mutable references to
+/// its children during rebalancing.  All pointer dereferences are done inside
+/// `unsafe` blocks, but the unsafe code is isolated and carefully documented.
+struct Node<K, V> {
+    key: K,
+    value: V,
+    color: Color,
+    left: Link<K,

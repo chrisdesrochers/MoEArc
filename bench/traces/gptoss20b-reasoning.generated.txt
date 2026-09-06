@@ -1,0 +1,17 @@
+We need to analyze two trains on same track. Freight train leaves A at 6:00 at 40 km/h. Passenger leaves B at 7:30 at 90 km/h towards A. There is a single siding 180 km from A that can hold one train. We need to determine if they can pass without collision, at what time and place they'd meet on open track, and the latest departure time from B such that passenger reaches A and freight doesn't wait more than 20 minutes in siding.
+
+We need to find meeting point on open track if no siding used. But there is siding 180 km from A. Let's analyze.
+
+Let distance between stations A and B: 300 km.
+
+Freight train: speed v_f = 40 km/h, leaving A at t=6:00. Passenger train: speed v_p = 90 km/h, leaving B at t=7:30.
+
+We need to find if they would collide on main track if they both travel without siding. That means we need to see if their paths cross before one passes the other.
+
+Let time variable t in hours from 6:00. Freight train position from A: x_f(t) = 40 t km. Passenger train position from B (which is 300 km from A). So passenger train's position from A: x_p(t) = 300 - 90 (t - 1.5) because departure at 7:30 = 1.5 hours after 6:00. Actually t in hours from 6:00. So passenger train starts at t=1.5. For t < 1.5, passenger hasn't started. For t >= 1.5, x_p(t) = 300 - 90 (t - 1.5) = 300 - 90 t + 135 = 435 - 90 t. Wait 300 - 90(t-1.5) = 300 - 90t + 135 = 435 - 90t. Yes.
+
+We need to find t when x_f(t) = x_p(t). Solve 40t = 435 - 90t => 130t = 435 => t = 435/130 = 3.346153846... hours after 6:00. That's 3.346 h = 3 h + 0.346 h. 0.346 h * 60 = 20.77 min. So 3h20.77min after 6:00. That is 9:20.77? Wait 6:00 + 3h20.77min = 9:20.77? Actually 6 + 3h = 9, plus 20.77min -> 9:20.77. So about 9:20:46? Actually 0.77 min = 0.77*60 = 46.2 sec. So 9:20:46.
+
+Position at meeting: x_f = 40t = 40*3.34615 = 133.846 km from A. So about 133.85 km from A, or 166.15 km from B (since total 300). So they'd meet on open track at 9:20:46.
+
+Now check if that is before freight passes the siding at 180 km from A? Freight passes 180 km at time t_f_siding = 180/40 = 4.5 h after 6:00 = 10:30. So freight will be at siding at 10:30. The passenger train will have reached A earlier? Let's compute passenger arrival at A: time to travel 300 km at 90 km/h = 3.3333 h. Starting at 7:30, arrival at 10:33:20? Wait 7:30 + 3h 20m = 10:50? Actually 3h20m after 7:30 is 10:50. Let's compute precisely: 300/90 = 3.3333 h = 3h20m. So arrival at 7:30 + 3h20m = 10:50. So passenger arrives at 10:50 at A. Freight will be at A at time t_f_arrive_A = 300/40 = 7.5 h after 6:00 = 13:30. So freight arrives at 13:30. So freight passes siding at 10:30, passenger passes A at 10:50. So passenger passes freight? Wait freight is still on track from A to B traveling 40 km/h. At 10:30 freight is at 180 km from A. At that time passenger has not yet reached A; passenger is traveling from B to A. They will meet at 9:20:46 at 133.85 km from A. So the freight is ahead of passenger by 180-133.85=46.

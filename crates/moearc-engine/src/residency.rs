@@ -23,7 +23,7 @@
 //! [`Policy::StaticSplit`] models what llama.cpp does, so every measurement has the incumbent
 //! next to it. A number with no baseline is decoration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// One expert, identified by the layer it lives in.
 ///
@@ -237,6 +237,79 @@ pub enum Policy {
     /// no notion of a hit. Modelling it as "every expert in a resident layer hits, every
     /// expert elsewhere misses" is the closest comparable statement.
     StaticSplit { resident_layers: u16 },
+
+    /// Segmented LRU: a probationary segment keeps a one-off touch from displacing the hot set.
+    ///
+    /// A miss enters *probation*; a second reference promotes it to *protected*, and the LRU of
+    /// protected is demoted to the MRU of probation when protected overflows. Eviction always
+    /// takes probation's LRU, so an expert touched once and never again leaves without ever
+    /// having displaced a repeatedly-used one. `protected_pct` is protected's share of capacity,
+    /// clamped to 0..=100.
+    Slru { protected_pct: u8 },
+
+    /// 2Q: a FIFO admission queue, an LRU main queue, and a ghost list of evicted keys.
+    ///
+    /// Differs from [`Policy::Slru`] in that the promotion signal survives eviction — an expert
+    /// pushed out of the admission queue leaves its *key* in `A1out`, and a later reference then
+    /// enters the main queue directly. `kin_pct` sizes the admission queue as a share of
+    /// capacity; `kout_pct` sizes the ghost list, which holds keys only and occupies no slots.
+    TwoQ { kin_pct: u8, kout_pct: u8 },
+
+    /// LRU-K: order by the *K*-th most recent reference rather than the most recent.
+    ///
+    /// One touch stops making an expert look hot; it takes `k` of them. An expert referenced
+    /// fewer than `k` times is evicted before any that has, ordered among themselves by
+    /// recency. `k = 1` is exactly [`Policy::Lru`].
+    LruK { k: u8 },
+
+    /// Pin the hottest experts outright and run LRU over what is left.
+    ///
+    /// Frequency is learned from the first `warmup_steps` steps *only*. A policy that took its
+    /// top-K from the whole trace would be Belady wearing a hat; this one sees exactly what an
+    /// engine sees. After warm-up the pinned set is fixed and never evicted. `pin_pct` is the
+    /// pinned share of capacity, clamped to 0..=95 so eviction can never starve.
+    PinnedHot { pin_pct: u8, warmup_steps: u16 },
+
+    /// LRU counted in *steps*, with ties broken by how soon an expert's block comes round again.
+    ///
+    /// Every policy above orders recency on a per-*reference* clock, and on this access pattern
+    /// that clock is systematically wrong. A step walks the blocks in order, so at the moment
+    /// block `b` of step `t` needs a slot, everything from step `t-1` is older than everything
+    /// from step `t` — and *within* step `t-1`, block 35's experts carry a later stamp than
+    /// block 0's. Recency therefore favours the late blocks. But a late block's experts are
+    /// needed *last* on the next pass, and an early block's are needed *first*: the ordering
+    /// is backwards with respect to when the demand actually arrives.
+    ///
+    /// This policy quantises recency to the step and breaks ties the other way — among experts
+    /// last touched in the same step, the one whose block is furthest round the cycle leaves
+    /// first. It is the only online lookahead available for free: routing is unpredictable, but
+    /// the *schedule* of blocks is fixed and known.
+    ///
+    /// 🔴 **Measured, and it does not work.** On all three gpt-oss-120B decode traces it lands
+    /// within 0.2 points of plain LRU at every capacity from 180 to 1152 slots, and is *worse*
+    /// at the tightest ones (37.6% against LRU's 38.7% on prose at 180 slots). The bias
+    /// described above is real, but correcting it buys nothing: at 600 slots the cache holds
+    /// barely four steps of history, so almost every eviction candidate was last used in a
+    /// different step and the tie-break the policy exists for almost never fires. Kept in the
+    /// enum, with its numbers, so the idea is not re-derived and re-tried a third time. See
+    /// `bench/policy-sweep.md`.
+    PhaseLru,
+
+    /// TinyLFU admission over a segmented-LRU main cache, optionally behind an LRU window.
+    ///
+    /// The only policy here that can decline to keep what it just fetched: the candidate's
+    /// frequency is compared against that of the expert it would displace, and it is admitted
+    /// only if it wins. Counters are halved every `capacity * 10` references, so an expert that
+    /// was hot early is allowed to go cold. `window_pct = 0` is plain TinyLFU; a non-zero window
+    /// is W-TinyLFU, which grants a new expert a few references of grace before it has to win an
+    /// admission contest.
+    ///
+    /// 🔴 **A rejected candidate is still fetched, still charged a miss, and still charged its
+    /// bytes** — it is used and then released rather than retained. In an engine that costs one
+    /// scratch slot above `capacity`, so this policy is modelled with a budget of
+    /// `capacity + 1`. At the real operating point that is 12.6 MiB on top of 7.4 GiB, but it
+    /// is an advantage and it is stated rather than buried.
+    WTinyLfu { window_pct: u8, protected_pct: u8 },
 }
 
 impl Policy {
@@ -246,6 +319,13 @@ impl Policy {
             Self::Lfu => "lfu",
             Self::Optimal => "optimal (belady)",
             Self::StaticSplit { .. } => "static split",
+            Self::Slru { .. } => "slru",
+            Self::TwoQ { .. } => "2q",
+            Self::LruK { .. } => "lru-k",
+            Self::PinnedHot { .. } => "pinned-hot",
+            Self::PhaseLru => "phase-lru",
+            Self::WTinyLfu { window_pct: 0, .. } => "tinylfu",
+            Self::WTinyLfu { .. } => "w-tinylfu",
         }
     }
 }
@@ -380,15 +460,12 @@ pub fn simulate(
         return Ok(stats);
     }
 
-    let next_use = (policy == Policy::Optimal).then(|| NextUse::build(trace));
-
-    let mut resident: Vec<ExpertRef> = Vec::with_capacity(capacity as usize);
-    let mut last_used: HashMap<ExpertRef, u64> = HashMap::new();
-    let mut use_count: HashMap<ExpertRef, u64> = HashMap::new();
+    let mut cache = Cache::new(capacity, policy, trace);
     let mut ever_seen: HashMap<ExpertRef, ()> = HashMap::new();
     let mut clock: u64 = 0;
 
     for (step_idx, step) in trace.steps.iter().enumerate() {
+        cache.cur_step = step_idx;
         // Experts required now, so eviction cannot touch them.
         let mut pinned: Vec<ExpertRef> = step.clone();
         pinned.sort_unstable();
@@ -397,11 +474,11 @@ pub fn simulate(
         for &e in step {
             clock += 1;
             stats.demands += 1;
-            *use_count.entry(e).or_insert(0) += 1;
+            cache.note_access(e, clock);
 
-            if resident.contains(&e) {
+            if cache.member.contains(&e) {
                 stats.hits += 1;
-                last_used.insert(e, clock);
+                cache.on_hit(e, &pinned);
                 continue;
             }
 
@@ -411,52 +488,482 @@ pub fn simulate(
                 stats.compulsory_misses += 1;
             }
 
-            if resident.len() >= capacity as usize {
-                let victim = choose_victim(
-                    &resident,
-                    &pinned,
-                    &last_used,
-                    &use_count,
-                    next_use.as_ref(),
-                    step_idx,
-                    policy,
-                );
-                // Pinning cannot starve eviction: capacity >= peak step demand is checked
-                // above, so at least one resident expert is always unpinned.
-                let victim = victim.expect("capacity >= peak demand guarantees an unpinned slot");
-                resident.retain(|&r| r != victim);
-            }
-            resident.push(e);
-            last_used.insert(e, clock);
+            cache.on_miss(e, &pinned, step_idx);
         }
+
+        cache.end_of_step(step_idx);
     }
 
     Ok(stats)
 }
 
-fn choose_victim(
-    resident: &[ExpertRef],
-    pinned: &[ExpertRef],
-    last_used: &HashMap<ExpertRef, u64>,
-    use_count: &HashMap<ExpertRef, u64>,
-    next_use: Option<&NextUse>,
-    step_idx: usize,
+// ---------------------------------------------------------------------------
+// The cache under test
+// ---------------------------------------------------------------------------
+
+/// Which part of a partitioned cache an expert sits in.
+///
+/// Policies that do not partition put everything in [`Seg::Protected`] and never look at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seg {
+    /// 2Q's `A1in`; W-TinyLFU's admission window.
+    Window,
+    /// SLRU's probationary segment; the front of W-TinyLFU's main cache.
+    Probation,
+    /// SLRU's protected segment; 2Q's `Am`; the whole cache for the unpartitioned policies.
+    Protected,
+}
+
+/// How to order a segment when choosing what leaves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// By last reference — least recently used first.
+    Recency,
+    /// By arrival — first in, first out, regardless of later references.
+    Arrival,
+}
+
+struct Cache {
+    capacity: usize,
     policy: Policy,
-) -> Option<ExpertRef> {
-    // `pinned` is sorted and deduplicated by the caller, so a binary search is exactly
-    // equivalent to `contains` here — and necessary: at the capacities a real card gives
-    // (thousands of slots) a linear scan of the pin list inside a scan of the resident set
-    // makes a full-length trace take hours instead of seconds.
-    let candidates = resident.iter().copied().filter(|r| pinned.binary_search(r).is_err());
-    match policy {
-        Policy::Lru => candidates.min_by_key(|e| last_used.get(e).copied().unwrap_or(0)),
-        Policy::Lfu => candidates.min_by_key(|e| use_count.get(e).copied().unwrap_or(0)),
-        Policy::Optimal => {
-            let nu = next_use.expect("Optimal requires a next-use index");
-            // Furthest next use wins; never-used-again is furthest of all.
-            candidates.max_by_key(|e| nu.after(*e, step_idx).unwrap_or(usize::MAX))
+
+    /// Resident experts in insertion order. Kept as a `Vec` rather than a set because it is the
+    /// tie-break authority: `min_by_key` returns the first minimum in iteration order, so LFU's
+    /// and Belady's ties resolve by how long an expert has been resident. Changing this
+    /// container would silently move every previously recorded number.
+    resident: Vec<ExpertRef>,
+    /// Membership, so the hit test is not a linear scan of `resident`. At the capacities a real
+    /// card gives, that scan is the difference between a sweep taking minutes and taking hours.
+    member: HashSet<ExpertRef>,
+
+    last_used: HashMap<ExpertRef, u64>,
+    /// The reference before last, for `LruK { k: 2 }`.
+    prev_used: HashMap<ExpertRef, u64>,
+    use_count: HashMap<ExpertRef, u64>,
+
+    /// Ordering within a segment. Distinct from `last_used` because a demotion moves an expert
+    /// to the *MRU* of probation without it having been referenced.
+    seg_stamp: HashMap<ExpertRef, u64>,
+    arrival: HashMap<ExpertRef, u64>,
+    seg: HashMap<ExpertRef, Seg>,
+    n_window: usize,
+    n_protected: usize,
+    tick: u64,
+
+    window_cap: usize,
+    protected_cap: usize,
+
+    /// TinyLFU's estimator. Exact counts rather than a count-min sketch: the sketch is an
+    /// engineering approximation of this, and simulating the approximation would measure the
+    /// sketch's error rather than the policy's merit.
+    freq: HashMap<ExpertRef, u32>,
+    freq_samples: u64,
+    freq_window: u64,
+
+    /// 2Q's `A1out` — evicted keys, no data, so it costs no slots.
+    ghost: VecDeque<ExpertRef>,
+    ghost_set: HashSet<ExpertRef>,
+    ghost_cap: usize,
+
+    /// `PinnedHot`'s permanently resident set, empty until warm-up ends.
+    hot: HashSet<ExpertRef>,
+
+    /// Step-granular recency and the block cycle length, for `PhaseLru`.
+    step_used: HashMap<ExpertRef, usize>,
+    cur_step: usize,
+    n_layers: u32,
+
+    next_use: Option<NextUse>,
+}
+
+impl Cache {
+    fn new(capacity: u32, policy: Policy, trace: &Trace) -> Self {
+        let cap = capacity as usize;
+        let pct = |p: u8, of: usize| (of * (p.min(100) as usize)) / 100;
+        let (window_cap, protected_cap, ghost_cap, budget) = match policy {
+            Policy::Slru { protected_pct } => (0, pct(protected_pct, cap), 0, cap),
+            // The ghost list holds keys, not weights, so it is deliberately not clamped to
+            // 100%: `kout_pct` above 100 costs no VRAM and is the only way A1out can outlive a
+            // flood longer than the cache itself.
+            Policy::TwoQ { kin_pct, kout_pct } => {
+                (pct(kin_pct, cap).max(1), 0, (cap * kout_pct as usize / 100).max(1), cap)
+            }
+            Policy::WTinyLfu { window_pct, protected_pct } => {
+                // One slot is held back as the scratch a rejected candidate is used in, so this
+                // policy's total VRAM footprint is the same `capacity` every other policy gets.
+                // Charged, not granted: the alternative is a budget of `capacity + 1` and a
+                // comparison that quietly favours it.
+                let budget = cap.saturating_sub(1).max(1);
+                let w = pct(window_pct, budget);
+                (w, pct(protected_pct, budget.saturating_sub(w)), 0, budget)
+            }
+            _ => (0, 0, 0, cap),
+        };
+        Self {
+            capacity: budget,
+            policy,
+            resident: Vec::with_capacity(cap.min(1 << 16)),
+            member: HashSet::new(),
+            last_used: HashMap::new(),
+            prev_used: HashMap::new(),
+            use_count: HashMap::new(),
+            seg_stamp: HashMap::new(),
+            arrival: HashMap::new(),
+            seg: HashMap::new(),
+            n_window: 0,
+            n_protected: 0,
+            tick: 0,
+            window_cap,
+            protected_cap,
+            freq: HashMap::new(),
+            freq_samples: 0,
+            // TinyLFU's reset period. Ten references per slot is the value Caffeine ships;
+            // it is a dial, not a derivation, and it is here so the halving is visible.
+            freq_window: (cap as u64) * 10,
+            ghost: VecDeque::new(),
+            ghost_set: HashSet::new(),
+            ghost_cap,
+            hot: HashSet::new(),
+            step_used: HashMap::new(),
+            cur_step: 0,
+            n_layers: trace.steps.iter().flatten().map(|e| e.layer).max().unwrap_or(0) as u32 + 1,
+            next_use: (policy == Policy::Optimal).then(|| NextUse::build(trace)),
         }
-        Policy::StaticSplit { .. } => unreachable!("static split does not evict"),
+    }
+
+    /// Bookkeeping every reference updates, hit or miss.
+    fn note_access(&mut self, e: ExpertRef, clock: u64) {
+        *self.use_count.entry(e).or_insert(0) += 1;
+        self.step_used.insert(e, self.cur_step);
+        let before = self.last_used.get(&e).copied().unwrap_or(0);
+        self.prev_used.insert(e, before);
+        self.last_used.insert(e, clock);
+
+        if matches!(self.policy, Policy::WTinyLfu { .. }) {
+            *self.freq.entry(e).or_insert(0) += 1;
+            self.freq_samples += 1;
+            if self.freq_samples >= self.freq_window {
+                self.freq_samples = 0;
+                self.freq.retain(|_, c| {
+                    *c /= 2;
+                    *c > 0
+                });
+            }
+        }
+    }
+
+    fn stamp(&mut self, e: ExpertRef) {
+        self.tick += 1;
+        self.seg_stamp.insert(e, self.tick);
+    }
+
+    fn set_seg(&mut self, e: ExpertRef, seg: Seg) {
+        if let Some(old) = self.seg.insert(e, seg) {
+            self.dec(old);
+        }
+        self.inc(seg);
+    }
+
+    fn inc(&mut self, seg: Seg) {
+        match seg {
+            Seg::Window => self.n_window += 1,
+            Seg::Protected => self.n_protected += 1,
+            Seg::Probation => {}
+        }
+    }
+
+    fn dec(&mut self, seg: Seg) {
+        match seg {
+            Seg::Window => self.n_window -= 1,
+            Seg::Protected => self.n_protected -= 1,
+            Seg::Probation => {}
+        }
+    }
+
+    fn insert(&mut self, e: ExpertRef, seg: Seg) {
+        self.resident.push(e);
+        self.member.insert(e);
+        self.seg.insert(e, seg);
+        self.inc(seg);
+        self.tick += 1;
+        self.seg_stamp.insert(e, self.tick);
+        self.arrival.insert(e, self.tick);
+    }
+
+    fn remove(&mut self, e: ExpertRef) {
+        self.resident.retain(|&r| r != e);
+        self.member.remove(&e);
+        if let Some(seg) = self.seg.remove(&e) {
+            self.dec(seg);
+        }
+    }
+
+    /// The expert that leaves `seg` next, skipping anything this step still needs.
+    ///
+    /// `exempt` names the one expert whose pin may be ignored: the expert just consumed. It
+    /// cannot be needed again this step, so releasing it costs nothing, and without the
+    /// exemption a window smaller than a step's demand can never produce a candidate at all.
+    fn oldest_in(
+        &self,
+        seg: Option<Seg>,
+        pinned: &[ExpertRef],
+        order: Order,
+        exempt: Option<ExpertRef>,
+    ) -> Option<ExpertRef> {
+        let stamps = match order {
+            Order::Recency => &self.seg_stamp,
+            Order::Arrival => &self.arrival,
+        };
+        self.resident
+            .iter()
+            .copied()
+            .filter(|r| Some(*r) == exempt || pinned.binary_search(r).is_err())
+            .filter(|r| match seg {
+                None => true,
+                Some(s) => self.seg.get(r) == Some(&s),
+            })
+            .min_by_key(|r| stamps.get(r).copied().unwrap_or(0))
+    }
+
+    fn freq_of(&self, e: ExpertRef) -> u32 {
+        self.freq.get(&e).copied().unwrap_or(0)
+    }
+
+    fn push_ghost(&mut self, e: ExpertRef) {
+        if self.ghost_cap == 0 {
+            return;
+        }
+        if self.ghost_set.insert(e) {
+            self.ghost.push_back(e);
+        }
+        while self.ghost.len() > self.ghost_cap {
+            if let Some(old) = self.ghost.pop_front() {
+                self.ghost_set.remove(&old);
+            }
+        }
+    }
+
+    fn on_hit(&mut self, e: ExpertRef, pinned: &[ExpertRef]) {
+        match self.policy {
+            Policy::Slru { .. } | Policy::WTinyLfu { .. } => match self.seg.get(&e).copied() {
+                Some(Seg::Probation) => {
+                    self.set_seg(e, Seg::Protected);
+                    self.stamp(e);
+                    self.demote_overflow(pinned);
+                }
+                Some(_) => self.stamp(e),
+                None => {}
+            },
+            // 2Q's A1in is a FIFO: a reference to something in it deliberately changes nothing,
+            // which is what makes a scanned-once expert leave on schedule. Only Am is LRU.
+            Policy::TwoQ { .. } if self.seg.get(&e) == Some(&Seg::Protected) => self.stamp(e),
+            _ => {}
+        }
+    }
+
+    fn demote_overflow(&mut self, pinned: &[ExpertRef]) {
+        while self.n_protected > self.protected_cap {
+            let Some(v) = self.oldest_in(Some(Seg::Protected), pinned, Order::Recency, None) else {
+                return;
+            };
+            self.set_seg(v, Seg::Probation);
+            // Classic SLRU: a demoted expert lands at the MRU end of probation, not the LRU end.
+            self.stamp(v);
+        }
+    }
+
+    fn on_miss(&mut self, e: ExpertRef, pinned: &[ExpertRef], step_idx: usize) {
+        match self.policy {
+            Policy::StaticSplit { .. } => unreachable!("handled before the cache is built"),
+
+            Policy::Lru
+            | Policy::Lfu
+            | Policy::Optimal
+            | Policy::LruK { .. }
+            | Policy::PhaseLru => {
+                let victim = self.simple_victim(pinned, step_idx, u32::from(e.layer));
+                self.evict_one(victim);
+                self.insert(e, Seg::Protected);
+            }
+
+            Policy::PinnedHot { .. } => {
+                let victim = if self.resident.len() >= self.capacity {
+                    self.resident
+                        .iter()
+                        .copied()
+                        .filter(|r| pinned.binary_search(r).is_err() && !self.hot.contains(r))
+                        .min_by_key(|r| self.last_used.get(r).copied().unwrap_or(0))
+                } else {
+                    None
+                };
+                self.evict_one(victim);
+                self.insert(e, Seg::Protected);
+            }
+
+            Policy::Slru { .. } => {
+                let victim = if self.resident.len() >= self.capacity {
+                    self.oldest_in(Some(Seg::Probation), pinned, Order::Recency, None).or_else(
+                        || self.oldest_in(Some(Seg::Protected), pinned, Order::Recency, None),
+                    )
+                } else {
+                    None
+                };
+                self.evict_one(victim);
+                self.insert(e, Seg::Probation);
+            }
+
+            Policy::TwoQ { .. } => {
+                let promoted = self.ghost_set.remove(&e);
+                if self.resident.len() >= self.capacity {
+                    // Over its share, A1in pays; otherwise the main queue does.
+                    let from_window = self.n_window >= self.window_cap;
+                    let first = if from_window { Some(Seg::Window) } else { Some(Seg::Protected) };
+                    let order = if from_window { Order::Arrival } else { Order::Recency };
+                    let victim = self.oldest_in(first, pinned, order, None).or_else(|| {
+                        let (alt, alt_order) = if from_window {
+                            (Some(Seg::Protected), Order::Recency)
+                        } else {
+                            (Some(Seg::Window), Order::Arrival)
+                        };
+                        self.oldest_in(alt, pinned, alt_order, None)
+                    });
+                    if let Some(v) = victim {
+                        if self.seg.get(&v) == Some(&Seg::Window) {
+                            self.push_ghost(v);
+                        }
+                    }
+                    self.evict_one(victim);
+                }
+                self.insert(e, if promoted { Seg::Protected } else { Seg::Window });
+            }
+
+            Policy::WTinyLfu { .. } => {
+                self.insert(e, Seg::Window);
+                if self.n_window <= self.window_cap {
+                    return;
+                }
+                // The window is over its share, so one expert leaves it and has to earn a place
+                // in the main cache. `e` is exempt from the pin because it has just been used.
+                let Some(cand) = self.oldest_in(Some(Seg::Window), pinned, Order::Recency, Some(e))
+                else {
+                    // Every window entry is still needed this step. Restore the budget from the
+                    // main cache instead of letting the cache quietly exceed `capacity`.
+                    if self.resident.len() > self.capacity {
+                        let victim = self
+                            .oldest_in(Some(Seg::Probation), pinned, Order::Recency, None)
+                            .or_else(|| {
+                                self.oldest_in(Some(Seg::Protected), pinned, Order::Recency, None)
+                            });
+                        self.evict_one(victim);
+                    }
+                    return;
+                };
+
+                if self.resident.len() <= self.capacity {
+                    self.set_seg(cand, Seg::Probation);
+                    self.stamp(cand);
+                    return;
+                }
+
+                let victim = self
+                    .oldest_in(Some(Seg::Probation), pinned, Order::Recency, None)
+                    .or_else(|| self.oldest_in(Some(Seg::Protected), pinned, Order::Recency, None));
+                match victim {
+                    Some(v) if self.freq_of(cand) > self.freq_of(v) => {
+                        self.remove(v);
+                        self.set_seg(cand, Seg::Probation);
+                        self.stamp(cand);
+                    }
+                    // The candidate lost the contest: it was fetched and used, and is now
+                    // dropped rather than allowed to displace a more frequently used expert.
+                    Some(_) => self.remove(cand),
+                    None => {
+                        self.set_seg(cand, Seg::Probation);
+                        self.stamp(cand);
+                    }
+                }
+            }
+        }
+    }
+
+    fn evict_one(&mut self, victim: Option<ExpertRef>) {
+        if let Some(v) = victim {
+            self.remove(v);
+        }
+    }
+
+    /// Victim for the policies that treat the cache as one undivided list.
+    fn simple_victim(
+        &self,
+        pinned: &[ExpertRef],
+        step_idx: usize,
+        current_block: u32,
+    ) -> Option<ExpertRef> {
+        if self.resident.len() < self.capacity {
+            return None;
+        }
+        // `pinned` is sorted and deduplicated by the caller, so a binary search is exactly
+        // equivalent to `contains` here — and necessary: at the capacities a real card gives
+        // (thousands of slots) a linear scan of the pin list inside a scan of the resident set
+        // makes a full-length trace take hours instead of seconds.
+        let candidates = self.resident.iter().copied().filter(|r| pinned.binary_search(r).is_err());
+        let victim = match self.policy {
+            Policy::Lru => candidates.min_by_key(|e| self.last_used.get(e).copied().unwrap_or(0)),
+            Policy::Lfu => candidates.min_by_key(|e| self.use_count.get(e).copied().unwrap_or(0)),
+            Policy::Optimal => {
+                let nu = self.next_use.as_ref().expect("Optimal requires a next-use index");
+                // Furthest next use wins; never-used-again is furthest of all.
+                candidates.max_by_key(|e| nu.after(*e, step_idx).unwrap_or(usize::MAX))
+            }
+            Policy::LruK { k } => {
+                // K-th most recent reference, with k = 2 the only depth `prev_used` records.
+                // Anything referenced fewer than k times sorts first, ordered by recency among
+                // themselves, which is standard LRU-K's correlated-reference handling.
+                if k <= 1 {
+                    candidates.min_by_key(|e| self.last_used.get(e).copied().unwrap_or(0))
+                } else {
+                    candidates.min_by_key(|e| {
+                        (
+                            self.prev_used.get(e).copied().unwrap_or(0),
+                            self.last_used.get(e).copied().unwrap_or(0),
+                        )
+                    })
+                }
+            }
+            Policy::PhaseLru => {
+                // How many blocks forward until this expert's block comes round again, counted
+                // from the block being served now. A block equal to the current one is a whole
+                // cycle away, not zero away: this step has already passed it.
+                let here = current_block;
+                let n = self.n_layers;
+                candidates.min_by_key(|e| {
+                    let wait = (u32::from(e.layer) + n - here - 1) % n + 1;
+                    (self.step_used.get(e).copied().unwrap_or(0), n - wait)
+                })
+            }
+            _ => unreachable!("simple_victim is only for the undivided policies"),
+        };
+        // Pinning cannot starve eviction: capacity >= peak step demand is checked by `simulate`,
+        // so at least one resident expert is always unpinned.
+        Some(victim.expect("capacity >= peak demand guarantees an unpinned slot"))
+    }
+
+    /// Warm-up boundary for [`Policy::PinnedHot`]: freeze the hot set, once, from what has been
+    /// seen so far and nothing else.
+    fn end_of_step(&mut self, step_idx: usize) {
+        let Policy::PinnedHot { pin_pct, warmup_steps } = self.policy else {
+            return;
+        };
+        if step_idx + 1 != warmup_steps as usize {
+            return;
+        }
+        let keep = (self.capacity * (pin_pct.min(95) as usize)) / 100;
+        let mut ranked: Vec<(u64, ExpertRef)> =
+            self.use_count.iter().map(|(&e, &c)| (c, e)).collect();
+        // Sort by count descending, expert ascending, so the pinned set is a function of the
+        // trace prefix alone and not of hash iteration order.
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        self.hot = ranked.into_iter().take(keep).map(|(_, e)| e).collect();
     }
 }
 
@@ -800,5 +1307,342 @@ mod tests {
         assert_eq!(loaded.trace.steps.len(), 1024);
         assert!(loaded.trace.steps.iter().all(|s| s.len() == 320), "40 layers x 8 experts");
         assert!(loaded.trace.working_set() <= 40 * 256);
+    }
+
+    // -----------------------------------------------------------------------
+    // The policies added to answer "how much is LRU leaving on the table?"
+    // -----------------------------------------------------------------------
+
+    /// The failure mode `bench/baselines/gpt-oss-120b.md` §6.5 describes, in miniature: a hot
+    /// set that has to survive floods of experts touched once and never again.
+    ///
+    /// Each cycle is two steps on a 4-expert hot set, then two steps of 8 fresh experts. At 16
+    /// slots the flood is exactly large enough to age the hot set out of an LRU ordering, while
+    /// leaving it plainly the most *frequently* used thing in the trace. Any policy that can
+    /// tell "used a lot" from "used recently" keeps it; LRU cannot, and re-fetches it every
+    /// cycle.
+    ///
+    /// 🔴 The first version of this test made the flood exactly the size of the cache, and
+    /// **every** policy scored 0.0 — with the whole flood pinned for its own step there is
+    /// nothing else the cache can hold, so the test measured the pinning rule rather than any
+    /// policy. A microbenchmark that no policy can pass is not a hard test, it is a broken one.
+    fn scan_flood_trace() -> Trace {
+        let mut steps: Vec<Vec<ExpertRef>> = Vec::new();
+        let hot: Vec<ExpertRef> = (0..4).map(|e| ExpertRef::new(0, e)).collect();
+        let mut cold = 100u16;
+        for _ in 0..12 {
+            steps.push(hot.clone());
+            steps.push(hot.clone());
+            for _ in 0..2 {
+                steps.push(
+                    (0..8)
+                        .map(|_| {
+                            cold += 1;
+                            ExpertRef::new(1, cold)
+                        })
+                        .collect(),
+                );
+            }
+        }
+        Trace { steps }
+    }
+
+    #[test]
+    fn every_scan_resistant_policy_beats_lru_on_a_flood() {
+        let t = scan_flood_trace();
+        let cap = 16;
+        let lru = simulate(&t, cap, Policy::Lru, MIB).unwrap();
+        let opt = simulate(&t, cap, Policy::Optimal, MIB).unwrap();
+        assert!(
+            lru.hit_rate() < 0.20 && opt.hit_rate() > 0.30,
+            "the flood should defeat lru but not belady: lru {:.3}, belady {:.3}",
+            lru.hit_rate(),
+            opt.hit_rate()
+        );
+
+        for policy in ALL_ONLINE
+            .iter()
+            .copied()
+            // `PhaseLru` is excluded on purpose: it corrects a *block-ordering* bias and makes
+            // no claim to scan resistance, so it behaves exactly like LRU here. Asserting it
+            // passed this test would be asserting something it was never built to do.
+            .filter(|p| !matches!(p, Policy::Lru | Policy::PhaseLru))
+            .chain([Policy::WTinyLfu { window_pct: 20, protected_pct: 80 }])
+            .map(|p| match p {
+                // The sweep's 128-step warm-up outlasts this 48-step trace, which would leave
+                // the hot set never pinned and the policy indistinguishable from LRU.
+                Policy::PinnedHot { pin_pct, .. } => Policy::PinnedHot { pin_pct, warmup_steps: 8 },
+                other => other,
+            })
+        {
+            let r = simulate(&t, cap, policy, MIB).unwrap();
+            assert!(
+                r.hit_rate() > lru.hit_rate() + 0.10,
+                "{:?} ({}) should survive the flood: {:.3} vs lru {:.3}",
+                policy,
+                policy.name(),
+                r.hit_rate(),
+                lru.hit_rate()
+            );
+        }
+    }
+
+    #[test]
+    fn lru_k_with_k_of_one_is_exactly_lru() {
+        for seed in [3u64, 91] {
+            let t = synthetic_trace(300, 6, 32, 3, 0.7, seed);
+            for cap in [48u32, 96] {
+                let a = simulate(&t, cap, Policy::Lru, MIB).unwrap();
+                let b = simulate(&t, cap, Policy::LruK { k: 1 }, MIB).unwrap();
+                assert_eq!(a.hits, b.hits, "k = 1 must degenerate to lru at cap {cap}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_policy_escapes_belady() {
+        // The bound is the point of the whole exercise: if a candidate ever beat Belady, the
+        // candidate would be wrong, not the bound.
+        for seed in [5u64, 61] {
+            for skew in [0.2, 0.9] {
+                let t = synthetic_trace(200, 6, 32, 3, skew, seed);
+                for cap in [48u32, 96, 192] {
+                    let opt = simulate(&t, cap, Policy::Optimal, MIB).unwrap();
+                    for policy in ALL_ONLINE {
+                        let r = simulate(&t, cap, policy, MIB).unwrap();
+                        assert!(
+                            r.misses >= opt.misses,
+                            "{} beat belady at cap {cap} (skew {skew}, seed {seed}): {} < {}",
+                            policy.name(),
+                            r.misses,
+                            opt.misses
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_policy_fetches_each_expert_at_least_once() {
+        // Compulsory misses must equal the working set exactly. A segmented or admission-
+        // filtered policy that lost track of its own membership would show up here first.
+        let t = synthetic_trace(200, 6, 32, 3, 0.6, 17);
+        let ws = t.working_set() as u64;
+        for policy in ALL_ONLINE.iter().copied().chain([Policy::Optimal]) {
+            let r = simulate(&t, 96, policy, MIB).unwrap();
+            assert_eq!(r.compulsory_misses, ws, "{} miscounted first touches", policy.name());
+            assert!(r.bytes_fetched >= ws * MIB);
+            assert_eq!(r.hits + r.misses, r.demands);
+        }
+    }
+
+    #[test]
+    fn a_pinned_hot_set_is_learned_from_the_prefix_and_never_changes() {
+        // Reproducibility is the claim being tested: the pinned set must be a function of the
+        // trace prefix alone, not of hash iteration order.
+        let t = synthetic_trace(300, 6, 32, 3, 0.8, 23);
+        let p = Policy::PinnedHot { pin_pct: 40, warmup_steps: 50 };
+        let a = simulate(&t, 96, p, MIB).unwrap();
+        let b = simulate(&t, 96, p, MIB).unwrap();
+        assert_eq!(a, b, "the same trace must give the same result, every run");
+    }
+
+    /// Every online policy the sweep scores, at the settings it scores them with.
+    const ALL_ONLINE: [Policy; 8] = [
+        Policy::Lru,
+        Policy::Lfu,
+        Policy::Slru { protected_pct: 80 },
+        Policy::TwoQ { kin_pct: 25, kout_pct: 200 },
+        Policy::LruK { k: 2 },
+        Policy::PinnedHot { pin_pct: 50, warmup_steps: 128 },
+        Policy::WTinyLfu { window_pct: 0, protected_pct: 80 },
+        Policy::PhaseLru,
+    ];
+
+    // -----------------------------------------------------------------------
+    // The sweep itself
+    // -----------------------------------------------------------------------
+
+    /// Score every policy against Belady across a range of slot counts, on every captured
+    /// decode trace, and print the tables `bench/policy-sweep.md` is built from.
+    ///
+    /// Ignored by default because it is minutes of CPU, not seconds. Run it with:
+    ///
+    /// ```sh
+    /// cargo test --release -p moearc-engine policy_sweep -- --ignored --nocapture
+    /// ```
+    ///
+    /// `MOEARC_SWEEP_TRACES` overrides the file list (comma separated) and `MOEARC_SWEEP_MULTS`
+    /// the capacity multipliers. Capacity is expressed as a **multiple of one step's demand**
+    /// rather than in absolute slots, because that is the only axis on which two models with
+    /// different block counts and different `n_expert_used` can be put side by side: it is how
+    /// many steps of routing history the pool can hold.
+    #[test]
+    #[ignore = "minutes of CPU; run deliberately"]
+    fn policy_sweep() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/traces");
+        let files: Vec<String> = match std::env::var("MOEARC_SWEEP_TRACES") {
+            Ok(v) => v.split(',').map(str::to_string).collect(),
+            Err(_) => {
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    eprintln!("no {dir}; nothing to sweep");
+                    return;
+                };
+                let mut v: Vec<String> = rd
+                    .filter_map(Result::ok)
+                    .map(|e| e.path().to_string_lossy().into_owned())
+                    .filter(|p| p.ends_with(".decode.ndjson"))
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        let mults: Vec<f64> = match std::env::var("MOEARC_SWEEP_MULTS") {
+            Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+            Err(_) => vec![1.25, 1.5, 2.0, 3.0, 4.167, 6.0, 8.0, 12.43, 20.0],
+        };
+
+        let policies: Vec<Policy> = ALL_ONLINE
+            .iter()
+            .copied()
+            .chain([Policy::WTinyLfu { window_pct: 20, protected_pct: 80 }, Policy::Optimal])
+            .collect();
+
+        for path in &files {
+            let Ok(loaded) = Trace::from_ndjson_file(path) else {
+                eprintln!("skipping unreadable {path}");
+                continue;
+            };
+            let t = &loaded.trace;
+            let per_step = t.peak_step_demand();
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            println!("\n## {name}");
+            println!(
+                "steps {} · demands {} · per step {} · working set {} · header {}",
+                t.steps.len(),
+                t.demands(),
+                per_step,
+                t.working_set(),
+                loaded.header.chars().take(240).collect::<String>()
+            );
+            println!(
+                "\n| slots | steps of history | static | {} | belady |",
+                policies
+                    .iter()
+                    .filter(|p| **p != Policy::Optimal)
+                    .map(|p| label(*p))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            println!("|---:|---:|---:|{}---:|", "---:|".repeat(policies.len().saturating_sub(1)));
+
+            for m in &mults {
+                let cap = ((per_step as f64) * m).round() as u32;
+                if cap as usize > t.working_set() * 2 {
+                    continue;
+                }
+                let stat = simulate(t, cap, t.widest_static_split(cap), 1)
+                    .map(|r| r.hit_rate())
+                    .unwrap_or(f64::NAN);
+                let mut cells: Vec<String> = Vec::new();
+                let mut belady = f64::NAN;
+                for p in &policies {
+                    let r = simulate(t, cap, *p, 1).expect("capacity is above peak demand");
+                    if *p == Policy::Optimal {
+                        belady = r.hit_rate();
+                    } else {
+                        cells.push(format!("{:.1}", r.hit_rate() * 100.0));
+                    }
+                }
+                println!(
+                    "| {cap} | {m:.2} | {:.1} | {} | {:.1} |",
+                    stat * 100.0,
+                    cells.join(" | "),
+                    belady * 100.0
+                );
+            }
+        }
+    }
+
+    fn label(p: Policy) -> String {
+        match p {
+            Policy::Slru { protected_pct } => format!("slru{protected_pct}"),
+            Policy::TwoQ { kin_pct, .. } => format!("2q{kin_pct}"),
+            Policy::LruK { k } => format!("lru-{k}"),
+            Policy::PinnedHot { pin_pct, .. } => format!("pin{pin_pct}"),
+            Policy::WTinyLfu { window_pct: 0, .. } => "tinylfu".into(),
+            Policy::WTinyLfu { window_pct, .. } => format!("w-tinylfu{window_pct}"),
+            other => other.name().into(),
+        }
+    }
+
+    /// Does turning the dials rescue any of the segmented policies at the pool size the engine
+    /// actually has? Same shape as [`policy_sweep`], one capacity, many parameter settings.
+    ///
+    /// ```sh
+    /// cargo test --release -p moearc-engine policy_tuning -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "minutes of CPU; run deliberately"]
+    fn policy_tuning() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/traces");
+        let mult: f64 =
+            std::env::var("MOEARC_TUNE_MULT").ok().and_then(|v| v.parse().ok()).unwrap_or(4.167);
+        let files: Vec<String> = match std::env::var("MOEARC_SWEEP_TRACES") {
+            Ok(v) => v.split(',').map(str::to_string).collect(),
+            Err(_) => ["prose", "code", "reasoning"]
+                .iter()
+                .map(|n| format!("{dir}/gptoss120b-{n}.decode.ndjson"))
+                .collect(),
+        };
+        let mut policies = vec![Policy::Lru, Policy::LruK { k: 2 }, Policy::PhaseLru];
+        for p in [30u8, 50, 70, 80, 90] {
+            policies.push(Policy::Slru { protected_pct: p });
+        }
+        for w in [0u8, 1, 5, 10, 20, 40] {
+            policies.push(Policy::WTinyLfu { window_pct: w, protected_pct: 80 });
+        }
+        for kin in [10u8, 25, 50] {
+            policies.push(Policy::TwoQ { kin_pct: kin, kout_pct: 200 });
+        }
+        for pin in [20u8, 50, 80] {
+            policies.push(Policy::PinnedHot { pin_pct: pin, warmup_steps: 64 });
+        }
+        policies.push(Policy::Optimal);
+
+        for path in &files {
+            let Ok(loaded) = Trace::from_ndjson_file(path) else {
+                eprintln!("skipping unreadable {path}");
+                continue;
+            };
+            let t = &loaded.trace;
+            let cap = ((t.peak_step_demand() as f64) * mult).round() as u32;
+            println!("\n### {path} @ {cap} slots ({mult:.2} steps of history)");
+            println!("| policy | hit % |");
+            println!("|---|---:|");
+            for p in &policies {
+                let r = simulate(t, cap, *p, 1).expect("capacity is above peak demand");
+                println!("| {} | {:.1} |", tuning_label(*p), r.hit_rate() * 100.0);
+            }
+        }
+    }
+
+    fn tuning_label(p: Policy) -> String {
+        match p {
+            Policy::Slru { protected_pct } => format!("slru protected={protected_pct}%"),
+            Policy::TwoQ { kin_pct, kout_pct } => format!("2q kin={kin_pct}% kout={kout_pct}%"),
+            Policy::PinnedHot { pin_pct, warmup_steps } => {
+                format!("pinned-hot pin={pin_pct}% warmup={warmup_steps}")
+            }
+            Policy::WTinyLfu { window_pct, protected_pct } => {
+                format!("tinylfu window={window_pct}% protected={protected_pct}%")
+            }
+            other => other.name().into(),
+        }
     }
 }
