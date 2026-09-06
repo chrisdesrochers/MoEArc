@@ -1162,8 +1162,12 @@ mod tests {
         m.screen = Screen::Models;
         m.model_row = 3; // qwen3-235b-a22b
         let dump = frame(&m, W, H);
-        show("moearc info — a model that will not fit", &dump);
-        assert!(dump.contains("will not fit"), "the headline names why there is no plan");
+        show("moearc info — a model the card cannot hold right now", &dump);
+        // 🔴 "not right now", not "will not fit". The expert bank pages, so a model larger
+        // than the card is the normal case here; what fails is the always-resident half
+        // against the VRAM free at this instant. See `fit.rs`'s `FitOutcome::DoesNotFit`.
+        assert!(dump.contains("not right now"), "the headline names why there is no plan");
+        assert!(!dump.contains("will not fit"), "size alone never disqualifies a model here");
         // The engine names the shortfall and a way out; "out of memory" would not.
         assert!(dump.contains("quantisation"), "the miss should say what would fix it");
     }
@@ -1259,19 +1263,59 @@ mod tests {
 
     #[test]
     fn a_remedy_is_never_truncated_mid_sentence() {
+        // Both causes a real machine can reach, because they are very different lengths and
+        // the panel sizes itself from the text. Dropping the inference targets from the
+        // fixture leaves the refused iGPU, which is `UnsupportedDevice` and carries the whole
+        // measured sentence; dropping the refused row too leaves CPU-only.
+        let mut cpu_only = loaded().report.clone().unwrap();
+        cpu_only.devices.retain(|d| d.backend == crate::source::Backend::Cpu);
+        cpu_only.verdict = crate::source::Verdict::for_devices(&cpu_only.devices);
+        assert!(matches!(
+            cpu_only.verdict,
+            crate::source::Verdict::CpuOnly { cause: CpuOnlyCause::RuntimeNotSourced }
+        ));
+
+        let mut refused = loaded().report.clone().unwrap();
+        refused.devices.retain(|d| !d.is_inference_target());
+        refused.verdict = crate::source::Verdict::for_devices(&refused.devices);
+        assert!(matches!(
+            refused.verdict,
+            crate::source::Verdict::CpuOnly { cause: CpuOnlyCause::UnsupportedDevice { .. } }
+        ));
+
+        for report in [cpu_only, refused] {
+            let remedy = report.verdict.remedy().expect("a verdict that is not ready has one");
+            let mut m = loaded();
+            update(&mut m, Msg::Detected(report));
+            for width in [60, 80, 100, 140] {
+                let dump = frame(&m, width, 34);
+                // Compare word by word: the panel re-breaks the text, so the sentence is
+                // present without any single line of it matching.
+                for word in remedy.split_whitespace() {
+                    assert!(dump.contains(word), "`{word}` missing at width {width}");
+                }
+            }
+        }
+    }
+
+    /// 🔴 The lie, asserted against the rendered frame.
+    ///
+    /// The packaged binary printed `✓ Intel(R) Graphics is ready — 85.6 GiB free right now` on
+    /// a machine with no usable GPU, and would then have agreed a 132 GiB model fits. It
+    /// succeeded and lied, which is worse than crashing. This drives the whole surface, not
+    /// the verdict alone, because the free-memory cell of the device table said it too.
+    #[test]
+    fn an_integrated_gpu_is_never_rendered_as_ready_with_host_ram_as_its_vram() {
         let mut m = loaded();
         let mut report = m.report.clone().unwrap();
         report.devices.retain(|d| !d.is_inference_target());
         report.verdict = crate::source::Verdict::for_devices(&report.devices);
         update(&mut m, Msg::Detected(report));
-        for width in [60, 80, 100, 140] {
-            let dump = frame(&m, width, 34);
-            // Compare word by word: the panel re-breaks the text, so the sentence is present
-            // without any single line of it matching.
-            for word in CpuOnlyCause::RuntimeNotSourced.remedy().split_whitespace() {
-                assert!(dump.contains(word), "`{word}` missing at width {width}");
-            }
-        }
+        let dump = frame(&m, 140, 34);
+        show("moearc — an integrated GPU offering 85.6 GiB it does not have", &dump);
+        assert!(!dump.contains("is ready"), "a device with no VRAM is not ready");
+        assert!(!dump.contains("85.6 GiB free"), "and its host RAM is not a budget");
+        assert!(dump.contains("system RAM"), "the refusal says what the number actually is");
     }
 
     #[test]

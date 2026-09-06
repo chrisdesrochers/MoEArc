@@ -55,6 +55,11 @@ pub fn run(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
             m.ctx_request = a.ctx;
             pending.push(Action::Serve(a.model.clone()));
         }
+        // Unreachable: `main.rs` routes both to the plain path before this function is
+        // called, because a benchmark must not run underneath a renderer that is redrawing on
+        // the same box. The arm exists so adding a screenless subcommand stays a compile-time
+        // decision rather than a silent fallthrough to the device report.
+        Some(Command::Bench(_) | Command::BenchRun(_)) => {}
     }
 
     enable_raw_mode().context("could not put the terminal into raw mode")?;

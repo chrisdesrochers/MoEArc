@@ -63,20 +63,51 @@ pub struct DeviceRow {
     /// matters, and neither does on its own.
     pub driver: String,
     pub total_bytes: u64,
-    /// Free bytes *now*. Every plan is built from this, never from `total_bytes` — a card
-    /// with a compositor on it does not hand over its whole framebuffer.
+    /// The budget a plan may be built from — **not** whatever the device reported.
+    ///
+    /// 🔴 Every plan is built from this, never from `total_bytes`: a card with a compositor on
+    /// it does not hand over its whole framebuffer. And on a device with no memory of its own
+    /// this is **zero**, which is the literal truth, rather than the 85.58 GiB of host RAM an
+    /// integrated GPU reports where a VRAM figure is expected. See [`Self::unusable`].
     pub free_bytes: u64,
+    /// Where `free_bytes` came from — measured on the device, or installed capacity assumed
+    /// idle. Two different promises, so they are not flattened into one number.
+    pub budget_source: Option<&'static str>,
+    /// The measured reason this device cannot be planned against, when there is one.
+    ///
+    /// 🔴 This exists because the tool used to answer `✓ Intel(R) Graphics is ready — 85.6 GiB
+    /// free right now` on a machine with no usable GPU, and would then have agreed that a
+    /// 132 GiB model fits. It succeeded and lied, which is worse than crashing. The figure was
+    /// a driver-chosen share of system RAM: Sysman reports the device's only memory module as
+    /// `ZES_MEM_LOC_SYSTEM`, with a size equal to `/proc/meminfo`'s `MemTotal` exactly.
+    /// `moearc_device::fitness` holds the rule and the evidence; this field carries its
+    /// sentence to the screen.
+    pub unusable: Option<String>,
+    /// The Level Zero runtime build, when it is known.
+    ///
+    /// ⚠️ Reported because two users on the same card can get different answers for reasons
+    /// that have nothing to do with their hardware. Measured on this project's own B580, in
+    /// clean containers: build 27642 does not enumerate the card at all, 33578 detects it and
+    /// then fails at model load, 37020 loads and decodes. It is a **caution with provenance**
+    /// and never a gate — the Level Zero specification assigns no encoding to `driverVersion`
+    /// and publishes no minimum, so there is nothing to gate on.
+    pub driver_build: Option<u32>,
 }
 
 impl DeviceRow {
+    /// Whether MoEArc will schedule inference onto it.
+    ///
+    /// 🔴 Two conditions, not one. The backend has to be Level Zero *and* the device has to
+    /// have a memory pool of its own — an integrated GPU is enumerated, is Level Zero, and
+    /// reports tens of gigabytes it does not have.
     pub fn is_inference_target(&self) -> bool {
-        self.backend.is_inference_target()
+        self.backend.is_inference_target() && self.unusable.is_none()
     }
 }
 
 /// Why the tool found no GPU. "No GPU found" alone is precisely the message `docs/ux.md`
 /// rules out, so the absence always carries a named cause.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CpuOnlyCause {
     /// The known-bad configuration recorded in `docs/ux.md`: the oneAPI environment was
@@ -92,29 +123,33 @@ pub enum CpuOnlyCause {
     /// which is `moearc-device`'s job; the fixture cannot produce it.
     #[allow(dead_code)]
     KernelDriverMissing,
-    /// Enumeration worked and the device is simply not one we can target.
-    #[allow(dead_code)]
-    UnsupportedDevice,
+    /// Enumeration worked, and every device it found has no memory to plan in.
+    ///
+    /// Carries `moearc_device::fitness::Unusable`'s own sentence rather than a generic one:
+    /// the refusal is a measurement (this device reports N bytes, this machine has N bytes of
+    /// RAM, Sysman independently says the device has no pool), and a message that discards the
+    /// numbers cannot be checked by the person reading it.
+    UnsupportedDevice { reason: String },
 }
 
 impl CpuOnlyCause {
-    pub fn headline(self) -> &'static str {
+    pub fn headline(&self) -> String {
         match self {
             Self::RuntimeNotSourced => {
-                "No Level Zero device — the oneAPI runtime is not on this shell's path."
+                "No Level Zero device — the oneAPI runtime is not on this shell's path.".to_string()
             }
             Self::KernelDriverMissing => {
-                "No Level Zero device — the kernel GPU driver is not loaded."
+                "No Level Zero device — the kernel GPU driver is not loaded.".to_string()
             }
-            Self::UnsupportedDevice => {
-                "A GPU was found, but it is not a supported inference target."
-            }
+            // The whole sentence, numbers included. It is long for a headline and that is the
+            // right trade: the alternative was one cheerful line that was false.
+            Self::UnsupportedDevice { reason } => reason.clone(),
         }
     }
 
     /// The single next action. One line, one thing to do: a remedy that offers a choice is a
     /// dependency complaint wearing a helpful tone.
-    pub fn remedy(self) -> &'static str {
+    pub fn remedy(&self) -> &'static str {
         match self {
             Self::RuntimeNotSourced => {
                 "The CPU device in the table is the giveaway: an unsourced runtime enumerates CPU-only \
@@ -125,7 +160,11 @@ impl CpuOnlyCause {
                 "Load the `xe` driver (kernel 6.8+) or `i915` on older kernels. This is the \
                  only component MoEArc cannot ship for you: it lives in the kernel."
             }
-            Self::UnsupportedDevice => "MoEArc targets Intel Arc. Other vendors are not supported.",
+            Self::UnsupportedDevice { .. } => {
+                "Install a discrete Intel Arc card. If you have one, the compute runtime did \
+                 not enumerate it — install Intel's client GPU runtime for your distribution \
+                 and re-run; `moearc-device-report` prints the full diagnosis."
+            }
         }
     }
 }
@@ -150,14 +189,23 @@ impl Verdict {
     /// the one that decides, and cannot drift from what the screens then render. A detector
     /// that also diagnoses can hand back a richer [`CpuOnlyCause`]; this is the floor.
     pub fn for_devices(devices: &[DeviceRow]) -> Self {
-        match devices.iter().find(|d| d.is_inference_target()) {
-            Some(d) => Self::Ready { device: d.name.clone(), free_bytes: d.free_bytes },
-            // An empty list means the loader never answered. A list with only CPU devices
-            // means it answered and found no GPU — which, per docs/ux.md, is most often an
-            // unsourced runtime rather than broken hardware.
-            None if devices.is_empty() => Self::NoDevice,
-            None => Self::CpuOnly { cause: CpuOnlyCause::RuntimeNotSourced },
+        if let Some(d) = devices.iter().find(|d| d.is_inference_target()) {
+            return Self::Ready { device: d.name.clone(), free_bytes: d.free_bytes };
         }
+        // 🔴 A refused device outranks "no GPU found", and it must: on the machine this was
+        // written for, a GPU *was* found, was Level Zero, and reported 85.58 GiB. Reporting
+        // "the runtime is not on your path" there would send the user to fix a path that is
+        // already correct, and say nothing about the number that was wrong.
+        if let Some(reason) = devices.iter().find_map(|d| d.unusable.clone()) {
+            return Self::CpuOnly { cause: CpuOnlyCause::UnsupportedDevice { reason } };
+        }
+        // An empty list means the loader never answered. A list with only CPU devices
+        // means it answered and found no GPU — which, per docs/ux.md, is most often an
+        // unsourced runtime rather than broken hardware.
+        if devices.is_empty() {
+            return Self::NoDevice;
+        }
+        Self::CpuOnly { cause: CpuOnlyCause::RuntimeNotSourced }
     }
 
     pub fn headline(&self) -> String {
@@ -165,7 +213,7 @@ impl Verdict {
             Self::Ready { device, free_bytes } => {
                 format!("{device} is ready — {} free right now.", format::bytes(*free_bytes))
             }
-            Self::CpuOnly { cause } => cause.headline().to_string(),
+            Self::CpuOnly { cause } => cause.headline(),
             Self::NoDevice => "No compute device enumerated at all.".to_string(),
         }
     }
@@ -508,16 +556,31 @@ impl DeviceSource for StubDeviceSource {
             DeviceRow {
                 name: "Intel Arc B580 Graphics".to_string(),
                 backend: Backend::LevelZero,
-                driver: "xe / Level Zero 1.6".to_string(),
+                driver: "xe / L0 build 37020".to_string(),
                 total_bytes: 12 * 1024 * 1024 * 1024,
                 free_bytes: 12_241_698_816,
+                budget_source: Some("measured free VRAM"),
+                unusable: None,
+                driver_build: Some(37_020),
             },
+            // 🔴 The fixture's integrated device is refused, and its numbers are the measured
+            // ones: an Arrow Lake iGPU reports 91,890,372,608 bytes, which is 93.5% of this
+            // machine's 98,257,694,720 bytes of system RAM. Keeping it in the fixture as a
+            // *usable* row is what let the screens be developed against a lie.
             DeviceRow {
-                name: "Intel Arc 140T Graphics (iGPU)".to_string(),
+                name: "Intel(R) Graphics (iGPU)".to_string(),
                 backend: Backend::LevelZero,
-                driver: "xe / Level Zero 1.6".to_string(),
-                total_bytes: 16 * 1024 * 1024 * 1024,
-                free_bytes: 9_663_676_416,
+                driver: "xe / L0 build 37020".to_string(),
+                total_bytes: 91_890_372_608,
+                free_bytes: 0,
+                budget_source: None,
+                unusable: Some(
+                    "Intel(R) Graphics (iGPU) reports 85.58 GiB of memory, and that figure is \
+                     this machine's system RAM rather than video memory — this machine has \
+                     91.51 GiB of RAM. MoEArc needs a discrete Intel Arc card."
+                        .to_string(),
+                ),
+                driver_build: Some(37_020),
             },
             DeviceRow {
                 name: "Intel OpenCL Runtime (CPU)".to_string(),
@@ -525,6 +588,9 @@ impl DeviceSource for StubDeviceSource {
                 driver: "OpenCL 3.0".to_string(),
                 total_bytes: 96 * 1024 * 1024 * 1024,
                 free_bytes: 74_088_284_160,
+                budget_source: None,
+                unusable: None,
+                driver_build: None,
             },
         ];
         let verdict = Verdict::for_devices(&devices);

@@ -12,6 +12,12 @@ authors.workspace = true
 name = "moearc"
 path = "src/main.rs"
 
+[features]
+default = []
+# The device half of the engine. `moearc bench --absolutes` cannot time anything without it,
+# and says so rather than reporting a figure from a binary that cannot reach the card.
+gpu = ["moearc-engine/gpu"]
+
 [dependencies]
 moearc-engine.workspace = true
 moearc-device.workspace = true

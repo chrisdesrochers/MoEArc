@@ -4,7 +4,7 @@
 //! real card or a fixture, which is what makes the fixture worth having.
 
 use crate::source::{Backend, DeviceReport, DeviceRow, DeviceSource, Verdict};
-use moearc_device::sysman;
+use moearc_device::{fitness, sysman};
 
 /// Detection backed by Level Zero.
 pub struct LevelZeroDevices;
@@ -34,37 +34,34 @@ impl DeviceSource for LevelZeroDevices {
                     .and_then(|p| p.kernel_driver.clone())
                     .unwrap_or_else(|| "unknown".to_string());
 
-                let live_free = telemetry
-                    .iter()
-                    .find(|t| t.uuid == d.uuid)
-                    .and_then(|t| t.free_device_memory_bytes());
-
-                // 🔴 Two measured hazards, both from the detector's report.
+                // 🔴 The budget comes from `fitness::vram_budget` and nowhere else. The rule
+                // is one sentence — *a budget must come from a memory pool that is measurably
+                // on the device* — and the reason it is a shared function rather than a
+                // `match` here is that the `match` that used to be here got it wrong in the
+                // most expensive way available: it fell back to the device's reported total
+                // whenever the live reading was missing, and on an integrated GPU that total
+                // is a share of host RAM. The tool then printed `✓ … is ready — 85.6 GiB free
+                // right now` and would have agreed that a 132 GiB model fits.
                 //
-                // Sysman reports more free memory than core Level Zero reports allocatable
-                // (12,567,810,048 against 12,168,933,376 on the reference B580). They answer
-                // different questions and neither is wrong, but a plan built on the larger
-                // figure would ask for memory the allocator will not hand over — so the
-                // allocatable figure is the ceiling, always.
-                //
-                // And when sysman has nothing to say, falling back to the core figure is only
-                // safe for a discrete card. An integrated GPU's only memory module is system
-                // RAM: the reference iGPU reports 85.58 GiB, which as a VRAM budget would
-                // plan a model that cannot possibly fit.
-                let free = match live_free {
-                    Some(f) => f.min(d.total_memory_bytes),
-                    None => d.total_memory_bytes,
-                };
+                // Sysman is joined on UUID inside `reading_for`, not by index: Sysman and core
+                // Level Zero enumerate in different orders on the reference machine, so an
+                // index join silently attributes one card's memory to another.
+                let budget = fitness::vram_budget(d, fitness::reading_for(&telemetry, d));
 
                 DeviceRow {
                     name: d.name.clone(),
                     backend: Backend::LevelZero,
-                    driver: format!(
-                        "{kernel_driver} / L0 build {}",
-                        driver_build(d.driver_version)
-                    ),
+                    // `GpuDevice::driver_build` rather than a second copy of the same masking
+                    // and the same corroboration table. There were two; only one of them could
+                    // ever be the one a reader checks.
+                    driver: format!("{kernel_driver} / L0 build {}", d.driver_build()),
                     total_bytes: d.total_memory_bytes,
-                    free_bytes: free,
+                    // Zero for a device with no pool of its own. Literally true, and the row
+                    // beside it says why in the device's own numbers.
+                    free_bytes: budget.as_ref().map(|b| b.bytes).unwrap_or(0),
+                    budget_source: budget.as_ref().ok().map(|b| b.source.describe()),
+                    unusable: budget.as_ref().err().map(ToString::to_string),
+                    driver_build: Some(d.driver_build()),
                 }
             })
             .collect();
@@ -84,38 +81,63 @@ impl DeviceSource for LevelZeroDevices {
     }
 }
 
-/// The compute-runtime build number carried in Level Zero's `driverVersion`.
-///
-/// 🔴 Only the low 16 bits are reported, and that restraint is deliberate. The Level Zero
-/// specification defines `driverVersion` as "a non-zero, monotonically increasing value" and
-/// specifies **no** encoding — so any `major.minor.build` reading of it is invented.
-///
-/// An earlier version of this function did invent one, rendering the reference card's
-/// 17,010,844 as `1.3.37020`. Cross-checking against two independent sources on the same
-/// machine showed what was real and what was not:
-///
-/// | source | reports |
-/// | --- | --- |
-/// | `sycl-ls` | `Intel(R) Arc(TM) B580 Graphics 20.1.0 [1.14.37020]` |
-/// | `clinfo` | `Driver Version 26.05.037020` |
-///
-/// The build number **37020** appears in both. The `1.3` did not appear anywhere — `sycl-ls`
-/// shows `1.14` there, which is the Level Zero *API* version, an entirely different field.
-/// So the high bits are unidentified and are not displayed; printing a version string that
-/// matches nothing the user can search for is worse than printing less.
-fn driver_build(v: u32) -> u32 {
-    v & 0xFFFF
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::source::{Backend, DeviceRow, Verdict};
+
+    fn row(name: &str, free: u64, unusable: Option<&str>) -> DeviceRow {
+        DeviceRow {
+            name: name.to_string(),
+            backend: Backend::LevelZero,
+            driver: "xe / L0 build 27642".to_string(),
+            total_bytes: 91_890_372_608,
+            free_bytes: free,
+            budget_source: None,
+            unusable: unusable.map(str::to_string),
+            driver_build: Some(27_642),
+        }
+    }
+
+    /// 🔴 The shipped-binary defect, asserted at the seam that shipped it.
+    ///
+    /// `moearc-device` refuses correctly; what the packaged `moearc` command did with that
+    /// refusal is this crate's problem, and for a while the answer was to ignore it and print
+    /// `✓ Intel(R) Graphics is ready — 85.6 GiB free right now`.
+    #[test]
+    fn a_device_with_no_pool_of_its_own_is_never_ready() {
+        let devices = vec![row(
+            "Intel(R) Graphics",
+            0,
+            Some(
+                "Intel(R) Graphics reports 85.58 GiB of memory, and that figure is this \
+                  machine's system RAM rather than video memory",
+            ),
+        )];
+        let verdict = Verdict::for_devices(&devices);
+        assert!(!verdict.is_ready(), "{verdict:?}");
+        assert!(!devices[0].is_inference_target());
+        // And the sentence that reaches the screen is the measurement, not a category.
+        let headline = verdict.headline();
+        assert!(headline.contains("85.58 GiB"), "{headline}");
+        assert!(headline.contains("system RAM"), "{headline}");
+    }
 
     #[test]
-    fn the_build_number_matches_what_other_intel_tools_report() {
-        // The reference B580 reports 17,010,844. Both sycl-ls ([1.14.37020]) and clinfo
-        // (26.05.037020) show 37020 for the same driver on the same machine, so this is
-        // checked against corroborated output rather than against an assumed encoding.
-        assert_eq!(driver_build(17_010_844), 37_020);
+    fn a_refusal_outranks_the_generic_no_gpu_message() {
+        // A GPU *was* found and it was Level Zero. "The oneAPI runtime is not on this shell's
+        // path" would send the user to fix a path that is already correct.
+        let devices = vec![row("Intel(R) Graphics", 0, Some("no pool of its own"))];
+        assert!(!Verdict::for_devices(&devices).headline().contains("path"));
+    }
+
+    #[test]
+    fn a_usable_card_is_still_ready_and_plans_against_its_budget() {
+        let mut d = row("Intel(R) Arc(TM) B580 Graphics", 12_168_933_376, None);
+        d.total_bytes = 12_168_933_376;
+        assert!(d.is_inference_target());
+        let Verdict::Ready { free_bytes, .. } = Verdict::for_devices(&[d]) else {
+            panic!("a card with a real pool is ready")
+        };
+        assert_eq!(free_bytes, 12_168_933_376);
     }
 }

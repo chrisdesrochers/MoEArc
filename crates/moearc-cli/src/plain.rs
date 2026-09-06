@@ -18,6 +18,7 @@ use moearc_engine::host_budget::{
 };
 use serde_json::{Value, json};
 
+use crate::bench;
 use crate::cli::{Cli, Command, InfoArgs, LsArgs, PullArgs, ServeArgs};
 use crate::fit::{self, Fit, FitOutcome};
 use crate::format;
@@ -37,6 +38,8 @@ pub fn run(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
         Some(Command::Pull(args)) => pull(cli, sources, args),
         Some(Command::Serve(args)) => serve(cli, sources, args),
         Some(Command::Info(args)) => info(cli, sources, args),
+        Some(Command::Bench(args)) => bench::run(cli, sources, args),
+        Some(Command::BenchRun(args)) => bench::run_worker(args),
     }
 }
 

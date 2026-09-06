@@ -17,6 +17,7 @@
 //!   wired straight to hardware cannot be snapshot-tested, because its frames would change
 //!   with the card, the driver and the free VRAM at the moment the test ran.
 
+mod bench;
 mod catalog;
 mod cli;
 mod detect;
@@ -42,8 +43,14 @@ fn main() -> ExitCode {
         source::Sources::real(catalog::models_dir(cli.global.models_dir.as_deref()))
     };
 
-    let result =
-        if cli.plain_output() { plain::run(&cli, &sources) } else { tui::run(&cli, &sources) };
+    // 🔴 `bench` never opens the interface, whichever way it was invoked. A measurement
+    // taken underneath a renderer that is redrawing at 20 Hz on the same box is measuring the
+    // renderer as much as the engine, and the artefact it writes is a file rather than a
+    // screen. This is the one exception to "every screen has a subcommand": the subcommand
+    // has no screen, on purpose, and `cli.rs`'s table records that.
+    let plain = cli.plain_output()
+        || matches!(cli.command, Some(cli::Command::Bench(_) | cli::Command::BenchRun(_)));
+    let result = if plain { plain::run(&cli, &sources) } else { tui::run(&cli, &sources) };
 
     match result {
         Ok(code) => code,

@@ -80,8 +80,22 @@ pub enum FitOutcome {
     ///
     /// `reason` is the full sentence — usually the engine's, which names the shortfall in
     /// gigabytes and, where it can, what would fix it. `headline` is the three words that fit
-    /// in a table cell, because "will not fit" is right for a model too large for the card and
-    /// wrong for one asked to do something it was never trained to do.
+    /// in a table cell, and it exists because one sentence does not cover both a model asked
+    /// for a context it was never trained on and a card that is momentarily short of VRAM.
+    ///
+    /// 🔴 **No headline here may say the model is too large.** This project's premise is a
+    /// 59.0 GiB model on an 11.33 GiB card: the expert bank pages, so size alone never
+    /// disqualifies a model. Every planner error that reaches this cell is a shortage *at this
+    /// moment* — dense weights against free VRAM, which has fired at 1.3 GiB free while
+    /// another process held the device on a model that runs fine when it does not — so the
+    /// cell says **"not right now"**, which is transient, and the reason beside it names the
+    /// shortfall and what would clear it. `moearc-engine`'s `memory.rs` carries a
+    /// whole-surface guard test asserting the same thing of every planner message;
+    /// [`the_cell_never_says_a_model_is_too_large`] is this crate's half of it.
+    ///
+    /// ⚠️ The genuinely permanent verdict — weights larger than the **free disk** — is a
+    /// different classification (`host_budget::Tier`) and still says "won't fit", because
+    /// there it is true.
     DoesNotFit { headline: &'static str, reason: String },
 }
 
@@ -343,7 +357,10 @@ fn build(
             let ceiling = ceiling_tokens(device, card, &policy, a.context_tokens);
             fits(&a, card, ceiling, capped)
         }
-        Err(e) => FitOutcome::DoesNotFit { headline: "will not fit", reason: e.to_string() },
+        // 🔴 "not right now", never "will not fit". See [`FitOutcome::DoesNotFit`]: every
+        // planner error reaching here is a VRAM shortage at this instant, not a property of
+        // the model, and this tool exists to run models far larger than the card.
+        Err(e) => FitOutcome::DoesNotFit { headline: "not right now", reason: e.to_string() },
     };
     Fit { model: card.id.clone(), requested_ctx: ctx, slot_override, calibrated: false, outcome }
 }
@@ -542,10 +559,57 @@ mod tests {
         let FitOutcome::DoesNotFit { headline, reason } = &f.outcome else {
             panic!("a context the model never saw is not a fit: {:?}", f.outcome)
         };
-        assert_eq!(*headline, "past its trained context", "and not `will not fit`, which it does");
+        assert_eq!(
+            *headline, "past its trained context",
+            "and not the VRAM-shortage cell: the memory is there, the training is not"
+        );
         assert!(reason.contains("32,768"), "the refusal names the model's limit: {reason}");
         // At its own limit it plans normally.
         assert!(plan(&card(), &m, Some(32_768)).fits());
+    }
+
+    /// 🔴 The claim this whole project rests on, asserted against its own UI.
+    ///
+    /// MoEArc runs a 59.0 GiB model on an 11.33 GiB card. A cell that tells a user their model
+    /// is too large contradicts the premise, and the condition behind it is usually transient:
+    /// `WeightsDoNotFit` fires on free VRAM at that instant, and was observed live at 1.3 GiB
+    /// free while GPU tests ran on the same box. `moearc-engine`'s `memory.rs` drives every
+    /// failing planner path and asserts the same phrases appear in none of its messages; this
+    /// is the renderer's half — the last place in the tree that said it.
+    #[test]
+    fn the_cell_never_says_a_model_is_too_large() {
+        let banned = ["too large", "too big", "will not fit", "won't fit"];
+        // Every model in the catalogue, at the largest context and at one the card cannot
+        // serve, so both the fitting and the failing paths are driven.
+        for m in StubCatalog.curated().unwrap() {
+            for ctx in [None, Some(1_000_000)] {
+                let f = plan(&card(), &m, ctx);
+                let rendered =
+                    format!("{} {} {:?}", f.residency_cell(), f.context_cell(), f.outcome);
+                for phrase in banned {
+                    assert!(
+                        !rendered.to_lowercase().contains(phrase),
+                        "`{}` at ctx {ctx:?} rendered `{phrase}`: {rendered}",
+                        m.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_vram_shortage_reads_as_transient_and_says_what_would_clear_it() {
+        // A card with almost nothing free — the 1.3 GiB situation, in a test.
+        let starved = DeviceRow { free_bytes: 200 << 20, ..card() };
+        let f = plan(&starved, &model("qwen3-30b-a3b"), None);
+        let FitOutcome::DoesNotFit { headline, reason } = &f.outcome else {
+            panic!("200 MiB free cannot hold this model's dense weights: {:?}", f.outcome)
+        };
+        assert_eq!(*headline, "not right now");
+        assert!(
+            reason.contains("right now") || reason.contains("free VRAM"),
+            "the reason has to say the shortage is a moment, not a verdict: {reason}"
+        );
     }
 
     #[test]
