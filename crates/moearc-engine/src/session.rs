@@ -37,7 +37,7 @@ use moearc_model::tensors::MappedModel;
 
 use crate::cache::CacheStats;
 use crate::host_experts::HostPolicy;
-use crate::moe::{Config, EngineError, Model, Residency, ResidencyReport, Tap};
+use crate::moe::{Config, EngineError, KvGeometry, Model, Residency, ResidencyReport, Tap};
 
 /// How to build a session.
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,6 +58,11 @@ pub struct SessionInfo {
     pub device: String,
     /// Context length this session was built for.
     pub n_ctx: usize,
+    /// The KV cache that was actually allocated — and, through
+    /// [`KvGeometry::saved_bytes`], what sliding-window attention gave back. Reported rather
+    /// than left implicit because on this card the cache and the expert pool compete for the
+    /// same bytes, so "how big is the cache" is a question about throughput, not only memory.
+    pub kv: KvGeometry,
     /// The pool as it stands at load: counters all zero, sizes final.
     pub residency: ResidencyReport,
 }
@@ -524,6 +529,7 @@ fn worker(
         config: model.cfg().clone(),
         device: ctx.device_name().unwrap_or_else(|_| "unknown device".to_string()),
         n_ctx,
+        kv: model.kv_geometry(),
         residency: model.residency(),
     };
     if tx.send(Reply::Ready(Box::new(info))).is_err() {

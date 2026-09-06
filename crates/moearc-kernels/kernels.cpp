@@ -1808,6 +1808,15 @@ int moearc_kv_append(moearc_ctx *c, void *k_pages, void *v_pages, const float *k
 // multi-token prefill the mask is genuinely necessary, and `moearc_softmax`'s `mask` argument
 // is what supplies it. This kernel is not a prefill kernel and does not pretend to be one.
 //
+// 🔴 **Sliding-window attention is the other half of that bound.** `kv_begin` is the first
+// logical key this query may see, so the span is `[kv_begin, n_kv)`. llama.cpp masks a key when
+// `p1 - p0 >= n_swa` (`llama_hparams::is_masked_swa`, `LLAMA_SWA_TYPE_STANDARD`), which for a
+// single query at `p1 = n_kv - 1` is exactly `kv_begin = n_kv - n_swa`. Expressing it as a loop
+// bound rather than an additive mask is not a shortcut either: a masked key contributes
+// `exp(-inf) = 0` to both the numerator and the denominator, which is the same arithmetic as
+// never visiting it — and visiting it would cost a full `head_dim` reduction per key, which is
+// the whole run-time saving.
+//
 // 🔴 The keys are read through `block_table`, not from a contiguous run. Logical key `j` lives
 // in page `block_table[j / page_tokens]` at slot `j % page_tokens`, and those pages are
 // scattered across the pool in whatever order the allocator handed them out. A kernel that
@@ -1828,13 +1837,16 @@ int moearc_kv_append(moearc_ctx *c, void *k_pages, void *v_pages, const float *k
 int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_pages,
                        const void *v_pages, const unsigned int *block_table, const float *sinks,
                        unsigned long n_heads, unsigned long n_kv_heads, unsigned long head_dim,
-                       unsigned long n_kv, unsigned long page_tokens, float scale,
-                       unsigned int kv_type) {
+                       unsigned long kv_begin, unsigned long n_kv, unsigned long page_tokens,
+                       float scale, unsigned int kv_type) {
     if (!c || !out || !q || !k_pages || !v_pages || !block_table) return ERR;
     if (kv_type != GGML_TYPE_F32 && kv_type != GGML_TYPE_F16) return ERR_ARG;
     if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || n_kv == 0 || page_tokens == 0)
         return ERR_ARG;
     if (n_heads % n_kv_heads != 0) return ERR_ARG;
+    // An empty span is not "attend to nothing" — it is a caller that computed the window
+    // wrong, and softmax over no keys is 0/0. Refused rather than returned as NaNs.
+    if (kv_begin >= n_kv) return ERR_ARG;
     // One lane per channel of the head, so the accumulator lives in registers. 1024 is the
     // smallest maximum work-group size any conformant device may report.
     if (head_dim > 1024) return ERR_ARG;
@@ -1867,7 +1879,7 @@ int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_
                    float l = have_sink ? 1.0f : 0.0f;  // running softmax denominator
                    float acc = 0.0f;             // running sum of p_j * V_j, this lane's channel
 
-                   for (size_t j = 0; j < n_kv; ++j) {
+                   for (size_t j = kv_begin; j < n_kv; ++j) {
                        const size_t page = block_table[j / page_tokens];
                        const size_t slot = j % page_tokens;
                        const unsigned long base =

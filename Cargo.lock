@@ -1975,6 +1975,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sysinfo",
  "throbber-widgets-tui",
  "tui-input",
 ]

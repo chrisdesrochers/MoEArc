@@ -16,6 +16,7 @@
 //! | the split it chose          | `moearc serve <model> --dry-run`            |
 //! | context slider              | `--ctx <tokens>`                            |
 //! | expert-slot override        | `--moe-cache <slots>`                       |
+//! | host RAM budget             | `--host-budget <SIZE>` / `$MOEARC_HOST_BUDGET` |
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -65,6 +66,13 @@ pub struct GlobalArgs {
     /// Show more: -v adds the numbers behind each decision, -vv adds diagnostics.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Host RAM to keep model weights in, e.g. `24G`. Also `$MOEARC_HOST_BUDGET`.
+    ///
+    /// Weights past this are paged from the drive on demand — slower, and it still runs. The
+    /// value is clamped to what this machine has available, so it cannot starve the OS.
+    #[arg(long, global = true, value_name = "SIZE", value_parser = crate::host::parse_size)]
+    pub host_budget: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -150,6 +158,23 @@ impl Cli {
     pub fn plain_output(&self) -> bool {
         self.global.json || self.global.no_tui || !std::io::stdout().is_terminal()
     }
+
+    /// The host RAM budget the user asked for, if any: the flag, then the environment.
+    ///
+    /// `None` is not zero. It means "no preference", and the engine answers it with a
+    /// defensible default rather than with a constant chosen here — the same rule `--ctx`
+    /// follows, and for the same reason.
+    ///
+    /// A malformed environment variable is ignored rather than fatal. A stale export in a shell
+    /// profile should not stop the tool from starting; the flag is the channel for a value the
+    /// user is asserting right now, and clap rejects a bad one there.
+    pub fn host_budget(&self) -> Option<u64> {
+        self.global.host_budget.or_else(|| {
+            std::env::var(crate::host::HOST_BUDGET_ENV)
+                .ok()
+                .and_then(|v| crate::host::parse_size(&v).ok())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +226,20 @@ mod tests {
         assert_eq!(a.host, "127.0.0.1");
         assert!(a.ctx.is_none());
         assert!(a.moe_cache.is_none());
+    }
+
+    #[test]
+    fn the_host_budget_is_a_size_and_defaults_to_no_preference() {
+        assert!(Cli::parse_from(["moearc"]).global.host_budget.is_none());
+        let cli = Cli::parse_from(["moearc", "ls", "--host-budget", "24G"]);
+        assert_eq!(cli.global.host_budget, Some(24 << 30));
+        // Zero is a setting, not an absence: "keep nothing in RAM".
+        assert_eq!(Cli::parse_from(["moearc", "--host-budget", "0"]).global.host_budget, Some(0));
+    }
+
+    #[test]
+    fn a_malformed_host_budget_is_rejected_at_parse_time() {
+        assert!(Cli::try_parse_from(["moearc", "--host-budget", "lots"]).is_err());
     }
 
     #[test]

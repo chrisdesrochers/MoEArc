@@ -13,12 +13,15 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
+use moearc_engine::host_budget::{
+    BudgetPolicy, BudgetSource, HostBudget, ModelBytes, Placement, Tier, place,
+};
 use serde_json::{Value, json};
 
 use crate::cli::{Cli, Command, InfoArgs, LsArgs, PullArgs, ServeArgs};
 use crate::fit::{self, Fit, FitOutcome};
 use crate::format;
-use crate::source::{DeviceRow, ModelCard, Sources};
+use crate::source::{DeviceRow, HostReport, ModelCard, Sources};
 
 /// Exit code for a command whose backend does not exist yet.
 ///
@@ -48,6 +51,9 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
         Some(d) => models.iter().map(|m| fit::plan(d, m, cli.ctx)).collect(),
         None => Vec::new(),
     };
+    let host = sources.host.probe()?;
+    let budget = budget_for(cli, &host);
+    let placements = placements_for(&models, &host, budget);
 
     if cli.global.json {
         return emit(json!({
@@ -56,8 +62,14 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
             "verdict": devices.verdict,
             "requested_ctx": cli.ctx,
             "calibrated": false,
+            "host": host_json(&host, budget),
             "models": models,
             "fits": fits,
+            "placements": models
+                .iter()
+                .zip(&placements)
+                .map(|(m, p)| placement_json(&m.id, p))
+                .collect::<Vec<_>>(),
             "unreadable": sources.models.skipped(),
         }));
     }
@@ -89,6 +101,8 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
         println!("    {remedy}");
     }
 
+    print_host(&host, budget);
+
     if models.is_empty() {
         no_models(sources);
     } else if !fits.is_empty() {
@@ -97,10 +111,17 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
             None => "What will fit".to_string(),
         });
         let cols = fit::Columns::of(&models);
-        for (card, f) in models.iter().zip(&fits) {
-            print_fit_row(card, f, cols, cli.global.verbose);
+        print_fit_header(cols);
+        for ((card, f), p) in models.iter().zip(&fits).zip(&placements) {
+            print_fit_row(card, f, Some(p), cols, cli.global.verbose);
         }
         println!();
+        if placements.iter().any(|p| p.tier == Tier::RunsPagesFromDisk) {
+            println!(
+                "  note: past the budget is not past the machine — the excess is paged in from \
+                 the drive as it is needed, which is slower and is not a failure."
+            );
+        }
         println!(
             "  note: residency and context are computed from this card's free VRAM. The \
              headroom behind them is provisional, not measured on Arc."
@@ -109,6 +130,12 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
             println!(
                 "  note: a context at the minimum is not the card's limit — experts took \
                  everything above it. `--ctx <tokens>` trades slots back for context."
+            );
+            // Measured; see the same note in `tui::view::fit_panel` for the trace it comes from.
+            println!(
+                "  note: measured on a real Qwen3-30B routing trace, only 1.4% of its 6,144 \
+                 expert slots are touched on more than half of tokens, and every KV byte is \
+                 touched on all of them."
             );
         }
     }
@@ -133,18 +160,54 @@ fn no_models(sources: &Sources) {
     }
 }
 
-fn print_fit_row(card: &ModelCard, f: &Fit, cols: fit::Columns, verbose: u8) {
+/// The table's heading row. Present here for the same reason it is present in the interface:
+/// the cells hold bare numbers, so something has to say what they are.
+fn print_fit_header(cols: fit::Columns) {
+    println!(
+        "    {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
+        "model",
+        "quant",
+        "size",
+        "host",
+        "residency",
+        "ctx",
+        id = cols.id,
+        quant = cols.quant,
+        size = cols.size,
+        tier = fit::Columns::TIER,
+        res = cols.residency,
+        ctx = cols.ctx
+    );
+}
+
+fn print_fit_row(
+    card: &ModelCard,
+    f: &Fit,
+    placement: Option<&Placement>,
+    cols: fit::Columns,
+    verbose: u8,
+) {
     let mark = if f.fits() { "✓" } else { "·" };
     println!(
-        "  {mark} {:<id$} {:<quant$} {:>size$}   {}",
+        "  {mark} {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
         card.id,
         card.quant,
         format::bytes(card.file_bytes),
-        f.summary(),
+        placement.map_or("", |p| p.tier.label()),
+        f.residency_cell(),
+        f.context_cell(),
         id = cols.id,
         quant = cols.quant,
-        size = cols.size
+        size = cols.size,
+        tier = fit::Columns::TIER,
+        res = cols.residency,
+        ctx = cols.ctx
     );
+    if let Some(p) = placement
+        && verbose >= 1
+    {
+        println!("      {}", p.reason);
+    }
     if verbose >= 1 {
         match &f.outcome {
             FitOutcome::Fits { rationale, ceiling_tokens, .. } => {
@@ -333,6 +396,9 @@ fn print_plan(plan: &Fit, device: &DeviceRow, verbose: u8) {
             headroom_bytes,
             ceiling_tokens,
             context_at_floor,
+            // Already the last line of `rationale` below, in the planner's own words. Pulled
+            // out for the interface's table, where there is no room for the full reasoning.
+            yield_note: _,
             rationale,
         } => {
             println!("  Planned split");
@@ -399,12 +465,17 @@ fn info(cli: &Cli, sources: &Sources, args: &InfoArgs) -> Result<ExitCode> {
     let card = sources.models.resolve(&args.model)?;
     let devices = sources.devices.detect()?;
     let plan = devices.primary().map(|d| fit::plan(d, &card, args.ctx));
+    let host = sources.host.probe()?;
+    let budget = budget_for(cli, &host);
+    let placement = placements_for(std::slice::from_ref(&card), &host, budget).remove(0);
 
     if cli.global.json {
         return emit(json!({
             "source": provenance(sources),
             "model": card,
             "requested_ctx": args.ctx,
+            "host": host_json(&host, budget),
+            "placement": placement_json(&card.id, &placement),
             "plan": plan,
         }));
     }
@@ -449,6 +520,10 @@ fn info(cli: &Cli, sources: &Sources, args: &InfoArgs) -> Result<ExitCode> {
     }
     println!("  {:<18}{}", "requested ctx", requested(args.ctx));
     println!();
+    print_host(&host, budget);
+    println!("  {:<18}{}", "host tier", placement.tier.label());
+    println!("  {:<18}{}", "", placement.reason);
+    println!();
     match (&plan, devices.primary()) {
         (Some(p), Some(d)) => print_plan(p, d, cli.global.verbose),
         _ => println!("  no device to plan against — {}", devices.verdict.headline()),
@@ -470,6 +545,96 @@ fn requested(ctx: Option<u32>) -> String {
         Some(c) => format!("{} tokens", format::count(c as i64)),
         None => "largest that fits".to_string(),
     }
+}
+
+/// The budget this invocation is planning against.
+///
+/// One place, so the plain renderer and the interface cannot answer the same question
+/// differently. The clamp is the engine's, not this crate's.
+fn budget_for(cli: &Cli, host: &HostReport) -> HostBudget {
+    let memory = crate::host::memory(host);
+    let policy = BudgetPolicy::default();
+    match cli.host_budget() {
+        Some(want) => HostBudget::requested(memory, &policy, want),
+        None => HostBudget::default_for(memory, &policy),
+    }
+}
+
+fn placements_for(models: &[ModelCard], host: &HostReport, budget: HostBudget) -> Vec<Placement> {
+    let storage = crate::host::storage(host);
+    models
+        .iter()
+        .map(|c| {
+            place(ModelBytes { weights_bytes: c.file_bytes, on_disk: c.local }, budget, storage)
+        })
+        .collect()
+}
+
+/// The host tier, printed before the card's plan.
+///
+/// 🔴 First, deliberately. On this engine the card is not what decides whether a model can run
+/// — a 59 GiB model runs on an 11.33 GiB card — so the number that actually predicts how a
+/// model will feel is how much of it the host can hold.
+fn print_host(host: &HostReport, budget: HostBudget) {
+    section("Host RAM");
+    println!(
+        "  {:<18}{} of {} usable",
+        "budget",
+        format::bytes(budget.bytes()),
+        format::bytes(budget.max_bytes())
+    );
+    println!(
+        "  {:<18}{} available of {} fitted",
+        "memory",
+        format::bytes(host.available_bytes),
+        format::bytes(host.total_bytes)
+    );
+    println!("  {:<18}{} kept for the machine", "reserved", format::bytes(budget.reserved_bytes()));
+    if let BudgetSource::Clamped { asked } = budget.source() {
+        println!(
+            "  {:<18}{} was asked for; this machine does not have it available",
+            "clamped",
+            format::bytes(asked)
+        );
+    }
+    if host.models_free_bytes != u64::MAX {
+        println!("  {:<18}{} free", "model storage", format::bytes(host.models_free_bytes));
+    }
+}
+
+fn host_json(host: &HostReport, budget: HostBudget) -> Value {
+    let (source, asked) = match budget.source() {
+        BudgetSource::Default => ("default", None),
+        BudgetSource::Requested => ("requested", None),
+        BudgetSource::Clamped { asked } => ("clamped", Some(asked)),
+    };
+    json!({
+        "total_bytes": host.total_bytes,
+        "available_bytes": host.available_bytes,
+        // Absent rather than `u64::MAX` when it could not be measured: a sentinel in a JSON
+        // payload is a number to a script, and this one would read as an infinite drive.
+        "models_free_bytes": (host.models_free_bytes != u64::MAX).then_some(host.models_free_bytes),
+        "budget_bytes": budget.bytes(),
+        "budget_max_bytes": budget.max_bytes(),
+        "reserved_bytes": budget.reserved_bytes(),
+        "budget_source": source,
+        "budget_asked_bytes": asked,
+    })
+}
+
+fn placement_json(model: &str, p: &Placement) -> Value {
+    json!({
+        "model": model,
+        "tier": match p.tier {
+            Tier::RunsFromRam => "runs_from_ram",
+            Tier::RunsPagesFromDisk => "runs_pages_from_disk",
+            Tier::WillNotFit => "will_not_fit",
+        },
+        "runs": p.tier.runs(),
+        "ram_bytes": p.ram_bytes,
+        "disk_bytes": p.disk_bytes,
+        "reason": p.reason.to_string(),
+    })
 }
 
 fn section(title: &str) {

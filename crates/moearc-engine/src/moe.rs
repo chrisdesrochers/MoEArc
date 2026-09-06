@@ -238,8 +238,8 @@ pub enum Arch {
     /// **softmaxes after the top-k rather than before**, and **YaRN RoPE that engages from
     /// position 0**. Its experts are **MXFP4**, which is not a K-quant.
     ///
-    /// ⚠️ It also declares `attention.sliding_window = 128`, which this pass does **not**
-    /// implement — see [`Config::n_swa`].
+    /// It also declares `attention.sliding_window = 128`, on **alternating** blocks — see
+    /// [`Config::n_swa`] and [`Config::is_swa_block`].
     GptOss,
 }
 
@@ -301,13 +301,32 @@ pub struct Config {
     pub rope_scaling: Option<RopeScaling>,
     /// `attention.sliding_window`, when the file declares one.
     ///
-    /// 🔴 This pass does **not** implement sliding-window attention. The value is carried so
-    /// that a session longer than the window can be refused by name rather than silently
-    /// attending to keys llama.cpp would have masked. Below the window an SWA mask and a plain
-    /// causal mask are the same mask — `is_masked_swa` masks on `p1 - p0 >= n_swa`, which no
-    /// pair of positions inside one window satisfies — so a short context is exact, not
-    /// approximate.
+    /// The window is the span a *windowed* block may attend to: llama.cpp masks a key when
+    /// `p1 - p0 >= n_swa` (`llama_hparams::is_masked_swa`, `LLAMA_SWA_TYPE_STANDARD`), so a
+    /// query at `p1` sees keys `p1 - n_swa + 1 ..= p1`.
+    ///
+    /// 🔴 It does **not** apply to every block. See [`Config::swa_pattern`].
     pub n_swa: Option<usize>,
+    /// The period of the windowed/full alternation — llama.cpp's `set_swa_pattern(n)`.
+    ///
+    /// 🔴 **This is the whole difficulty of SWA on this family, and it is not visible in
+    /// `n_swa`.** `set_swa_pattern(n)` with `dense_first = false` sets
+    /// `is_swa[il] = il % n < n - 1`, so at the gpt-oss default of 2 the **even** blocks are
+    /// windowed and the odd ones are full causal attention. A model with a window is therefore
+    /// two attention regimes interleaved, not one — an implementation that windowed every block
+    /// would be wrong on half of them, and one that windowed none would be wrong on the other
+    /// half, and both stay fluent while being wrong.
+    ///
+    /// Read from `attention.sliding_window_pattern`; **2 when the file is silent**, which is
+    /// `llama_model_openai_moe::load_arch_hparams`'s own default. ⚠️ That default is a property
+    /// of the architecture, not of GGUF — `llama_model_gemma3` seeds the same variable with
+    /// **6** — so a family whose file omits the key needs its own arm here, which is one more
+    /// reason [`Config::from_model`] allowlists architectures by name.
+    ///
+    /// ⚠️ Gemma also needs something this pass does not have: `rope.freq_base_swa`, a *second*
+    /// RoPE base used only on the windowed blocks. [`Config::from_model`] refuses a file that
+    /// declares one rather than rotating every block at the same frequency.
+    pub swa_pattern: usize,
     /// The per-block suffix of the pre-FFN norm. `gpt-oss` spells it
     /// `post_attention_norm.weight`; everything else here spells it `ffn_norm.weight`.
     pub ffn_norm: &'static str,
@@ -584,6 +603,31 @@ impl Config {
         let n_swa = u64_key_opt(model, &format!("{arch}.attention.sliding_window"))
             .filter(|w| *w > 0)
             .map(|w| w as usize);
+        // `ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false)` over a
+        // `swa_period` already initialised to 2 — so an absent key means 2, not "no pattern".
+        let swa_pattern = u64_key_opt(model, &format!("{arch}.attention.sliding_window_pattern"))
+            .filter(|p| *p > 0)
+            .map_or(2, |p| p as usize);
+
+        // 🔴 A **second** thing sliding-window models can do, which this pass does not: give the
+        // windowed blocks their own RoPE base. `llm_graph_context` calls
+        // `model.get_rope_freq_base(cparams, il)` per block, and for a windowed block that is
+        // `hparams.rope_freq_base_train_swa` — seeded from the ordinary base and then overwritten
+        // by `rope.freq_base_swa` when the file has one. gpt-oss's files do not; Gemma 3's do,
+        // and there the two differ by two orders of magnitude (10k against 1M).
+        //
+        // Refused by name rather than ignored. The window alone is not what makes a model an SWA
+        // model, and a file that carries this key and is run without it is wrong on its first
+        // token in half its blocks — fluently.
+        if let Some(swa_base) = f32_key(model, &format!("{arch}.rope.freq_base_swa"))
+            && swa_base != rope_freq_base
+        {
+            return Err(EngineError::Unsupported(format!(
+                "`{arch}` declares rope.freq_base_swa = {swa_base} against a base of \
+                 {rope_freq_base}, so its windowed blocks rotate at a different frequency from \
+                 its full-attention blocks; this pass applies one RoPE base to every block"
+            )));
+        }
 
         Ok(Self {
             n_block,
@@ -605,6 +649,7 @@ impl Config {
             act,
             rope_scaling,
             n_swa,
+            swa_pattern,
             ffn_norm,
             has_attn_bias,
             has_sinks,
@@ -631,6 +676,96 @@ impl Config {
     /// `1/sqrt(head_dim)`, the scale llama.cpp passes to `build_attn`.
     fn kq_scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
+    }
+
+    /// Whether block `il` attends through a sliding window rather than to the whole prefix.
+    ///
+    /// This is `llama_hparams::set_swa_pattern(n, dense_first = false)` transcribed:
+    /// `is_swa[il] = il % n < n - 1`. At `n = 2` — gpt-oss and Gemma's mechanism — that is
+    /// "every even block", and the odd ones are ordinary full causal attention.
+    pub fn is_swa_block(&self, il: usize) -> bool {
+        self.n_swa.is_some() && self.swa_pattern > 0 && il % self.swa_pattern < self.swa_pattern - 1
+    }
+
+    /// The window block `il` attends through, or `None` if it sees everything.
+    pub fn swa_window(&self, il: usize) -> Option<usize> {
+        if self.is_swa_block(il) { self.n_swa } else { None }
+    }
+
+    /// How many of the model's blocks are windowed.
+    pub fn swa_blocks(&self) -> usize {
+        (0..self.n_block).filter(|il| self.is_swa_block(*il)).count()
+    }
+}
+
+/// How much KV cache one model needs at one context length, and how much windowing saves.
+///
+/// 🔴 The point of this type. A block that can only ever see the last `n_swa` positions does not
+/// need a cache of `n_ctx` positions — it needs `n_swa` of them, reused in a ring. On a card
+/// where the KV cache and the expert pool are competing for the same bytes, that is not a
+/// tidiness argument: every byte the cache gives back is a byte an expert slot can have, and an
+/// expert slot on gpt-oss-120B is 12.607 MiB.
+///
+/// The saving is only interesting at long context, and the arithmetic says exactly how
+/// interesting: a windowed block's cost stops growing at the window while a full block's keeps
+/// going, so at `n_ctx = n_swa` this saves nothing at all and the ratio approaches
+/// `full_blocks / n_block` as the context grows. At gpt-oss's alternating pattern that limit is
+/// **half the cache**, and half is reached slowly — [`KvGeometry::saved_bytes`] is the number to
+/// quote, never the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvGeometry {
+    /// Pages a full-attention block needs to hold `n_ctx` tokens.
+    pub pages: usize,
+    /// Pages a windowed block needs. Equal to `pages` when nothing is windowed, and never more
+    /// — a window wider than the context is not a saving, it is an over-allocation.
+    pub swa_pages: usize,
+    /// How many blocks are windowed.
+    pub swa_blocks: usize,
+    /// Blocks that cache anything at all.
+    pub n_block: usize,
+    /// Bytes of K and V actually allocated.
+    pub bytes: u64,
+    /// What would have been allocated if every block held a full cache.
+    pub bytes_full: u64,
+}
+
+impl KvGeometry {
+    /// Plan the cache for `n_ctx` tokens.
+    pub fn plan(cfg: &Config, n_ctx: usize) -> Self {
+        let pages = n_ctx.div_ceil(PAGE_TOKENS).max(1);
+        // 🔴 Rounded **up** to a whole page, and capped at the full cache. Up, because the ring
+        // has to hold every position in the window at once: `swa_pages * PAGE_TOKENS` is the
+        // ring's capacity, and a capacity below `n_swa` would have the oldest key in the window
+        // already overwritten by the newest. Capped, because a window wider than the context can
+        // never wrap.
+        let swa_pages = cfg.n_swa.map_or(pages, |w| w.div_ceil(PAGE_TOKENS).max(1).min(pages));
+        let swa_blocks = cfg.swa_blocks();
+        let per_page = (PAGE_TOKENS * cfg.n_embd_kv() * KV.elem_bytes() * 2) as u64;
+        let full_blocks = cfg.n_block - swa_blocks;
+        Self {
+            pages,
+            swa_pages,
+            swa_blocks,
+            n_block: cfg.n_block,
+            bytes: per_page * (full_blocks * pages + swa_blocks * swa_pages) as u64,
+            bytes_full: per_page * (cfg.n_block * pages) as u64,
+        }
+    }
+
+    /// Pages block `il` gets.
+    pub fn pages_of(&self, cfg: &Config, il: usize) -> usize {
+        if cfg.is_swa_block(il) { self.swa_pages } else { self.pages }
+    }
+
+    /// The ring's capacity in tokens. A windowed block stores position `p` at ring slot
+    /// `p % ring_tokens`, which is why the capacity must be at least the window.
+    pub fn ring_tokens(&self) -> usize {
+        self.swa_pages * PAGE_TOKENS
+    }
+
+    /// What windowing gave back.
+    pub fn saved_bytes(&self) -> u64 {
+        self.bytes_full - self.bytes
     }
 }
 
@@ -1282,8 +1417,24 @@ pub struct State<'c> {
     block_table: DeviceBuffer<'c>,
 
     /// One K and one V pool per block, paged and indexed through `block_table`.
+    ///
+    /// 🔴 **Not all the same size.** A windowed block gets `KvGeometry::swa_pages`, a full one
+    /// gets `KvGeometry::pages`; see [`KvGeometry`] for why that is the interesting half of
+    /// sliding-window attention rather than a detail of it.
     k_pages: Vec<DeviceBuffer<'c>>,
     v_pages: Vec<DeviceBuffer<'c>>,
+
+    /// The page table a **windowed** block indexes, instead of `block_table`.
+    ///
+    /// 🔴 It is cyclic — `swa_table[p] = p % swa_pages` — and that one line is the entire ring
+    /// buffer. Logical key `j` resolves to `swa_table[j / PAGE_TOKENS] * PAGE_TOKENS +
+    /// j % PAGE_TOKENS`, which is `j % ring_tokens`: a position and the position one ring
+    /// earlier share a slot, and no two positions inside one window do. So the kernel needs no
+    /// notion of a ring at all, and neither does `kv_append` — the wrap lives in this table.
+    ///
+    /// Constant for the life of the state, so it is uploaded once. `None` when no block is
+    /// windowed.
+    swa_block_table: Option<DeviceBuffer<'c>>,
 
     kv: PagedKvCache,
     begun: bool,
@@ -1321,6 +1472,8 @@ pub struct State<'c> {
     /// Set to `Some(Tap::default())` to capture per-block activations.
     pub tap: Option<Tap>,
     n_ctx: usize,
+    /// What the KV pools above were sized from.
+    kv_geom: KvGeometry,
 }
 
 impl<'c> State<'c> {
@@ -1332,15 +1485,27 @@ impl<'c> State<'c> {
         // and the attention output all reading half a projection.
         let n_embd_q = cfg.n_embd_q();
         let n_embd_kv = cfg.n_embd_kv();
-        let pages = n_ctx.div_ceil(PAGE_TOKENS).max(1);
+        let geom = KvGeometry::plan(cfg, n_ctx);
+        let pages = geom.pages;
         let page_elems = PAGE_TOKENS * n_embd_kv;
 
         let mut k_pages = Vec::with_capacity(cfg.n_block);
         let mut v_pages = Vec::with_capacity(cfg.n_block);
-        for _ in 0..cfg.n_block {
-            k_pages.push(ctx.alloc(pages * page_elems * KV.elem_bytes())?);
-            v_pages.push(ctx.alloc(pages * page_elems * KV.elem_bytes())?);
+        for il in 0..cfg.n_block {
+            let n = geom.pages_of(cfg, il);
+            k_pages.push(ctx.alloc(n * page_elems * KV.elem_bytes())?);
+            v_pages.push(ctx.alloc(n * page_elems * KV.elem_bytes())?);
         }
+
+        // Uploaded once: it does not depend on the sequence, only on the geometry.
+        let swa_block_table = if geom.swa_blocks > 0 {
+            let table: Vec<u32> = (0..pages).map(|p| (p % geom.swa_pages) as u32).collect();
+            let buf = ctx.alloc_n::<u32>(pages)?;
+            ctx.upload_slice(&buf, &table)?;
+            Some(buf)
+        } else {
+            None
+        };
 
         Ok(Self {
             tok: ctx.alloc_n::<u32>(1)?,
@@ -1370,6 +1535,7 @@ impl<'c> State<'c> {
             block_table: ctx.alloc_n::<u32>(pages)?,
             k_pages,
             v_pages,
+            swa_block_table,
             kv: PagedKvCache::new(pages as u32, PAGE_TOKENS as u32, n_ctx as u32)?,
             begun: false,
             n_kv: 0,
@@ -1386,6 +1552,7 @@ impl<'c> State<'c> {
             logits: vec![0.0; cfg.n_vocab],
             tap: None,
             n_ctx,
+            kv_geom: geom,
         })
     }
 
@@ -1461,27 +1628,18 @@ impl<'c, 'm> Model<'c, 'm> {
         let cfg = &weights.cfg;
         let n_slots = weights.n_slots();
 
-        // 🔴 Sliding-window attention is declared by `gpt-oss` and **not implemented here**.
+        // 🔴 Sliding-window attention. This used to be a refusal; it is now two regimes.
         //
-        // Below the window it does not have to be: llama.cpp masks a key when
-        // `p1 - p0 >= n_swa`, and no pair of positions inside a context of `n_swa` tokens
-        // satisfies that, so an SWA mask and a plain causal mask are the same mask and this
-        // pass is exact rather than approximate. Above it they diverge, silently and
-        // progressively — the first token past the window attends to one key llama.cpp has
-        // dropped, and the divergence grows from there.
+        // A windowed block sees keys `p1 - n_swa + 1 ..= p1` and a full block sees everything,
+        // and `Config::is_swa_block` says which is which — at gpt-oss's `set_swa_pattern(2)`,
+        // the even blocks are windowed and the odd ones are not. Both live in the same decode
+        // loop below, differing in exactly two arguments to `attn_decode_ext`: which page table
+        // to index, and where the key span starts.
         //
-        // ⚠️ It is also **alternating**: `set_swa_pattern(2)` makes even blocks windowed and
-        // odd blocks full causal, so implementing it means two masks and two KV caches, not
-        // one shorter cache.
-        if cfg.n_swa.is_some_and(|w| n_ctx > w) {
-            let w = cfg.n_swa.unwrap_or_default();
-            return Err(EngineError::Unsupported(format!(
-                "`{}` uses sliding-window attention with a {w}-token window on alternating \
-                 blocks, which this forward pass does not implement; a context of {n_ctx} \
-                 tokens would diverge from llama.cpp past position {w}. Load with n_ctx <= {w}.",
-                cfg.arch
-            )));
-        }
+        // ⚠️ Below the window the two regimes coincide — `is_masked_swa` masks on
+        // `p1 - p0 >= n_swa`, which no pair of positions inside one window satisfies — so a
+        // short context was always exact, which is why the old refusal was a correct thing to
+        // do rather than a workaround. Nothing about ≤ `n_swa` contexts changes here.
 
         // A step activates `n_expert_used` distinct experts of one block, so no policy can serve
         // a pool smaller than that — `ExpertCache::admit` refuses it rather than thrashing, and
@@ -1512,6 +1670,20 @@ impl<'c, 'm> Model<'c, 'm> {
                 let policy = memory::Policy {
                     min_context_tokens: n_ctx as u32,
                     ..memory::Policy::default()
+                };
+                // 🔴 Scaled by what the windowed blocks actually allocate. `ModelInfo` reads
+                // the header, which records the window but not the alternation, so its
+                // per-token figure is the full-cache one. A planner given that reserves for a
+                // cache larger than `State::new` builds and hands back expert slots that exist
+                // — the error is in the safe direction, but it is still wrong, and on this card
+                // 12.607 MiB is one expert.
+                let kv_geom = KvGeometry::plan(cfg, n_ctx);
+                let footprint = memory::ModelFootprint {
+                    kv_bytes_per_token: info
+                        .kv_bytes_per_token
+                        .saturating_mul(kv_geom.bytes)
+                        .div_ceil(kv_geom.bytes_full.max(1)),
+                    ..footprint
                 };
                 let allocation = memory::plan(
                     device,
@@ -1630,6 +1802,11 @@ impl<'c, 'm> Model<'c, 'm> {
         self.state.n_ctx
     }
 
+    /// The KV cache this model actually allocated, and what windowing saved.
+    pub fn kv_geometry(&self) -> KvGeometry {
+        self.state.kv_geom
+    }
+
     /// Run one token through every block and return its logits.
     ///
     /// The token is appended to the KV cache at the next free position, so calling this
@@ -1672,6 +1849,17 @@ impl<'c, 'm> Model<'c, 'm> {
             st.table_host.extend_from_slice(pages);
             ctx.upload_slice(&st.block_table, &st.table_host)?;
         }
+
+        // Where a **windowed** block writes this token. The ring holds `ring_tokens` slots, so
+        // position `p` lands at `p % ring_tokens` — page `(p / PAGE_TOKENS) % swa_pages` at the
+        // same in-page slot the full cache uses, since the ring is a whole number of pages.
+        //
+        // 🔴 The eviction this implies is exactly the right one, and it is worth seeing why:
+        // writing position `p` overwrites `p - ring_tokens`, and `ring_tokens >= n_swa`, so the
+        // position destroyed is one that has already left the window `[p - n_swa + 1, p]`. The
+        // token's own K and V are appended before it attends, and they do not displace anything
+        // it still needs.
+        let swa_page = ((pos as usize / PAGE_TOKENS) % st.kv_geom.swa_pages) as u32;
 
         {
             let _p = profile::scope("setup.upload");
@@ -1774,6 +1962,19 @@ impl<'c, 'm> Model<'c, 'm> {
                 )?;
             }
 
+            // 🔴 The two attention regimes, chosen per block. A windowed block indexes the
+            // cyclic table into its own short pool and starts its key span at
+            // `n_kv - n_swa`; a full block indexes the sequence's real page table and starts
+            // at 0. Everything else about the two is identical, which is the whole reason this
+            // is three bindings and not a second code path.
+            let (kv_table, kv_begin, kv_page) = match cfg.swa_window(bi) {
+                Some(w) => (
+                    st.swa_block_table.as_ref().expect("a windowed block implies its table"),
+                    st.n_kv.saturating_sub(w),
+                    swa_page,
+                ),
+                None => (&st.block_table, 0, page),
+            };
             {
                 let _p = profile::scope("attn.kv_append");
                 ctx.kv_append(
@@ -1781,7 +1982,7 @@ impl<'c, 'm> Model<'c, 'm> {
                     &st.v_pages[bi],
                     &st.k_roped,
                     &st.v,
-                    page,
+                    kv_page,
                     slot,
                     cfg.n_head_kv,
                     cfg.head_dim,
@@ -1796,11 +1997,12 @@ impl<'c, 'm> Model<'c, 'm> {
                     &st.q_roped,
                     &st.k_pages[bi],
                     &st.v_pages[bi],
-                    &st.block_table,
+                    kv_table,
                     b.attn_sinks.as_ref(),
                     cfg.n_head,
                     cfg.n_head_kv,
                     cfg.head_dim,
+                    kv_begin,
                     st.n_kv,
                     PAGE_TOKENS,
                     scale,
@@ -2317,6 +2519,139 @@ mod tests {
 
     fn e(layer: u16, expert: u16) -> ExpertRef {
         ExpertRef::new(layer, expert)
+    }
+
+    /// A gpt-oss-shaped config, so the SWA geometry can be checked without a 59 GiB file or a
+    /// card. Only the fields the KV geometry reads are meaningful; the rest are filled to make
+    /// a legal `Config`.
+    fn swa_config(n_block: usize, n_swa: Option<usize>, swa_pattern: usize) -> Config {
+        Config {
+            arch: "gpt-oss".to_string(),
+            kind: Arch::GptOss,
+            n_block,
+            n_embd: 2880,
+            n_ff: 2880,
+            n_head: 64,
+            n_head_kv: 8,
+            head_dim: 64,
+            n_rot: 64,
+            n_expert: 128,
+            n_expert_used: 4,
+            n_vocab: 201_088,
+            n_ctx_train: 131_072,
+            rms_eps: 1e-5,
+            rope_freq_base: 150_000.0,
+            qk_norm_per_head: false,
+            has_qk_norm: false,
+            gating: Gating::SoftmaxAfterTopK,
+            act: Activation::SwigluOai { alpha: 1.702, limit: 7.0 },
+            rope_scaling: None,
+            n_swa,
+            swa_pattern,
+            ffn_norm: "post_attention_norm.weight",
+            has_attn_bias: true,
+            has_sinks: true,
+            has_router_bias: true,
+            has_expert_bias: true,
+            bos: None,
+            eos: None,
+        }
+    }
+
+    #[test]
+    fn the_alternation_is_llama_cpps_set_swa_pattern_and_not_every_block() {
+        // `set_swa_pattern(n, dense_first = false)` is `is_swa[il] = il % n < n - 1`. At n = 2
+        // that is the EVEN blocks -- and getting this backwards is the failure mode the whole
+        // feature has, because both halves of the model stay fluent while half of them attend
+        // to the wrong keys.
+        let c = swa_config(36, Some(128), 2);
+        for il in 0..36 {
+            assert_eq!(c.is_swa_block(il), il % 2 == 0, "block {il}");
+        }
+        assert_eq!(c.swa_blocks(), 18);
+
+        // A model with no window has no windowed blocks, whatever the pattern says.
+        let none = swa_config(36, None, 2);
+        assert_eq!(none.swa_blocks(), 0);
+        assert!(!none.is_swa_block(0));
+
+        // Gemma's shape: one full block in six.
+        let g = swa_config(12, Some(1024), 6);
+        let windowed: Vec<usize> = (0..12).filter(|il| g.is_swa_block(*il)).collect();
+        assert_eq!(windowed, vec![0, 1, 2, 3, 4, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn a_windowed_blocks_ring_never_overwrites_a_key_still_inside_the_window() {
+        // 🔴 The correctness core of the short cache, and it needs no GPU: if two positions
+        // inside one window ever resolved to the same physical slot, the newer would destroy
+        // the older and attention would read a key from the wrong token -- finite, fluent, and
+        // wrong. Walked over a whole 4096-token sequence rather than argued.
+        const N_SWA: usize = 128;
+        const N_CTX: usize = 4096;
+        let cfg = swa_config(36, Some(N_SWA), 2);
+        let g = KvGeometry::plan(&cfg, N_CTX);
+        assert!(g.ring_tokens() >= N_SWA, "the ring is smaller than the window it must hold");
+
+        // Per position, not cumulative: a slot being reused across the sequence is the point
+        // of a ring. What must never happen is two keys of the SAME window sharing one.
+        let mut seen = vec![None; g.ring_tokens()];
+        for p in 0..N_CTX {
+            seen.iter_mut().for_each(|s| *s = None);
+            for j in p.saturating_sub(N_SWA - 1)..=p {
+                // Exactly what `State::new`'s table and the kernel's index arithmetic compute
+                // between them: table[j / PAGE_TOKENS] * PAGE_TOKENS + j % PAGE_TOKENS.
+                let slot = ((j / PAGE_TOKENS) % g.swa_pages) * PAGE_TOKENS + j % PAGE_TOKENS;
+                assert_eq!(slot, j % g.ring_tokens(), "the cyclic table is not a ring");
+                if let Some(prev) = seen[slot] {
+                    panic!("at position {p}, keys {prev} and {j} share slot {slot}");
+                }
+                seen[slot] = Some(j);
+            }
+        }
+    }
+
+    #[test]
+    fn windowing_saves_nothing_below_the_window_and_approaches_half_above_it() {
+        // The honest shape of the saving. It is zero where the old refusal used to bite, and it
+        // is bounded by the fraction of blocks that are windowed -- never more.
+        let cfg = swa_config(36, Some(128), 2);
+
+        let at_window = KvGeometry::plan(&cfg, 128);
+        assert_eq!(at_window.saved_bytes(), 0, "a window as wide as the context saves nothing");
+        assert_eq!(at_window.swa_pages, at_window.pages);
+
+        let mut last = 0.0;
+        for n_ctx in [256usize, 1024, 8192, 131_072] {
+            let g = KvGeometry::plan(&cfg, n_ctx);
+            let frac = g.saved_bytes() as f64 / g.bytes_full as f64;
+            assert!(frac > last, "the saving must grow with context: {frac} after {last}");
+            assert!(frac < 0.5, "18 of 36 blocks cannot save more than half: {frac}");
+            last = frac;
+        }
+        assert!(last > 0.49, "at 131072 tokens the saving should be nearly half, got {last}");
+
+        // And it is a real allocation, not an accounting fiction: 18 blocks of 4 pages each
+        // against 18 of 64.
+        let g = KvGeometry::plan(&cfg, 2048);
+        assert_eq!((g.pages, g.swa_pages), (64, 4));
+        let per_page = (PAGE_TOKENS * cfg.n_embd_kv() * KV.elem_bytes() * 2) as u64;
+        assert_eq!(g.bytes, per_page * (18 * 64 + 18 * 4));
+    }
+
+    #[test]
+    fn a_model_with_no_window_allocates_exactly_what_it_used_to() {
+        // The regression gate for OLMoE and Qwen3: no window means no second table, no short
+        // pools, and byte-for-byte the cache these models had before SWA existed.
+        let cfg = swa_config(24, None, 2);
+        let g = KvGeometry::plan(&cfg, 1000);
+        assert_eq!(g.swa_blocks, 0);
+        assert_eq!(g.saved_bytes(), 0);
+        assert_eq!(g.bytes, g.bytes_full);
+        assert_eq!(g.pages, 1000usize.div_ceil(PAGE_TOKENS));
+        for il in 0..24 {
+            assert_eq!(g.pages_of(&cfg, il), g.pages);
+        }
     }
 
     /// Every expert a step names must end up in a slot of its own once the plan is executed.

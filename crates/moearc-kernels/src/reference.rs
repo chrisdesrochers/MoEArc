@@ -811,6 +811,12 @@ pub fn kv_append(
 ///
 /// Causality is the loop bound: `n_kv` counts the keys at or before the query, which for decode
 /// is every key in the cache including the query's own, already appended.
+///
+/// 🔴 `kv_begin` is the other end of that bound, and it is what **sliding-window attention**
+/// means here: the span is `[kv_begin, n_kv)`, so a window of `n_swa` is
+/// `kv_begin = n_kv.saturating_sub(n_swa)`. `0` is full causal attention. Deliberately written
+/// as a span rather than as an additive `-inf` mask, so that this and the kernel are two
+/// different programs for the same function rather than one program written twice.
 #[allow(clippy::too_many_arguments)]
 pub fn attn_decode(
     q: &[f32],
@@ -820,12 +826,14 @@ pub fn attn_decode(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    kv_begin: usize,
     n_kv: usize,
     page_tokens: usize,
     scale: f32,
 ) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert!(n_kv > 0 && n_heads % n_kv_heads == 0);
+    assert!(kv_begin < n_kv, "an empty key span is a window computed wrong");
     assert!(block_table.len() >= n_kv.div_ceil(page_tokens));
     let group = n_heads / n_kv_heads;
     let mut out = vec![0.0f32; n_heads * head_dim];
@@ -834,7 +842,7 @@ pub fn attn_decode(
         let kvh = h / group;
         let qh = &q[h * head_dim..(h + 1) * head_dim];
 
-        let scores: Vec<f64> = (0..n_kv)
+        let scores: Vec<f64> = (kv_begin..n_kv)
             .map(|j| {
                 let page = block_table[j / page_tokens];
                 let slot = (j % page_tokens) as u32;
@@ -851,7 +859,8 @@ pub fn attn_decode(
 
         for d in 0..head_dim {
             let mut acc = 0.0f64;
-            for (j, e) in exps.iter().enumerate() {
+            for (i, e) in exps.iter().enumerate() {
+                let j = kv_begin + i;
                 let page = block_table[j / page_tokens];
                 let slot = (j % page_tokens) as u32;
                 let base = kv_index(page, slot, kvh, 0, n_kv_heads, head_dim, page_tokens);

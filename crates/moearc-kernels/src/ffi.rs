@@ -226,6 +226,7 @@ unsafe extern "C" {
         n_heads: c_ulong,
         n_kv_heads: c_ulong,
         head_dim: c_ulong,
+        kv_begin: c_ulong,
         n_kv: c_ulong,
         page_tokens: c_ulong,
         scale: c_float,

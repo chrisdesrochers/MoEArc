@@ -20,9 +20,8 @@ out of the box.
 > 🔴 **Not yet:** no batched prefill, so there is no counterpart to llama.cpp's prefill
 > throughput. Matvecs run at 25–29% of the card's peak bandwidth against llama.cpp's 63%.
 > No adaptive policy — the residency fractions above were found by sweeping, not chosen by
-> the engine. Sliding-window models are refused above 128 tokens of context rather than
-> silently approximated. **KV is fp16 only** -- there is no quantised KV path, so long
-> context costs twice what it needs to.
+> the engine. **KV is fp16 only** -- there is no quantised KV path, so long context costs
+> twice what it needs to.
 
 ```
 ╭ What will fit ──────────────────────────────────────────────────────────────────╮

@@ -22,6 +22,7 @@ mod cli;
 mod detect;
 mod fit;
 mod format;
+mod host;
 mod plain;
 mod source;
 mod theme;

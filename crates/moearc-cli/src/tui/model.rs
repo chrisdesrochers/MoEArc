@@ -12,12 +12,13 @@
 //! anywhere.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use moearc_engine::host_budget::{BudgetPolicy, HostBudget, ModelBytes, Placement, place};
 use throbber_widgets_tui::ThrobberState;
 use tui_input::Input;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::fit::{self, Fit};
-use crate::source::{DeviceReport, ModelCard, ServeSample, TransferPlan};
+use crate::source::{DeviceReport, HostReport, ModelCard, ServeSample, TransferPlan};
 
 /// The frame interval. Also the unit progress is integrated over, so the two cannot drift
 /// apart the way a separate animation clock would.
@@ -109,6 +110,21 @@ pub struct Model {
     /// The context the user asked for, or `None` for "whatever fits". Not defaulted to a
     /// constant: see `fit::plan`.
     pub ctx_request: Option<u32>,
+    /// What this machine has: RAM, and room where models are kept. `None` until the probe
+    /// lands, which is what keeps the budget control off screen rather than showing zeroes.
+    pub host: Option<HostReport>,
+    /// How much host RAM the model's weights may occupy.
+    ///
+    /// 🔴 The second half of the plan, and on this project the more important half. VRAM
+    /// decides how many experts are resident; this decides whether a miss on the rest is a copy
+    /// from RAM or a read from a drive. A model far larger than the card runs either way — see
+    /// `moearc_engine::host_budget`.
+    pub budget: Option<HostBudget>,
+    /// A budget the user asked for on the command line, applied when the probe lands. Held
+    /// separately because a request cannot be clamped until the machine has been measured.
+    pub budget_request: Option<u64>,
+    /// Parallel to `models`, like `fits`. Recomputed whenever the budget or the catalog moves.
+    pub placements: Vec<Placement>,
     pub tick: u64,
     pub throbber: ThrobberState,
     pub help: bool,
@@ -127,7 +143,11 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(ctx_request: Option<u32>, provenance: Option<&'static str>) -> Self {
+    pub fn new(
+        ctx_request: Option<u32>,
+        budget_request: Option<u64>,
+        provenance: Option<&'static str>,
+    ) -> Self {
         Self {
             screen: Screen::Devices,
             report: None,
@@ -140,6 +160,10 @@ impl Model {
             download: None,
             serving: None,
             ctx_request,
+            host: None,
+            budget: None,
+            budget_request,
+            placements: Vec::new(),
             tick: 0,
             throbber: ThrobberState::default(),
             help: false,
@@ -169,6 +193,56 @@ impl Model {
 
     pub fn selected_fit(&self) -> Option<&Fit> {
         self.fits.get(self.model_row)
+    }
+
+    pub fn selected_placement(&self) -> Option<&Placement> {
+        self.placements.get(self.model_row)
+    }
+
+    /// Re-classify every model against the current host budget.
+    ///
+    /// Separate from `recompute_fits` because the two have different inputs and different
+    /// triggers: a fit changes when the card or the requested context does, a placement changes
+    /// every time the user touches the budget. Recomputing both on either would make the budget
+    /// key re-plan four models' VRAM for no reason, at 100 ms a frame.
+    pub fn recompute_placements(&mut self) {
+        let (Some(budget), Some(host)) = (self.budget, self.host.as_ref()) else {
+            self.placements.clear();
+            return;
+        };
+        let storage = crate::host::storage(host);
+        self.placements = self
+            .models
+            .iter()
+            .map(|c| {
+                place(
+                    // The whole file. See `ModelBytes::weights_bytes` for why this is not
+                    // discounted by whatever the card is holding.
+                    ModelBytes { weights_bytes: c.file_bytes, on_disk: c.local },
+                    budget,
+                    storage,
+                )
+            })
+            .collect();
+    }
+
+    /// Move the budget and re-classify. Clamping lives in the engine, so a key held down
+    /// cannot walk past what the machine has.
+    fn nudge_budget(&mut self, want: u64) {
+        let Some(b) = self.budget else { return };
+        self.budget = Some(b.set(want));
+        self.recompute_placements();
+    }
+
+    /// Move the context dial one rung and re-plan.
+    ///
+    /// 🔴 This does **no** arithmetic of its own. It changes the request and hands it back to
+    /// `moearc_engine::memory::plan`, which owns the rule that KV pages and expert slots come
+    /// out of one pool. A second estimate here would eventually disagree with the engine's, and
+    /// a screen that disagrees with the allocator is worse than a screen with no number on it.
+    fn nudge_context(&mut self, delta: isize) {
+        self.ctx_request = fit::ladder_step(self.ctx_request, delta);
+        self.recompute_fits();
     }
 
     /// Re-plan every model against the primary device.
@@ -218,6 +292,8 @@ pub enum Msg {
     Detected(DeviceReport),
     /// The catalog arrived.
     Catalog(Vec<ModelCard>),
+    /// The host machine was measured.
+    Host(HostReport),
     /// A download was sized and may begin.
     TransferReady(TransferPlan),
     /// A server came up.
@@ -264,6 +340,24 @@ pub fn update(m: &mut Model, msg: Msg) -> Action {
             m.model_row = 0;
             m.models = models;
             m.recompute_fits();
+            m.recompute_placements();
+            Action::None
+        }
+        Msg::Host(report) => {
+            let memory = crate::host::memory(&report);
+            let policy = BudgetPolicy::default();
+            // A request the user typed is honoured through `requested`, which clamps it and
+            // records that it did. Nobody's preference means the engine's default, never a
+            // constant chosen here.
+            m.budget = Some(match (m.budget, m.budget_request) {
+                // A rescan re-measures the machine, and must not undo a budget the user set
+                // with the keys — it only re-clamps it against the fresh reading.
+                (Some(existing), _) => HostBudget::requested(memory, &policy, existing.bytes()),
+                (None, Some(want)) => HostBudget::requested(memory, &policy, want),
+                (None, None) => HostBudget::default_for(memory, &policy),
+            });
+            m.host = Some(report);
+            m.recompute_placements();
             Action::None
         }
         Msg::TransferReady(plan) => {
@@ -347,6 +441,44 @@ fn on_key(m: &mut Model, key: KeyEvent) -> Action {
             let screens = m.screens();
             if let Some(s) = screens.get(want) {
                 m.screen = *s;
+            }
+            return Action::None;
+        }
+        // The budget control, global rather than per-screen: the models list and the "what
+        // will fit" table both re-classify under it, and a control that only worked on one of
+        // the two screens showing its effect would be a puzzle.
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            if let Some(b) = m.budget {
+                m.nudge_budget(b.bytes().saturating_sub(b.step_bytes()));
+            }
+            return Action::None;
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            if let Some(b) = m.budget {
+                m.nudge_budget(b.bytes().saturating_add(b.step_bytes()));
+            }
+            return Action::None;
+        }
+        KeyCode::Char('0') => {
+            m.nudge_budget(0);
+            return Action::None;
+        }
+        // The second dial. VRAM has two claimants and they trade one for one, so the context
+        // control sits beside the RAM one and moves the same table.
+        KeyCode::Char('[') => {
+            m.nudge_context(-1);
+            return Action::None;
+        }
+        KeyCode::Char(']') => {
+            m.nudge_context(1);
+            return Action::None;
+        }
+        KeyCode::Char('m') => {
+            // The ceiling by name rather than by clamping `u64::MAX` down to it: the two land
+            // on the same number, and only one of them can ever put an absurd figure in a
+            // message about what the user asked for.
+            if let Some(b) = m.budget {
+                m.nudge_budget(b.max_bytes());
             }
             return Action::None;
         }
@@ -463,9 +595,10 @@ fn on_key_editing(m: &mut Model, key: KeyEvent) -> Action {
 pub(crate) mod tests {
     use super::*;
     use crate::source::{
-        DeviceSource, ModelCatalog, ServeStats, StubCatalog, StubDeviceSource, StubServeStats,
-        StubTransfers, TransferSource,
+        DeviceSource, HostSource, ModelCatalog, ServeStats, StubCatalog, StubDeviceSource,
+        StubHost, StubServeStats, StubTransfers, TransferSource,
     };
+    use moearc_engine::host_budget::Tier;
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -473,9 +606,10 @@ pub(crate) mod tests {
 
     /// A model in the state the runtime hands to `view` once startup has settled.
     pub(crate) fn loaded() -> Model {
-        let mut m = Model::new(None, Some(crate::source::Sources::stub().stub_parts));
+        let mut m = Model::new(None, None, Some(crate::source::Sources::stub().stub_parts));
         update(&mut m, Msg::Detected(StubDeviceSource.detect().unwrap()));
         update(&mut m, Msg::Catalog(StubCatalog.curated().unwrap()));
+        update(&mut m, Msg::Host(StubHost.probe().unwrap()));
         m
     }
 
@@ -493,6 +627,138 @@ pub(crate) mod tests {
         assert_eq!(update(&mut m, key(KeyCode::Char('r'))), Action::Detect);
         assert!(m.report.is_none(), "the stale table must come down with the request");
         assert!(m.fits.is_empty());
+    }
+
+    #[test]
+    fn the_budget_starts_at_the_engine_default_and_every_model_is_classified() {
+        let m = loaded();
+        let b = m.budget.expect("the probe landed");
+        assert_eq!(b.bytes(), b.max_bytes(), "no preference means the ceiling");
+        assert!(b.bytes() < StubHost.probe().unwrap().available_bytes, "the reserve is real");
+        assert_eq!(m.placements.len(), m.models.len());
+    }
+
+    #[test]
+    fn a_budget_asked_for_on_the_command_line_is_applied_when_the_probe_lands() {
+        let mut m = Model::new(None, Some(6 << 30), None);
+        assert!(m.budget.is_none(), "nothing to clamp against until the machine is measured");
+        update(&mut m, Msg::Catalog(StubCatalog.curated().unwrap()));
+        update(&mut m, Msg::Host(StubHost.probe().unwrap()));
+        assert_eq!(m.budget.unwrap().bytes(), 6 << 30);
+        assert_eq!(m.placements.len(), m.models.len());
+    }
+
+    #[test]
+    fn the_budget_keys_move_it_and_re_classify_underneath() {
+        let mut m = loaded();
+        let top = m.budget.unwrap().bytes();
+        update(&mut m, key(KeyCode::Char('-')));
+        assert!(m.budget.unwrap().bytes() < top);
+        update(&mut m, key(KeyCode::Char('+')));
+        assert_eq!(m.budget.unwrap().bytes(), top);
+
+        // Zero is the demonstration: nothing is kept in RAM, so nothing runs from it, and
+        // every model still runs.
+        update(&mut m, key(KeyCode::Char('0')));
+        assert_eq!(m.budget.unwrap().bytes(), 0);
+        for (card, p) in m.models.iter().zip(&m.placements) {
+            if card.local {
+                assert_eq!(p.tier, Tier::RunsPagesFromDisk, "{} at a zero budget", card.id);
+                assert!(p.tier.runs(), "a model that pages is a model that runs");
+            }
+        }
+
+        // And back to the top, which cannot overshoot, and does not read as a clamp.
+        update(&mut m, key(KeyCode::Char('m')));
+        let b = m.budget.unwrap();
+        assert_eq!(b.bytes(), top);
+        assert!(
+            !matches!(b.source(), moearc_engine::host_budget::BudgetSource::Clamped { .. }),
+            "a key press is not a number the user typed"
+        );
+    }
+
+    #[test]
+    fn the_context_dial_buys_context_with_expert_slots() {
+        // The demo, as a test: one key press, and the viewer sees the residency figure fall as
+        // the context figure rises. Both numbers come from the engine's planner.
+        let mut m = loaded();
+        m.ctx_request = Some(2_048);
+        m.recompute_fits();
+        let before = m.fits[0].clone();
+        update(&mut m, key(KeyCode::Char(']')));
+        assert_eq!(m.ctx_request, Some(4_096));
+        let after = m.fits[0].clone();
+        let fit::FitOutcome::Fits { resident_experts: was, context_tokens: short, .. } =
+            before.outcome
+        else {
+            panic!("expected a fit")
+        };
+        let fit::FitOutcome::Fits { resident_experts: now, context_tokens: long, .. } =
+            after.outcome
+        else {
+            panic!("expected a fit")
+        };
+        assert!(long > short, "the dial bought context");
+        assert!(now < was, "and paid for it in expert slots");
+    }
+
+    #[test]
+    fn the_context_dial_stops_at_both_ends() {
+        let mut m = loaded();
+        for _ in 0..40 {
+            update(&mut m, key(KeyCode::Char('[')));
+        }
+        assert_eq!(m.ctx_request, None, "the bottom is `largest that fits`, not zero");
+        for _ in 0..40 {
+            update(&mut m, key(KeyCode::Char(']')));
+        }
+        assert_eq!(m.ctx_request, *fit::CONTEXT_LADDER.last().unwrap());
+    }
+
+    #[test]
+    fn a_context_the_hardware_cannot_serve_is_refused_with_the_engine_s_own_sentence() {
+        // The honest state, and it must reach the screen rather than being clamped away.
+        // 262,144 tokens of f16 KV is past what a 12 GiB card can hold for this model.
+        let mut m = loaded();
+        m.ctx_request = Some(262_144);
+        m.recompute_fits();
+        let refused = m.fits.iter().filter(|f| !f.fits()).count();
+        assert!(refused > 0, "at least one model must be refused at 256K on a 12 GiB card");
+        for f in m.fits.iter().filter(|f| !f.fits()) {
+            let fit::FitOutcome::DoesNotFit { reason, .. } = &f.outcome else { unreachable!() };
+            assert!(reason.len() > 30, "the refusal is a sentence, not a code: {reason}");
+        }
+    }
+
+    #[test]
+    fn holding_the_budget_key_down_never_walks_past_the_machine() {
+        let mut m = loaded();
+        for _ in 0..200 {
+            update(&mut m, key(KeyCode::Char('+')));
+        }
+        let b = m.budget.unwrap();
+        assert_eq!(b.bytes(), b.max_bytes());
+        assert!(b.bytes() < b.memory().available_bytes);
+        for _ in 0..500 {
+            update(&mut m, key(KeyCode::Char('-')));
+        }
+        assert_eq!(m.budget.unwrap().bytes(), 0, "and it stops at nothing rather than wrapping");
+    }
+
+    #[test]
+    fn the_budget_keys_are_text_while_the_repo_field_has_focus() {
+        // `-` and `+` are legal in a Hugging Face repo id, and a control that ate them would be
+        // discovered by a user halfway through pasting one.
+        let mut m = loaded();
+        m.screen = Screen::Models;
+        let top = m.budget.unwrap().bytes();
+        update(&mut m, key(KeyCode::Char('/')));
+        for c in "org/model-0".chars() {
+            update(&mut m, key(KeyCode::Char(c)));
+        }
+        assert_eq!(m.repo_input.value(), "org/model-0");
+        assert_eq!(m.budget.unwrap().bytes(), top, "the budget did not move");
     }
 
     #[test]

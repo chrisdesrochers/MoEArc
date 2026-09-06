@@ -318,6 +318,31 @@ impl ModelCard {
 }
 
 // ---------------------------------------------------------------------------------------
+// The host machine
+// ---------------------------------------------------------------------------------------
+
+/// What the machine underneath the card offers a memory-mapped model.
+///
+/// 🔴 This is a first-class part of the report, not a detail. MoEArc runs models several times
+/// the size of the card's memory, so the question that decides whether a model is pleasant to
+/// use is not how much VRAM there is — it is how much of the file the host can keep in the page
+/// cache, and therefore whether a cache miss is a copy over PCIe or a read from a drive. See
+/// `moearc_engine::host_budget`, which owns the reasoning this type feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HostReport {
+    /// RAM fitted to the machine.
+    pub total_bytes: u64,
+    /// RAM the operating system says can be used without pushing something else out.
+    pub available_bytes: u64,
+    /// Free space on the filesystem holding the model directory.
+    ///
+    /// The models' own filesystem, not the root one. They differ by orders of magnitude on any
+    /// machine with a dedicated pool for them, and the one that decides whether a download fits
+    /// is the one the models live on.
+    pub models_free_bytes: u64,
+}
+
+// ---------------------------------------------------------------------------------------
 // Transfers and serving
 // ---------------------------------------------------------------------------------------
 
@@ -384,6 +409,11 @@ pub trait ModelCatalog {
     }
 }
 
+/// Measure the host machine. Implemented by [`crate::host`].
+pub trait HostSource {
+    fn probe(&self) -> anyhow::Result<HostReport>;
+}
+
 /// Size a download before starting it. Implemented by `moearc-model`.
 pub trait TransferSource {
     fn plan(&self, repo: &str) -> anyhow::Result<TransferPlan>;
@@ -401,6 +431,7 @@ pub trait ServeStats {
 pub struct Sources {
     pub devices: Box<dyn DeviceSource>,
     pub models: Box<dyn ModelCatalog>,
+    pub host: Box<dyn HostSource>,
     pub transfers: Box<dyn TransferSource>,
     pub serve: Box<dyn ServeStats>,
     /// True while any of the above is a fixture. Surfaced in the footer and in `--json`,
@@ -435,6 +466,7 @@ impl Sources {
     pub fn real(models_dir: std::path::PathBuf) -> Self {
         Self {
             devices: Box::new(crate::detect::LevelZeroDevices),
+            host: Box::new(crate::host::RealHost::new(models_dir.clone())),
             models: Box::new(crate::catalog::LocalCatalog::new(models_dir)),
             transfers: Box::new(StubTransfers),
             serve: Box::new(StubServeStats),
@@ -449,6 +481,7 @@ impl Sources {
     pub fn stub() -> Self {
         Self {
             devices: Box::new(StubDeviceSource),
+            host: Box::new(StubHost),
             models: Box::new(StubCatalog),
             transfers: Box::new(StubTransfers),
             serve: Box::new(StubServeStats),
@@ -722,6 +755,18 @@ impl ModelCatalog for StubCatalog {
                      pass a full Hugging Face repo id"
                 )
             })
+    }
+}
+
+pub struct StubHost;
+
+impl HostSource for StubHost {
+    fn probe(&self) -> anyhow::Result<HostReport> {
+        Ok(HostReport {
+            total_bytes: 96 * 1024 * 1024 * 1024,
+            available_bytes: 74_088_284_160,
+            models_free_bytes: 3_298_534_883_328,
+        })
     }
 }
 

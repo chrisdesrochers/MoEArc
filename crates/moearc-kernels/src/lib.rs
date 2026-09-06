@@ -1121,6 +1121,9 @@ impl Context {
     /// needs the mask, and [`Context::softmax_ext`] is where that lives — this kernel does not
     /// cover prefill and does not pretend to.
     ///
+    /// Attends to every cached key. [`Context::attn_decode_ext`] takes the span, which is what
+    /// sliding-window attention needs.
+    ///
     /// Keys are reached through `block_table`, which maps a sequence's logical page index to a
     /// physical page. The pages are not contiguous and must not be assumed to be: a sequence
     /// that outlives a neighbour gets whatever the allocator has free.
@@ -1154,6 +1157,7 @@ impl Context {
             n_heads,
             n_kv_heads,
             head_dim,
+            0,
             n_kv,
             page_tokens,
             scale,
@@ -1161,7 +1165,17 @@ impl Context {
         )
     }
 
-    /// [`Context::attn_decode`] with **attention sinks**.
+    /// [`Context::attn_decode`] with **attention sinks** and an explicit key span.
+    ///
+    /// 🔴 `kv_begin` is the first logical key the query may attend to; the span is
+    /// `[kv_begin, n_kv)`. It is how **sliding-window attention** is expressed here. llama.cpp
+    /// masks a key when `p1 - p0 >= n_swa` (`llama_hparams::is_masked_swa`,
+    /// `LLAMA_SWA_TYPE_STANDARD`), and for one query at `p1 = n_kv - 1` that is exactly
+    /// `kv_begin = n_kv.saturating_sub(n_swa)`. `0` is full causal attention.
+    ///
+    /// ⚠️ The span is over **logical** keys. The caller still supplies the block table that maps
+    /// a logical page to a physical one, so a ring-buffer cache is expressed by handing this a
+    /// cyclic table rather than by anything here.
     ///
     /// 🔴 A sink is one extra logit per query head that enters the softmax denominator and has
     /// no value vector — llama.cpp's `ggml_soft_max_add_sinks`. Its effect is that a head's
@@ -1182,6 +1196,7 @@ impl Context {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        kv_begin: usize,
         n_kv: usize,
         page_tokens: usize,
         scale: f32,
@@ -1192,6 +1207,11 @@ impl Context {
         }
         if page_tokens == 0 {
             return Err(KernelError::BadArgument("page_tokens must be non-zero"));
+        }
+        // Named here rather than left to the kernel's generic argument error: an empty span is
+        // a window computed wrong, and softmax over no keys is 0/0.
+        if kv_begin >= n_kv {
+            return Err(KernelError::BadArgument("kv_begin is not before n_kv"));
         }
         q.require("query", n_heads * head_dim * 4)?;
         out.require("attention output", n_heads * head_dim * 4)?;
@@ -1211,6 +1231,7 @@ impl Context {
                 n_heads as ffi::c_ulong,
                 n_kv_heads as ffi::c_ulong,
                 head_dim as ffi::c_ulong,
+                kv_begin as ffi::c_ulong,
                 n_kv as ffi::c_ulong,
                 page_tokens as ffi::c_ulong,
                 scale,

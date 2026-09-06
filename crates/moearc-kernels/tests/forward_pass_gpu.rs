@@ -569,6 +569,7 @@ fn paged_attention_matches_the_cpu_reference_across_scattered_pages() {
             HEADS,
             KV_HEADS,
             HEAD_DIM,
+            0,
             N_KV,
             PAGE_TOKENS,
             scale,
@@ -657,6 +658,7 @@ fn paged_attention_handles_grouped_query_heads() {
         HEADS,
         KV_HEADS,
         HEAD_DIM,
+        0,
         N_KV,
         PAGE_TOKENS,
         scale,
@@ -739,6 +741,149 @@ fn attention_with_a_single_cached_key_returns_that_value_exactly() {
         }
     }
     eprintln!("single-key attention reproduced V exactly across {HEADS} heads");
+}
+
+#[test]
+fn a_windowed_span_attends_to_the_last_keys_and_only_those() {
+    if !gpu_available() {
+        return;
+    }
+    // 🔴 The gate on sliding-window attention at the kernel seam. `kv_begin` is the first key
+    // the query may see, so `[kv_begin, n_kv)` is llama.cpp's SWA span: `is_masked_swa` drops a
+    // key when `p1 - p0 >= n_swa`, which for one query at `p1 = n_kv - 1` is
+    // `kv_begin = n_kv - n_swa`.
+    //
+    // Three claims, and the second is the one that matters: a kernel that ignored `kv_begin`
+    // would satisfy the first (it agrees with a reference that also ignored it — but the
+    // reference is a *span* loop, so it cannot) and would fail the second outright.
+    let ctx = Context::new().unwrap();
+    const HEADS: usize = 8;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    const PAGE_TOKENS: usize = 4;
+    const PAGES: usize = 8;
+    const N_KV: usize = 21;
+    // Not a page boundary: the window starts mid-page, which is where an off-by-one that
+    // rounded the span to whole pages would show.
+    const WINDOW: usize = 6;
+    const BEGIN: usize = N_KV - WINDOW;
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let mut rng = Rng::new(0x0000_5A11);
+
+    let block_table: Vec<u32> = vec![7, 0, 4, 2, 6, 1];
+    let pool = PAGES * PAGE_TOKENS * KV_HEADS * HEAD_DIM;
+    let dk = ctx.alloc_n::<f32>(pool).unwrap();
+    let dv = ctx.alloc_n::<f32>(pool).unwrap();
+    let fx = fill_cache(
+        &ctx,
+        &dk,
+        &dv,
+        &block_table,
+        N_KV,
+        KV_HEADS,
+        HEAD_DIM,
+        PAGE_TOKENS,
+        PAGES,
+        KvType::F32,
+        &mut rng,
+    );
+
+    let q = rng.vec_unit(HEADS * HEAD_DIM);
+    let dq = ctx.alloc_n::<f32>(q.len()).unwrap();
+    let dbt = ctx.alloc_n::<u32>(block_table.len()).unwrap();
+    let dout = ctx.alloc_n::<f32>(q.len()).unwrap();
+    ctx.upload_slice(&dq, &q).unwrap();
+    ctx.upload_slice(&dbt, &block_table).unwrap();
+
+    let run = |begin: usize| {
+        ctx.attn_decode_ext(
+            &dout,
+            &dq,
+            &dk,
+            &dv,
+            &dbt,
+            None,
+            HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            begin,
+            N_KV,
+            PAGE_TOKENS,
+            scale,
+            KvType::F32,
+        )
+        .unwrap();
+        let mut got = vec![0.0f32; q.len()];
+        ctx.download_slice(&mut got, &dout).unwrap();
+        got
+    };
+
+    let got = run(BEGIN);
+    let want = reference::attn_decode(
+        &q,
+        &fx.k_host,
+        &fx.v_host,
+        &fx.block_table,
+        HEADS,
+        KV_HEADS,
+        HEAD_DIM,
+        BEGIN,
+        N_KV,
+        PAGE_TOKENS,
+        scale,
+    );
+    let tol = 8.0 * ((HEAD_DIM as f64 / 32.0 + 5.0) * U + (WINDOW as f64) * U + 8.0 * U);
+    assert_close("attn_decode window", &got, &want, tol);
+
+    // The window has to *change the answer*, or the test above is checking that two
+    // implementations agree about nothing.
+    let full = run(0);
+    let moved =
+        got.iter().zip(full.iter()).map(|(a, b)| f64::from(a - b).abs()).fold(0.0, f64::max);
+    assert!(moved > 1e-3, "windowing 21 keys down to 6 changed the output by only {moved:e}");
+
+    // Closed form, no tolerance argument: a span of one key is a softmax over one score, which
+    // is 1 whatever the score, so the output is that key's V exactly.
+    let one = run(N_KV - 1);
+    for h in 0..HEADS {
+        let kvh = h / (HEADS / KV_HEADS);
+        for d in 0..HEAD_DIM {
+            let j = N_KV - 1;
+            let want = fx.v_host[reference::kv_index(
+                fx.block_table[j / PAGE_TOKENS],
+                (j % PAGE_TOKENS) as u32,
+                kvh,
+                d,
+                KV_HEADS,
+                HEAD_DIM,
+                PAGE_TOKENS,
+            )];
+            let got_v = one[h * HEAD_DIM + d];
+            assert!(
+                (got_v - want).abs() <= 1e-6 * want.abs().max(1.0),
+                "head {h} channel {d}: a one-key window gave {got_v}, not V = {want}"
+            );
+        }
+    }
+    eprintln!(
+        "windowed attention: {WINDOW} of {N_KV} keys, max move from full attention {moved:.3e}"
+    );
+}
+
+#[test]
+fn attention_refuses_an_empty_key_span() {
+    if !gpu_available() {
+        return;
+    }
+    // A window computed wrong is an empty span, and softmax over no keys is 0/0. It must be a
+    // named refusal, not a buffer of NaNs that stays finite-looking one block later.
+    let ctx = Context::new().unwrap();
+    let b = ctx.alloc(1 << 16).unwrap();
+    let bt = ctx.alloc_n::<u32>(4).unwrap();
+    let err = ctx
+        .attn_decode_ext(&b, &b, &b, &b, &bt, None, 4, 4, 8, 4, 4, 4, 1.0, KvType::F32)
+        .unwrap_err();
+    assert!(matches!(err, KernelError::BadArgument(_)), "expected a refusal, got {err:?}");
 }
 
 #[test]

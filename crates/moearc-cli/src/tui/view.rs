@@ -6,6 +6,7 @@
 //! are the reason this file has no hidden animation state: anything that varied with wall
 //! time would make them flap.
 
+use moearc_engine::host_budget::{BudgetSource, HostBudget, Placement, Tier};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -17,7 +18,7 @@ use ratatui::widgets::{
 use throbber_widgets_tui::{Throbber, symbols::throbber};
 
 use super::model::{Model, Screen};
-use crate::fit::{Columns, Fit, FitOutcome};
+use crate::fit::{CONTEXT_LADDER, Columns, Fit, FitOutcome, KvPrecision, ladder_index};
 use crate::format;
 use crate::source::{DeviceRow, ModelCard, Verdict};
 use crate::theme;
@@ -70,12 +71,20 @@ fn header_line(m: &Model) -> Paragraph<'_> {
 
 fn footer_line(m: &Model) -> Paragraph<'_> {
     let keys: &[(&str, &str)] = match m.screen {
-        Screen::Devices => {
-            &[("↑↓", "select"), ("r", "rescan"), ("⏎", "models"), ("?", "help"), ("q", "quit")]
-        }
+        Screen::Devices => &[
+            ("↑↓", "select"),
+            ("-/+", "RAM"),
+            ("[/]", "context"),
+            ("r", "rescan"),
+            ("⏎", "models"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         Screen::Models if m.editing => &[("⏎", "pull"), ("esc", "cancel")],
         Screen::Models => &[
             ("↑↓", "select"),
+            ("-/+", "RAM"),
+            ("[/]", "context"),
             ("/", "repo id"),
             ("d", "pull"),
             ("s", "serve"),
@@ -172,7 +181,7 @@ fn devices_screen(m: &Model, f: &mut Frame, area: Rect) {
     );
 
     f.render_widget(verdict_panel(&report.verdict), verdict_area);
-    f.render_widget(fit_panel(m), fit_area);
+    f.render_widget(fit_panel(m, fit_area), fit_area);
 }
 
 fn device_row(d: &DeviceRow, selected: bool) -> Row<'_> {
@@ -230,17 +239,43 @@ fn verdict_panel(v: &Verdict) -> Paragraph<'_> {
 }
 
 /// "What will fit" — the second half of the zero-argument output.
-fn fit_panel(m: &Model) -> Paragraph<'_> {
+///
+/// Two plans, stacked, because there are two tiers and only one of them is the card. The gauge
+/// on top is the *host* budget; the table under it re-classifies as that gauge moves. That
+/// adjacency is the point: a 12 GiB card offering to run a 59 GiB model is the whole claim of
+/// this project, and it is legible in one frame only if the cause sits directly above the
+/// effect.
+fn fit_panel(m: &Model, area: Rect) -> Paragraph<'_> {
     let title = match m.ctx_request {
         Some(ctx) => format!("What will fit at {} ctx", format::count(ctx as i64)),
         None => "What will fit".to_string(),
     };
     let cols = Columns::of(&m.models);
-    let mut lines = Vec::new();
-    for (card, fit) in m.models.iter().zip(&m.fits) {
-        lines.push(fit_line(card, fit, cols));
+    let mut rows = Vec::new();
+    for (i, (card, fit)) in m.models.iter().zip(&m.fits).enumerate() {
+        rows.push(fit_line(card, fit, m.placements.get(i), cols));
     }
-    if lines.is_empty() {
+
+    // What has to survive, in priority order: the model rows, then the controls, then the
+    // heading and the spacing, then the prose. A clipped table would lose the rows the dials
+    // exist to change, which is the wrong half to lose — so the controls compact themselves
+    // instead. Two border rows and two padding rows come off the panel first.
+    const CHROME: u16 = 4;
+    let inner = area.height.saturating_sub(CHROME) as usize;
+    // The empty-catalogue message is three lines and is the content in that case.
+    let content = if rows.is_empty() { 3 } else { rows.len() };
+    let room_for_prose = inner >= 4 + 2 + content;
+    let dial_rows = if room_for_prose { 4 } else { 1 };
+    let room_for_spacing = inner >= dial_rows + 2 + content;
+
+    let mut lines = Vec::new();
+    if let Some(budget) = m.budget {
+        lines.extend(dial_lines(budget, m.ctx_request, room_for_prose));
+        if room_for_spacing {
+            lines.push(Line::raw(""));
+        }
+    }
+    if rows.is_empty() {
         // Where it looked, not just that it found nothing. `docs/ux.md` rules out an error
         // that reports a symptom without naming the cause, and the cause is nearly always
         // that the files are in a different directory.
@@ -257,7 +292,43 @@ fn fit_panel(m: &Model) -> Paragraph<'_> {
             Style::new().fg(theme::FAINT),
         ));
     } else {
+        if room_for_spacing {
+            lines.push(fit_header(cols));
+        }
+        lines.extend(rows);
         lines.push(Line::raw(""));
+        // A refusal is the planner's sentence, verbatim, on the screen where the dial that
+        // caused it lives. It already names the achievable number and, where there is one,
+        // what would fix it — better copy than anything this module could write, and putting
+        // it behind a keystroke would hide the honest state at exactly the wrong moment.
+        for (card, fit) in m.models.iter().zip(&m.fits) {
+            if let FitOutcome::DoesNotFit { reason, .. } = &fit.outcome {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} — ", card.id), Style::new().fg(theme::WARN)),
+                    Span::styled(reason.clone(), theme::subtle()),
+                ]));
+            }
+        }
+        // What the requested context cost, per model, in the planner's own words. This is the
+        // coupling the second dial exists to show: the residency column moved, and this says
+        // by how much and why.
+        for (card, fit) in m.models.iter().zip(&m.fits) {
+            if let Some(note) = fit.yield_note() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} — ", card.id), theme::subtle()),
+                    Span::styled(note.to_string(), theme::subtle()),
+                ]));
+            }
+        }
+        // Said once, on the screen where it is visible, because the wording of the tier is the
+        // thing most likely to be misread: a model past the budget is slower, not broken.
+        if m.placements.iter().any(|p| p.tier == Tier::RunsPagesFromDisk) {
+            lines.push(Line::styled(
+                "Past the budget is not past the machine: the excess is paged in from the \
+                 drive as it is needed, which is slower and is not a failure.",
+                theme::subtle(),
+            ));
+        }
         lines.push(Line::styled(
             "Residency and context are computed from this card's free VRAM. The headroom \
              behind them is provisional, not measured on Arc.",
@@ -266,17 +337,169 @@ fn fit_panel(m: &Model) -> Paragraph<'_> {
         if m.fits.iter().any(Fit::context_at_floor) {
             lines.push(Line::styled(
                 "A context at the minimum is not the card's limit — experts took everything \
-                 above it. Ask for a longer one with --ctx and it trades slots back.",
+                 above it. [ and ] trade expert slots back for context.",
                 theme::subtle(),
+            ));
+            // 🔴 Measured, and cited on screen because it is the reason to move the dial rather
+            // than an opinion about it. Source: `bench/traces/qwen3-30b-prose.decode.ndjson`,
+            // a real decode trace — the hottest of that model's 6,144 expert slots is touched
+            // on 97.9% of tokens, only 1.4% of slots exceed 50%, and 78% sit below 10%. A KV
+            // byte is touched on every token, so per byte of VRAM a KV byte beats every expert
+            // slot in the model. Nothing here is extrapolated to another model: the sentence
+            // names the one it was measured on.
+            lines.push(Line::styled(
+                "Measured on a real Qwen3-30B routing trace: only 1.4% of its 6,144 expert \
+                 slots are touched on more than half of tokens, and every KV byte is touched \
+                 on all of them.",
+                Style::new().fg(theme::FAINT),
             ));
         }
     }
-    Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+    // 🔴 `trim: false`, and it is load-bearing rather than a preference. Ratatui trims leading
+    // whitespace off every line when trimming is on, which silently deletes the two columns
+    // that align the heading row with the rows under it and the indent that ties each dial to
+    // its own explanation. A table whose heading is two columns left of its data reads as a
+    // rendering bug, which on the screen this tool is judged by is expensive.
+    Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         theme::panel(title).title_bottom(
             Line::from(Span::styled(" moearc info <model> ", Style::new().fg(theme::FAINT)))
                 .alignment(Alignment::Right),
         ),
     )
+}
+
+/// The two dials, and what each one is doing to the table under it.
+///
+/// 🔴 **They are one budget, split across two pools.** Host RAM bounds what the *machine* can
+/// keep of the mapping, so it decides whether a cache miss is a copy or a drive read. Context
+/// bounds what the *card* spends on KV, and the card has exactly two claimants — every page of
+/// context is an expert slot sold. Neither dial computes anything here: the first is
+/// `moearc_engine::host_budget`, the second is `moearc_engine::memory::plan`, and this function
+/// draws what they return.
+///
+/// Lines rather than panels of their own. A panel each would cost eight rows of chrome on the
+/// one screen that already has three, and the controls belong *with* the table they change.
+/// `prose` drops the two explanatory lines when the terminal is short — losing an explanation
+/// is better than losing the rows the explanation is about.
+fn dial_lines(b: HostBudget, ctx: Option<u32>, prose: bool) -> Vec<Line<'static>> {
+    // Wide enough to read a position off at video bitrate, narrow enough to leave the numbers
+    // beside it on the same line at 100 columns.
+    const BAR: usize = 26;
+    let ctx_text = match ctx {
+        Some(t) => format!("{} tokens", format::count(t as i64)),
+        // Not "0" and not a default constant: it is a different request. See `fit::plan`.
+        None => "largest that fits".to_string(),
+    };
+
+    if !prose {
+        // One line for both, for a terminal with no rows to spare.
+        return vec![Line::from(vec![
+            Span::styled("Host RAM  ", theme::subtle()),
+            Span::styled(
+                format!("{} of {}", format::bytes(b.bytes()), format::bytes(b.max_bytes())),
+                theme::text(),
+            ),
+            Span::styled("  -/+     ", Style::new().fg(theme::FAINT)),
+            Span::styled("Context  ", theme::subtle()),
+            Span::styled(ctx_text, theme::text()),
+            Span::styled("  [/]", Style::new().fg(theme::FAINT)),
+        ])];
+    }
+
+    let mut ram = vec![Span::styled("Host RAM  ", theme::subtle())];
+    ram.extend(gauge_spans(b.fraction_of_ceiling(), BAR));
+    ram.push(Span::styled(
+        format!("  {} of {}", format::bytes(b.bytes()), format::bytes(b.max_bytes())),
+        theme::text(),
+    ));
+    ram.push(Span::styled("   -/+", Style::new().fg(theme::FAINT)));
+
+    let memory = b.memory();
+    let ram_note = match b.source() {
+        // A clamp is reported rather than applied quietly: the user typed a number and did not
+        // get it, and that is theirs to know.
+        BudgetSource::Clamped { asked } => format!(
+            "{} was asked for — this machine has {} available, and {} of that is kept for it",
+            format::bytes(asked),
+            format::bytes(memory.available_bytes),
+            format::bytes(b.reserved_bytes())
+        ),
+        _ => format!(
+            "{} available of {} fitted · {} kept for the machine",
+            format::bytes(memory.available_bytes),
+            format::bytes(memory.total_bytes),
+            format::bytes(b.reserved_bytes())
+        ),
+    };
+
+    let rungs = (CONTEXT_LADDER.len() - 1).max(1) as f64;
+    let mut context = vec![Span::styled("Context   ", theme::subtle())];
+    context.extend(gauge_spans(ladder_index(ctx) as f64 / rungs, BAR));
+    context.push(Span::styled(format!("  {ctx_text}"), theme::text()));
+    context.push(Span::styled("   [/]", Style::new().fg(theme::FAINT)));
+
+    vec![
+        Line::from(ram),
+        Line::styled(format!("          {ram_note}"), Style::new().fg(theme::FAINT)),
+        Line::from(context),
+        Line::styled(
+            format!(
+                "          {} KV · every page of it is an expert slot given back",
+                KvPrecision::default().label()
+            ),
+            Style::new().fg(theme::FAINT),
+        ),
+    ]
+}
+
+/// A gauge drawn as text, so it can sit on a line beside its label inside a paragraph.
+///
+/// Heavy rule for the filled part, light for the rest — the same shape as the KV gauge on the
+/// serving screen, which is a `LineGauge` and cannot be used here.
+fn gauge_spans(fraction: f64, width: usize) -> Vec<Span<'static>> {
+    let filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    vec![
+        Span::styled("━".repeat(filled), theme::accent()),
+        Span::styled("─".repeat(width - filled), Style::new().fg(theme::FAINT)),
+    ]
+}
+
+/// The table's heading row.
+///
+/// Worth its two lines of code: it is what lets each cell hold a bare number instead of
+/// repeating its own units, which is where the width for the host column came from.
+fn fit_header(cols: Columns) -> Line<'static> {
+    Line::styled(
+        format!(
+            "  {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
+            "model",
+            "quant",
+            "size",
+            "host",
+            "residency",
+            "ctx",
+            id = cols.id,
+            quant = cols.quant,
+            size = cols.size,
+            tier = Columns::TIER,
+            res = cols.residency,
+            ctx = cols.ctx
+        ),
+        Style::new().fg(theme::FAINT),
+    )
+}
+
+/// The colour for a host tier.
+///
+/// 🔴 Restrained on purpose, and the paging tier is *not* a warning colour. It is a supported
+/// mode of this engine — the mode that lets a 59 GiB model run on an 11 GiB card — and
+/// painting it amber would tell the viewer the opposite of what the tool does.
+fn tier_style(tier: Tier) -> Style {
+    match tier {
+        Tier::RunsFromRam => Style::new().fg(theme::GOOD),
+        Tier::RunsPagesFromDisk => theme::text(),
+        Tier::WillNotFit => theme::subtle(),
+    }
 }
 
 /// One row of "what will fit".
@@ -285,11 +508,31 @@ fn fit_panel(m: &Model) -> Paragraph<'_> {
 /// constants, and constants were fine for fixtures with thirteen-character handles: a real
 /// directory produced rows that ran past the panel border, on the one screen the whole tool is
 /// judged by.
-fn fit_line<'a>(card: &'a ModelCard, fit: &Fit, cols: Columns) -> Line<'a> {
-    let (mark, style) = if fit.fits() {
+///
+/// The host column and the residency column are two different tiers and stay two cells: a model
+/// can page from disk and still plan cleanly onto the card, and collapsing that into one verdict
+/// would have to invent a precedence between them.
+///
+/// The leading mark is the row's own answer to "can I run this here", so it needs *both* — the
+/// card's plan has to succeed and the machine has to be able to hold the file. A green tick
+/// beside "won't fit" is a contradiction a viewer reads as a rendering bug.
+fn fit_line<'a>(
+    card: &'a ModelCard,
+    fit: &Fit,
+    placement: Option<&Placement>,
+    cols: Columns,
+) -> Line<'a> {
+    let runs = fit.fits() && placement.is_none_or(|p| p.tier.runs());
+    let (mark, style) = if runs {
         ("✓", Style::new().fg(theme::GOOD))
     } else {
         ("·", Style::new().fg(theme::SUBTLE))
+    };
+    let (tier_text, tier) = match placement {
+        Some(p) => (p.tier.label(), tier_style(p.tier)),
+        // Before the probe lands there is no verdict, and a blank cell says that better than a
+        // guess would.
+        None => ("", theme::subtle()),
     };
     Line::from(vec![
         Span::styled(format!("{mark} "), style),
@@ -299,7 +542,12 @@ fn fit_line<'a>(card: &'a ModelCard, fit: &Fit, cols: Columns) -> Line<'a> {
             format!("{:>w$}  ", format::bytes(card.file_bytes), w = cols.size),
             theme::subtle(),
         ),
-        Span::styled(fit.summary(), if fit.fits() { theme::text() } else { theme::subtle() }),
+        Span::styled(format!("{tier_text:<w$}  ", w = Columns::TIER), tier),
+        Span::styled(
+            format!("{:<w$} ", fit.residency_cell(), w = cols.residency),
+            if runs { theme::text() } else { theme::subtle() },
+        ),
+        Span::styled(format!("{:>w$}", fit.context_cell(), w = cols.ctx), theme::subtle()),
     ])
 }
 
@@ -408,6 +656,27 @@ fn model_detail(m: &Model) -> Paragraph<'_> {
         ),
         Line::raw(""),
     ]);
+
+    // The host tier, before the card's plan. Deliberately first: it is the question that
+    // decides whether a model is worth downloading at all, and the VRAM split underneath it is
+    // the same either way.
+    if let Some(p) = m.selected_placement() {
+        lines.push(Line::styled("Host RAM", theme::heading()));
+        lines.push(theme::field("tier", Span::styled(p.tier.label(), tier_style(p.tier)), LABEL_W));
+        if p.tier == Tier::RunsPagesFromDisk {
+            lines.push(theme::field(
+                "in RAM",
+                format!(
+                    "{} of {}",
+                    format::percent(p.ram_bytes as i64, (p.ram_bytes + p.disk_bytes) as i64),
+                    format::bytes(p.ram_bytes + p.disk_bytes)
+                ),
+                LABEL_W,
+            ));
+        }
+        lines.push(Line::styled(format!("· {}", p.reason), theme::subtle()));
+        lines.push(Line::raw(""));
+    }
 
     match m.selected_fit().map(|f| &f.outcome) {
         Some(FitOutcome::Fits { rationale, .. }) => {
@@ -689,6 +958,9 @@ fn help_overlay(f: &mut Frame, area: Rect) {
     const ROWS: &[(&str, &str, &str)] = &[
         ("↑ ↓ / j k", "move the selection", ""),
         ("tab", "next screen", ""),
+        ("- / +", "host RAM budget", "--host-budget <SIZE>"),
+        ("0 / m", "no budget / all of it", "--host-budget 0"),
+        ("[ / ]", "context length", "--ctx <tokens>"),
         ("r", "rescan devices", "moearc"),
         ("/", "paste a repo id", "moearc pull <repo-id>"),
         ("d", "download the selection", "moearc pull <model>"),
@@ -767,8 +1039,8 @@ mod tests {
     use super::snapshot::{frame, show};
     use super::*;
     use crate::source::{
-        CpuOnlyCause, DeviceReport, DeviceSource, ModelCatalog, ServeStats, StubCatalog,
-        StubDeviceSource, StubServeStats, StubTransfers, TransferSource,
+        CpuOnlyCause, DeviceReport, DeviceSource, HostSource, ModelCatalog, ServeStats,
+        StubCatalog, StubDeviceSource, StubHost, StubServeStats, StubTransfers, TransferSource,
     };
     use crate::tui::model::{Msg, Serving, update};
 
@@ -787,10 +1059,23 @@ mod tests {
     fn measured() -> Model {
         let mut m = Model::new(
             None,
+            None,
             Some(crate::source::Sources::real(std::path::PathBuf::new()).stub_parts),
         );
         update(&mut m, Msg::Detected(StubDeviceSource.detect().unwrap()));
         update(&mut m, Msg::Catalog(StubCatalog::as_measured()));
+        update(&mut m, Msg::Host(StubHost.probe().unwrap()));
+        m
+    }
+
+    /// The same, with the host budget wound down to `bytes`.
+    ///
+    /// The budget goes through the reducer rather than being poked into the model, so these
+    /// frames are the ones a key press produces and not a state only a test can reach.
+    fn measured_at_budget(bytes: u64) -> Model {
+        let mut m = measured();
+        m.budget = Some(m.budget.unwrap().set(bytes));
+        m.recompute_placements();
         m
     }
 
@@ -1012,7 +1297,17 @@ mod tests {
                     .lines()
                     .find(|l| l.contains(card.id.as_str()))
                     .unwrap_or_else(|| panic!("no row for {} at width {width}", card.id));
-                for part in [&card.quant, &format::bytes(card.file_bytes), &fit.summary()] {
+                let tier = m.placements[m.models.iter().position(|c| c.id == card.id).unwrap()]
+                    .tier
+                    .label()
+                    .to_string();
+                for part in [
+                    &card.quant,
+                    &format::bytes(card.file_bytes),
+                    &tier,
+                    &fit.residency_cell(),
+                    &fit.context_cell(),
+                ] {
                     assert!(
                         row.contains(part.as_str()),
                         "`{part}` is not on {}'s row at width {width}: {row:?}",
@@ -1042,7 +1337,140 @@ mod tests {
         );
         let dump = frame(&m, 100, 36);
         assert!(dump.contains("59.0 GiB"));
-        assert!(dump.contains(&fit.summary()), "the residency figure reaches the screen");
+        assert!(dump.contains(&fit.residency_cell()), "the residency figure reaches the screen");
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The two dials
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn the_host_budget_is_on_screen_with_the_machine_it_came_from() {
+        let m = measured();
+        let dump = frame(&m, 110, 40);
+        show("moearc — host RAM at the ceiling", &dump);
+        assert!(dump.contains("Host RAM"), "the control is visible without a keystroke");
+        let b = m.budget.unwrap();
+        assert!(dump.contains(&format::bytes(b.bytes())));
+        // The ceiling is explained rather than asserted: a number the user cannot go past has
+        // to say what is holding it there.
+        assert!(dump.contains("kept for the machine"));
+        assert!(dump.contains(&format::bytes(b.memory().total_bytes)));
+    }
+
+    #[test]
+    fn winding_the_budget_down_moves_models_from_ram_to_disk_and_none_of_them_out() {
+        // The demo, as a snapshot pair. The same four real models, two budgets, and the only
+        // thing that changes is which tier each is in — nothing becomes unrunnable.
+        let high = frame(&measured(), 110, 40);
+        show("moearc — host RAM at the ceiling", &high);
+        let low = frame(&measured_at_budget(8 << 30), 110, 40);
+        show("moearc — host RAM wound down to 8 GiB", &low);
+
+        assert!(high.contains("runs from RAM"));
+        assert!(low.contains("runs, pages from disk"));
+        assert!(!low.contains("won't fit"), "a smaller budget is slower, never fatal");
+        // olmoe is 3.9 GiB and stays inside an 8 GiB budget, so the two tiers are on screen
+        // together — which is what makes the distinction readable.
+        assert!(low.contains("runs from RAM"));
+    }
+
+    #[test]
+    fn a_zero_budget_still_runs_every_model() {
+        let dump = frame(&measured_at_budget(0), 110, 40);
+        show("moearc — host RAM at zero", &dump);
+        assert!(!dump.contains("won't fit"));
+        assert!(dump.contains("runs, pages from disk"));
+        assert!(dump.contains("is not a failure"), "the wording carries the claim, not a colour");
+    }
+
+    #[test]
+    fn the_context_dial_is_on_screen_and_its_ends_are_reachable() {
+        let mut m = measured();
+        let auto = frame(&m, 110, 40);
+        show("moearc — context at `largest that fits`", &auto);
+        assert!(auto.contains("Context"));
+        assert!(auto.contains("largest that fits"));
+
+        m.ctx_request = Some(65_536);
+        m.recompute_fits();
+        let long = frame(&m, 110, 40);
+        show("moearc — context wound to 64K", &long);
+        assert!(long.contains("65,536 tokens"), "the dial says what was asked for");
+        assert!(long.contains("What will fit at 65,536 ctx"));
+    }
+
+    #[test]
+    fn a_context_this_card_cannot_serve_shows_the_planner_s_own_refusal() {
+        // 🔴 The honest state at f16, and it must be legible rather than smoothed over: 256K of
+        // KV is past what an 11.33 GiB card can hold for these models. The sentence on screen
+        // is `moearc_engine::memory`'s, which names the achievable number.
+        let mut m = measured();
+        m.ctx_request = Some(262_144);
+        m.recompute_fits();
+        let dump = frame(&m, 110, 44);
+        show("moearc — a context the card cannot serve", &dump);
+        let refused: Vec<&crate::source::ModelCard> =
+            m.models.iter().zip(&m.fits).filter(|(_, f)| !f.fits()).map(|(c, _)| c).collect();
+        assert!(!refused.is_empty(), "256K must be refused somewhere on a 12 GiB card");
+        for card in refused {
+            assert!(dump.contains(card.id.as_str()));
+        }
+        assert!(
+            dump.contains("does not fit") || dump.contains("trained"),
+            "the refusal reaches the screen: {dump}"
+        );
+    }
+
+    #[test]
+    fn a_model_that_is_not_here_and_will_not_fit_the_drive_is_the_only_refusal() {
+        // 🔴 The third tier, and the only one that is a refusal. It is reachable **only** for a
+        // model that is not on this machine: a file already on the drive has spent its bytes
+        // and always runs, however far past the budget it is. That asymmetry is the whole
+        // point — see `moearc_engine::host_budget::place`.
+        //
+        // The catalogue on a real machine is all-local today, so this state cannot be produced
+        // from a directory scan; the fixture's remote entries are what exercise it, and the
+        // frame says so in its own footer.
+        let mut m = loaded();
+        update(
+            &mut m,
+            Msg::Host(crate::source::HostReport {
+                total_bytes: 96 << 30,
+                available_bytes: 74_088_284_160,
+                // A drive with 20 GiB left on it.
+                models_free_bytes: 20 << 30,
+            }),
+        );
+        let dump = frame(&m, 110, 40);
+        show("moearc — a model with nowhere to land", &dump);
+
+        for (card, p) in m.models.iter().zip(&m.placements) {
+            if card.local {
+                assert!(p.tier.runs(), "{} is here, so it runs", card.id);
+            }
+        }
+        // mixtral is 24.6 GiB and not here: it needs room the drive does not have.
+        assert!(dump.contains("won't fit"));
+        assert!(dump.contains("runs from RAM"), "and the other tiers are still on screen");
+    }
+
+    #[test]
+    fn the_dials_never_push_a_model_row_off_a_short_terminal() {
+        // The controls compact themselves rather than costing rows. Losing the explanation is
+        // survivable; losing the table the explanation is about is not.
+        let m = measured();
+        for height in [28, 30, 34, 40] {
+            let dump = frame(&m, 110, height);
+            for card in &m.models {
+                assert!(
+                    dump.contains(card.id.as_str()),
+                    "{} was pushed off screen at height {height}",
+                    card.id
+                );
+            }
+            assert!(dump.contains("Host RAM"), "and the control survives too, at {height}");
+        }
     }
 
     #[test]
@@ -1079,15 +1507,19 @@ mod tests {
             ceiling_tokens.is_none_or(|c| c <= 4_096),
             "the ceiling is held to the same limit, or it re-tells the same lie"
         );
-        assert!(frame(&m, 120, 36).contains("4,096 ctx"));
+        let dump = frame(&m, 120, 36);
+        let row = dump.lines().find(|l| l.contains("olmoe")).expect("a row for olmoe");
+        assert_eq!(fit.context_cell(), "4,096");
+        assert!(row.contains(&fit.context_cell()), "the capped context is on its own row: {row:?}");
     }
 
     #[test]
     fn an_empty_model_directory_says_where_it_looked() {
-        let mut m = Model::new(None, None);
+        let mut m = Model::new(None, None, None);
         m.catalog_location = Some("/srv/models".to_string());
         update(&mut m, Msg::Detected(StubDeviceSource.detect().unwrap()));
         update(&mut m, Msg::Catalog(Vec::new()));
+        update(&mut m, Msg::Host(StubHost.probe().unwrap()));
         let dump = frame(&m, 100, 30);
         show("moearc — nothing in the model directory", &dump);
         assert!(dump.contains("/srv/models"), "the directory is the cause, not a detail");

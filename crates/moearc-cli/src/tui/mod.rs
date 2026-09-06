@@ -40,7 +40,8 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
-    let mut m = Model::new(cli.ctx, sources.stubbed.then_some(sources.stub_parts));
+    let mut m =
+        Model::new(cli.ctx, cli.host_budget(), sources.stubbed.then_some(sources.stub_parts));
     m.catalog_location = sources.models.location();
     let mut pending = vec![Action::Detect];
 
@@ -128,6 +129,13 @@ fn perform(action: Action, sources: &Sources, m: &mut Model) -> Vec<Msg> {
             }
             match sources.models.curated() {
                 Ok(c) => out.push(Msg::Catalog(c)),
+                Err(e) => out.push(Msg::Failed(format!("{e:#}"))),
+            }
+            // The host is measured in the same pass as the card. Both halves of the plan are
+            // properties of this machine, and a screen that showed one before the other would
+            // render a budget of zero for a frame and look like a fault.
+            match sources.host.probe() {
+                Ok(h) => out.push(Msg::Host(h)),
                 Err(e) => out.push(Msg::Failed(format!("{e:#}"))),
             }
             // A file that could not be read is the difference between "you have no models"

@@ -35,14 +35,24 @@
 //! power-of-two E8M0 exponent. Its dequantiser is checked bit-for-bit against llama.cpp's own
 //! `to_float` in `moearc-kernels/tests/gguf_crosscheck.rs`.
 //!
-//! # 🔴 Sliding-window attention is declared and not implemented
+//! # Sliding-window attention, and why a short test proves nothing about it
 //!
 //! The file states `attention.sliding_window = 128`, applied by llama.cpp to **alternating**
-//! blocks. This pass does not implement it, and [`N_CTX`] is 128 for that reason: below the
-//! window an SWA mask and a plain causal mask are identical — `is_masked_swa` masks a key when
-//! `p1 - p0 >= n_swa`, which no pair of positions inside one window satisfies — so everything
-//! here is exact rather than approximate. `moe.rs` refuses a longer context by name;
-//! [`a_context_past_the_sliding_window_is_refused_by_name`] is the gate on that refusal.
+//! blocks (`set_swa_pattern(2)`: even blocks windowed, odd blocks full causal). This pass
+//! implements both regimes; [`N_CTX`] used to be 128 because it did not.
+//!
+//! 🔴 **Below 128 tokens sliding-window attention is a no-op, so a suite that only tested short
+//! contexts would pass with SWA entirely unimplemented.** `is_masked_swa` masks a key when
+//! `p1 - p0 >= n_swa`, and no pair of positions inside one window satisfies that — an SWA mask
+//! and a plain causal mask are the same mask there. That is why
+//! [`greedy_generation_past_the_sliding_window_matches_llama_cpp`] runs a **158-token prompt and
+//! 256 generated tokens**, reaching position 413: every windowed block spends the whole run
+//! dropping keys the full blocks keep.
+//!
+//! ⚠️ And the prompt is not incidental. llama.cpp's continuation **reproduces the passage** —
+//! a copy of 158 tokens that only the full-attention blocks can see. An engine that windowed
+//! every block could not produce it, and one that windowed none would produce it from a
+//! different set of keys.
 //!
 //! # Residency, on the model residency exists for
 //!
@@ -67,8 +77,9 @@ use moearc_engine::session::{Session, SessionOptions, StopConditions};
 // The default `SessionOptions` is still used by the refusal test, which needs a field the
 // helper below does not expose.
 
-/// 🔴 128, and not for tidiness — it is the sliding window. See the module header.
-const N_CTX: usize = 128;
+/// Large enough for the long-context gate: a 380-token prompt plus 256 generated tokens reaches
+/// position 635, **four windows** past where SWA starts to bite.
+const N_CTX: usize = 768;
 
 /// The default budget for a test that does not care about residency.
 ///
@@ -104,6 +115,83 @@ const LLAMA_CPP_GREEDY: [u32; 64] = [
     382, 12650, 13, 279, 976, 9029, 5030, 328, 10128, 382, 12650, 13, 279, 976, 9029, 5030, 328,
     10128, 382, 12650, 13, 279, 976, 9029, 5030, 328, 10128, 382, 12650, 13, 279, 976, 9029, 5030,
     328, 10128, 382, 12650, 13, 279, 976, 9029, 5030, 328, 10128, 382, 12650,
+];
+
+/// A 380-token prompt in gpt-oss's **harmony** format: a system line, a user turn holding a
+/// 16-entry list and the instruction to repeat it verbatim, and an assistant turn opened
+/// directly on the `final` channel with the list's first line already written.
+///
+/// 🔴 Three properties, each chosen and each measured, and the third is the one that took the
+/// longest to get right:
+///
+/// - **It is a copy task**, so every generated token is determined by a source line 380 tokens
+///   back — which only the full-attention blocks can see. The windowed blocks must simultaneously
+///   *not* see it and not corrupt anything.
+/// - **It is in harmony format.** Fed raw prose, this model breaks out of the passage into
+///   assistant commentary within a dozen tokens, and commentary is exactly where greedy decoding
+///   has no margin.
+/// - 🔴 **Its smallest top-1/top-2 margin over the 256 steps is 5.81** (measured with
+///   `llama-eval-callback`, which prints the runner-up). That matters because llama.cpp's CPU
+///   backend quantises activations to Q8_0 before every matmul and `moearc-kernels` keeps them
+///   in f32, a difference worth up to ~0.4 on this model's logits. Below about 1.0 of margin a
+///   greedy id is a decision about the tie-break rather than about the model: three earlier
+///   candidate prompts for this test had minimum margins of 0.16–0.19, and on one of them
+///   **llama.cpp disagreed with itself** — its one-shot prefill and its incremental decode chose
+///   different ids at the same position. A test built on such a prompt measures nothing.
+///
+/// 🔴 Long **on purpose**: the point of this file's long-context gate is that positions past
+/// 128 exist at all, and a six-token prompt would have to generate its way there. Starting past
+/// the window means every generated token is decoded with the two attention regimes already
+/// disagreeing about which keys exist.
+const SWA_PROMPT: [u32; 380] = [
+    200006, 17360, 200008, 42743, 289, 25, 4465, 200007, 200006, 1428, 200008, 49704, 290, 3992,
+    1562, 9707, 11, 483, 860, 1273, 2201, 364, 16, 13, 67062, 382, 290, 42173, 17921, 326, 290,
+    31179, 316, 290, 11628, 13, 1225, 853, 220, 15, 182603, 558, 17, 13, 73794, 382, 290, 55357,
+    17921, 11, 483, 261, 17154, 22137, 328, 15883, 70513, 13, 1225, 853, 220, 15, 182603, 558, 18,
+    13, 16464, 382, 290, 1606, 17921, 5542, 316, 2498, 2615, 13, 1225, 853, 220, 16, 28479, 558,
+    19, 13, 31259, 382, 4358, 290, 3592, 17921, 2236, 328, 290, 17069, 64480, 402, 1617, 9753, 13,
+    1225, 853, 220, 17, 182603, 558, 20, 13, 79575, 382, 290, 10574, 17921, 11, 261, 7322, 27675,
+    483, 261, 2212, 3592, 10021, 13, 1225, 853, 220, 4129, 182603, 558, 21, 13, 69868, 382, 290,
+    7322, 27675, 483, 290, 125725, 12796, 2420, 13, 1225, 853, 220, 19302, 182603, 558, 22, 13,
+    127440, 385, 382, 290, 12146, 376, 17921, 11, 326, 480, 155086, 402, 1617, 4307, 13, 1225, 853,
+    220, 2029, 182603, 558, 23, 13, 141806, 382, 290, 286, 10847, 376, 17921, 11, 326, 290, 21779,
+    129300, 591, 290, 11628, 13, 1225, 853, 220, 1125, 182603, 558, 24, 13, 363, 21042, 382, 261,
+    124441, 17921, 6772, 290, 61353, 328, 141806, 13, 1225, 853, 220, 15, 182603, 558, 702, 13,
+    136765, 382, 261, 124441, 17921, 484, 95853, 290, 61353, 328, 141806, 13, 1225, 853, 220, 20,
+    182603, 558, 994, 13, 10694, 3095, 64, 382, 261, 124441, 17921, 40123, 1299, 448, 16102, 13,
+    1225, 853, 220, 17, 182603, 558, 899, 13, 31283, 133846, 382, 261, 124441, 17921, 306, 290,
+    23393, 19629, 28328, 13, 1225, 853, 220, 16, 28479, 558, 1311, 13, 4225, 276, 382, 261, 124441,
+    17921, 945, 18965, 1572, 136765, 13, 1225, 853, 220, 16, 28479, 558, 1265, 13, 33794, 1503,
+    382, 261, 51041, 2817, 483, 261, 1869, 1701, 61353, 13, 1225, 853, 220, 15, 182603, 558, 1055,
+    13, 117716, 78, 277, 382, 261, 51041, 2817, 483, 261, 24125, 12796, 13, 1225, 853, 220, 16,
+    28479, 558, 1125, 13, 145492, 385, 382, 261, 51041, 2817, 4783, 4358, 290, 10329, 95384, 3794,
+    13, 1225, 853, 220, 16, 28479, 13, 200007, 200006, 173781, 200005, 17196, 200008, 16, 13,
+    67062, 382, 290, 42173, 17921, 326, 290, 31179, 316, 290, 11628, 13, 1225, 853, 220, 15,
+    182603, 13,
+];
+
+/// llama.cpp's greedy continuation of [`SWA_PROMPT`], ids in order — the list, copied out.
+///
+/// Recorded from `llama-eval-callback` with `MOEARC_GREEDY_N=256`, llama.cpp
+/// `e107984bcffcfd701e82738092a2b000b6fda7a2`, and — **measured, not assumed** — identical
+/// between `-ngl 0` (CPU) and `-ngl 99 --n-cpu-moe 31` (SYCL) across all 256 ids.
+const SWA_GREEDY: [u32; 256] = [
+    4066, 17, 13, 73794, 382, 290, 55357, 17921, 11, 483, 261, 17154, 22137, 328, 15883, 70513, 13,
+    1225, 853, 220, 15, 182603, 13, 4066, 18, 13, 16464, 382, 290, 1606, 17921, 5542, 316, 2498,
+    2615, 13, 1225, 853, 220, 16, 28479, 13, 4066, 19, 13, 31259, 382, 4358, 290, 3592, 17921,
+    2236, 328, 290, 17069, 64480, 402, 1617, 9753, 13, 1225, 853, 220, 17, 182603, 13, 4066, 20,
+    13, 79575, 382, 290, 10574, 17921, 11, 261, 7322, 27675, 483, 261, 2212, 3592, 10021, 13, 1225,
+    853, 220, 4129, 182603, 13, 4066, 21, 13, 69868, 382, 290, 7322, 27675, 483, 290, 125725,
+    12796, 2420, 13, 1225, 853, 220, 19302, 182603, 13, 4066, 22, 13, 127440, 385, 382, 290, 12146,
+    376, 17921, 11, 326, 480, 155086, 402, 1617, 4307, 13, 1225, 853, 220, 2029, 182603, 13, 4066,
+    23, 13, 141806, 382, 290, 286, 10847, 376, 17921, 11, 326, 290, 21779, 129300, 591, 290, 11628,
+    13, 1225, 853, 220, 1125, 182603, 13, 4066, 24, 13, 363, 21042, 382, 261, 124441, 17921, 6772,
+    290, 61353, 328, 141806, 13, 1225, 853, 220, 15, 182603, 13, 4066, 702, 13, 136765, 382, 261,
+    124441, 17921, 484, 95853, 290, 61353, 328, 141806, 13, 1225, 853, 220, 20, 182603, 13, 4066,
+    994, 13, 10694, 3095, 64, 382, 261, 124441, 17921, 40123, 1299, 448, 16102, 13, 1225, 853, 220,
+    17, 182603, 13, 4066, 899, 13, 31283, 133846, 382, 261, 124441, 17921, 306, 290, 23393, 19629,
+    28328, 13, 1225, 853, 220, 16, 28479, 13, 4066, 1311, 13, 4225, 276, 382, 261, 124441, 17921,
+    945, 18965, 1572, 136765,
 ];
 
 fn model_path() -> Option<PathBuf> {
@@ -302,29 +390,62 @@ fn the_router_softmaxes_after_the_top_k_and_its_weights_sum_to_one() {
 }
 
 #[test]
-fn a_context_past_the_sliding_window_is_refused_by_name() {
-    let Some(path) = model_path() else { return skipped() };
-    // 🔴 Refusing is the point. A 129-token context would attend to a key llama.cpp masks, and
-    // nothing in the output would say so — the model would stay fluent and start drifting one
-    // token past the window. The trained context is 131072, so the default is a refusal too.
+fn greedy_generation_past_the_sliding_window_matches_llama_cpp() {
+    // 🔴 The gate this file exists for now. 380 prompt tokens + 256 generated is position 635,
+    // and every windowed block is dropping keys that every full block still holds from the very
+    // first step. A single wrong id anywhere in the 256 means the two regimes are not where
+    // llama.cpp puts them — and below 128 the same test would pass with no SWA at all.
     //
-    // ⚠️ Under the lock even though it fails: the refusal happens **after** `Weights::upload`
-    // has put 2.29 GiB on the card, so this costs exactly as much device memory as a session
-    // that works.
-    let _guard = DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let opts = SessionOptions {
-        n_ctx: Some(N_CTX + 1),
-        residency: Residency::Slots(SHARED_SLOTS),
-        ..Default::default()
+    // ⚠️ **Measured, so that a future failure here is informative:** with `Config::is_swa_block`
+    // forced to `false` — every block full causal, which is what this engine did before SWA —
+    // this test fails at generated index **0**. Not eventually, and not by drift: the prompt is
+    // already 252 tokens past the window when generation starts, so the very first token an
+    // unwindowed engine produces is wrong.
+    let Some(()) = with_default(|s| {
+        let got = generate(s, &SWA_PROMPT, SWA_GREEDY.len());
+        let first = got.iter().zip(SWA_GREEDY.iter()).position(|(a, b)| a != b);
+        assert_eq!(
+            got,
+            SWA_GREEDY.to_vec(),
+            "greedy ids diverged from llama.cpp; first difference at index {first:?} — the \
+             prompt is already {} tokens past the window before a single token is generated",
+            SWA_PROMPT.len().saturating_sub(128)
+        );
+    }) else {
+        return skipped();
     };
-    let text = match Session::load_with(&path, opts) {
-        Ok(_) => panic!("a context past the sliding window was accepted"),
-        Err(e) => e.to_string(),
+}
+
+#[test]
+fn the_windowed_blocks_hold_a_short_kv_cache_and_the_full_ones_do_not() {
+    // 🔴 The other half of sliding-window attention, and the half that is worth memory rather
+    // than only correctness: a block that can only ever see 128 positions does not need a cache
+    // of `n_ctx` positions. On this card the KV cache and the expert pool are drawn from the
+    // same 11.33 GiB, so every byte given back here is a byte an expert slot can have.
+    let Some(()) = with_default(|s| {
+        let info = s.info();
+        let kv = info.kv;
+        let c = s.config();
+        assert_eq!(c.n_swa, Some(128));
+        assert_eq!(c.swa_pattern, 2);
+        assert_eq!(kv.swa_blocks, 18, "18 of gpt-oss-120B's 36 blocks are windowed");
+        assert_eq!(kv.n_block, 36);
+
+        // 768 tokens is 24 pages; a 128-token window is 4.
+        assert_eq!((kv.pages, kv.swa_pages), (24, 4));
+        assert!(kv.bytes < kv.bytes_full);
+        // 18 blocks at 4/24 of the cache: (18*24 + 18*4) / (36*24) = 7/12.
+        assert_eq!(kv.bytes * 12, kv.bytes_full * 7);
+        eprintln!(
+            "KV at n_ctx {}: {} KiB against {} KiB unwindowed, {} KiB given back",
+            info.n_ctx,
+            kv.bytes >> 10,
+            kv.bytes_full >> 10,
+            kv.saved_bytes() >> 10
+        );
+    }) else {
+        return skipped();
     };
-    assert!(
-        text.contains("sliding-window") && text.contains("128"),
-        "the refusal must name the mechanism and the window; got: {text}"
-    );
 }
 
 #[test]

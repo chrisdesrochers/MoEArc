@@ -15,6 +15,7 @@ software that solves a different problem than ours.
 | `clap` | CLI | Standard, derive API, and good `--help` output — which is part of the product, not decoration. |
 | `libloading` | Level Zero at runtime | Lets the binary `dlopen` `libze_loader` instead of linking it, so it still starts and can explain itself on a machine with no Level Zero runtime. Directly serves the "brings its own dependencies" rule. |
 | `serde` / `serde_json` | Config, `--json` output, test fixtures | Unavoidable and universal. |
+| `sysinfo` | Host RAM and free space | Read for the host memory budget: `MemAvailable`, fitted RAM, and free space on the filesystem the models live on. **Already in the CLI's dependency graph** — `hf-hub` reaches it through `hf-xet` → `xet-runtime` — so naming it as a direct dependency adds a manifest line and no crates. Only `system` and `disk` are enabled. The alternative was reading `/proc/meminfo` and calling `statvfs` ourselves, which is ~30 lines and Linux-only; `sysinfo` is already paid for and is not. 📌 It is a **CLI** dependency, never an engine one: `moearc-engine` has no dependencies at all, which is what keeps the planners testable on a machine with no card and no oneAPI. The engine decides; the CLI measures. |
 
 ### `hf-hub` — Hugging Face's own Hub client · adopted, with a cost worth stating
 

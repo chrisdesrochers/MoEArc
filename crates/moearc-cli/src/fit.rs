@@ -61,6 +61,18 @@ pub enum FitOutcome {
         /// compute. They are not — but nothing on the row says which of the two numbers it is,
         /// so the panel has to.
         context_at_floor: bool,
+        /// The planner's sentence for [`Reason::ExpertsYieldedToContext`], when it fired.
+        ///
+        /// 🔴 The one line of the rationale that is pulled out and shown beside the table
+        /// rather than left in the detail pane, because it is *the* tradeoff this screen
+        /// exists to make visible: how many expert slots the requested context cost. It is
+        /// extracted by matching the typed `Reason`, never by searching the rendered strings,
+        /// and the sentence is the engine's own — rewriting it here would give the same fact
+        /// two spellings that could drift.
+        ///
+        /// `None` is the ordinary case: at [`Context::Largest`] nothing is yielded, because
+        /// nothing specific was asked for.
+        yield_note: Option<String>,
         /// The planner's own reasoning, one line per step.
         rationale: Vec<String>,
     },
@@ -83,18 +95,36 @@ impl Fit {
         matches!(self.outcome, FitOutcome::Fits { context_at_floor: true, .. })
     }
 
-    /// One line, for a table cell or a plain-text row.
-    pub fn summary(&self) -> String {
+    /// What the requested context cost in expert slots, in the planner's own words.
+    pub fn yield_note(&self) -> Option<&str> {
         match &self.outcome {
-            FitOutcome::Fits { resident_experts, total_experts, context_tokens, .. } => format!(
-                // Separated, because a real model has thousands of residency slots and
-                // `4128/10240` is two numbers a reader has to count digits to compare.
-                "{} / {} experts resident · {} ctx",
+            FitOutcome::Fits { yield_note, .. } => yield_note.as_deref(),
+            FitOutcome::DoesNotFit { .. } => None,
+        }
+    }
+
+    /// `"4,128 / 4,608"` — resident slots over the model's total, for a column under a
+    /// heading that already says what the numbers are.
+    ///
+    /// Split out from [`Self::summary`] because the "what will fit" table now has a header row.
+    /// Repeating "experts resident" and "ctx" on every line cost sixteen columns that the host
+    /// tier needed, and a header says it once.
+    pub fn residency_cell(&self) -> String {
+        match &self.outcome {
+            FitOutcome::Fits { resident_experts, total_experts, .. } => format!(
+                "{} / {}",
                 crate::format::count(*resident_experts as i64),
-                crate::format::count(*total_experts as i64),
-                crate::format::count(*context_tokens as i64)
+                crate::format::count(*total_experts as i64)
             ),
             FitOutcome::DoesNotFit { headline, .. } => (*headline).to_string(),
+        }
+    }
+
+    /// `"2,048"` — the planned context, in tokens.
+    pub fn context_cell(&self) -> String {
+        match &self.outcome {
+            FitOutcome::Fits { context_tokens, .. } => crate::format::count(*context_tokens as i64),
+            FitOutcome::DoesNotFit { .. } => "—".to_string(),
         }
     }
 }
@@ -110,11 +140,24 @@ pub struct Columns {
     pub id: usize,
     pub quant: usize,
     pub size: usize,
+    /// Widest `"resident / total"` any row could hold.
+    pub residency: usize,
+    /// Widest context length any row could hold.
+    pub ctx: usize,
 }
 
 impl Columns {
     /// Floors, so a one-model directory still produces a table rather than a ragged line.
-    const MIN: Self = Self { id: 13, quant: 5, size: 9 };
+    const MIN: Self = Self { id: 13, quant: 5, size: 9, residency: 9, ctx: 5 };
+
+    /// The host tier column, fixed at the widest label [`Tier`] can produce.
+    ///
+    /// 🔴 Fixed rather than measured from the rows, which is the opposite of every other column
+    /// here and is deliberate: the tier is the one cell that changes as the user moves the
+    /// budget. A measured width would make the whole table reflow on every key press, so the
+    /// numbers a viewer is trying to read would slide sideways underneath them. A little
+    /// trailing space is the cheaper defect.
+    pub const TIER: usize = 21;
 
     pub fn of(models: &[ModelCard]) -> Self {
         let mut c = Self::MIN;
@@ -123,8 +166,47 @@ impl Columns {
             c.id = c.id.max(m.id.chars().count());
             c.quant = c.quant.max(m.quant.chars().count());
             c.size = c.size.max(crate::format::bytes(m.file_bytes).chars().count());
+            // Sized from the model rather than from the plan, so these two columns are also
+            // stable while the budget moves: the widest residency a row can ever print is the
+            // slot count against itself, and the widest context is the trained one.
+            let slots = crate::format::count(m.expert_slots_total as i64).chars().count();
+            c.residency = c.residency.max(slots * 2 + 3);
+            c.ctx =
+                c.ctx.max(crate::format::count(m.trained_context_tokens as i64).chars().count());
         }
         c
+    }
+}
+
+/// The KV cache's element width.
+///
+/// 🔴 One variant today, and the type exists *because* of that rather than in spite of it.
+/// `moearc-model` reads `kv_bytes_per_token` **at f16** out of the header, so f16 is the only
+/// width any number on this screen is entitled to describe. Quantised KV (q8_0) halves it
+/// again and is queued behind the sliding-window work in the engine's `moe.rs`/`kv.rs`, which
+/// this crate does not own. When it lands it lands as a variant here and a scale in
+/// [`footprint`], and no screen changes.
+///
+/// There is deliberately **no control for it on screen**. A dial that does nothing yet is a
+/// promise, and a promise in a demo is indistinguishable from a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvPrecision {
+    #[default]
+    F16,
+}
+
+impl KvPrecision {
+    /// Scale the header's f16 per-token figure to this width.
+    fn per_token(self, f16_bytes: u64) -> u64 {
+        match self {
+            Self::F16 => f16_bytes,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+        }
     }
 }
 
@@ -144,12 +226,59 @@ fn footprint(card: &ModelCard) -> ModelFootprint {
         per_expert_bytes: card.per_expert_bytes,
         total_experts: card.expert_slots_total,
         active_experts: card.expert_slots_active,
-        kv_bytes_per_token: card.kv_bytes_per_token,
+        kv_bytes_per_token: KvPrecision::default().per_token(card.kv_bytes_per_token),
     }
 }
 
 fn want(ctx: Option<u32>) -> Context {
     ctx.map_or(Context::Largest, Context::Tokens)
+}
+
+/// The context lengths the dial steps through.
+///
+/// Powers of two rather than a linear step, because that is the ladder the field is written in
+/// and because the length this product is aimed at — **64K** — is a rung rather than something
+/// a user has to hunt for. `None` is the first stop and is not "zero": it is *largest that
+/// fits*, which is a different question and the one `moearc` answers when nobody asks.
+///
+/// 🔴 The ladder deliberately runs past what an 11.33 GiB card can serve at f16. A dial that
+/// stops where today's hardware stops would hide the tradeoff instead of showing it — and the
+/// planner already refuses an impossible length with a sentence that names the achievable one,
+/// which is better copy than a control that will not move.
+pub const CONTEXT_LADDER: [Option<u32>; 9] = [
+    None,
+    Some(2_048),
+    Some(4_096),
+    Some(8_192),
+    Some(16_384),
+    Some(32_768),
+    Some(65_536),
+    Some(131_072),
+    Some(262_144),
+];
+
+/// Where a context length sits on [`CONTEXT_LADDER`].
+///
+/// A value that is not a rung — `--ctx 3000` — resolves to the first rung that covers it, so
+/// the dial steps from where the user is rather than jumping to the bottom.
+pub fn ladder_index(ctx: Option<u32>) -> usize {
+    match ctx {
+        None => 0,
+        Some(t) => CONTEXT_LADDER
+            .iter()
+            .position(|r| r.is_some_and(|rung| rung >= t))
+            .unwrap_or(CONTEXT_LADDER.len() - 1),
+    }
+}
+
+/// The rung `delta` steps away, clamped to the ends.
+///
+/// Clamped rather than wrapped: a dial that jumps from 262,144 back to "largest that fits" on
+/// one more key press has no ends, and a control with no ends cannot be driven by feel.
+pub fn ladder_step(ctx: Option<u32>, delta: isize) -> Option<u32> {
+    let at = ladder_index(ctx) as isize;
+    let next = (at + delta).clamp(0, CONTEXT_LADDER.len() as isize - 1) as usize;
+    CONTEXT_LADDER[next]
 }
 
 /// Plan `card` onto `device`, letting the engine choose the split.
@@ -267,6 +396,11 @@ fn fits(
 ) -> FitOutcome {
     let context_at_floor =
         a.rationale.iter().any(|r| matches!(r, Reason::ContextAtPolicyFloor { .. }));
+    let yield_note = a
+        .rationale
+        .iter()
+        .find(|r| matches!(r, Reason::ExpertsYieldedToContext { .. }))
+        .map(ToString::to_string);
     let mut rationale: Vec<String> = a.rationale.iter().map(ToString::to_string).collect();
     if context_capped {
         // Appended by this crate, not by the engine. The engine reasons about bytes; this is
@@ -287,6 +421,7 @@ fn fits(
         headroom_bytes: a.headroom_bytes,
         ceiling_tokens,
         context_at_floor,
+        yield_note,
         rationale,
     }
 }
@@ -433,6 +568,148 @@ mod tests {
         };
         let ceiling = ceiling_tokens.expect("minimum residency should always plan");
         assert!(ceiling > context_tokens, "dropping to the floor must buy context");
+    }
+
+    #[test]
+    fn a_requested_context_reports_what_it_cost_in_expert_slots() {
+        // The tradeoff, in the planner's own sentence. `Context::Largest` asks for nothing
+        // specific, so nothing is yielded and there is nothing to report.
+        let (d, m) = (card(), model("qwen3-30b-a3b"));
+        assert_eq!(plan(&d, &m, None).yield_note(), None);
+        let long = plan(&d, &m, Some(32_768));
+        let note = long.yield_note().expect("32k costs slots here");
+        assert!(note.contains("gave up"), "{note}");
+        assert!(note.contains("expert slots"), "{note}");
+    }
+
+    #[test]
+    fn the_bias_policy_is_not_the_axis_the_dial_moves() {
+        // 🔴 Measured, not assumed, and it is why the interface has a context dial and no bias
+        // toggle. `Bias::Experts` and `Bias::Context` produce **byte-identical** allocations for
+        // every model and every rung checked here: at `Context::Largest` the two take branches
+        // that are the same arithmetic, and with a requested context the experts-first
+        // yield-back loop lands on exactly the maximum residency the context-first path
+        // computes directly. A toggle for it would be a control a viewer could not see working.
+        //
+        // The axis that *does* move the plan is `Largest` vs `Tokens(n)` — which is the dial.
+        // Only the *explanation* differs between the two biases: the experts-first path emits
+        // `Reason::ExpertsYieldedToContext` and the context-first path has nothing to yield.
+        use moearc_engine::memory::{Bias, DeviceMemory, plan as engine};
+        let d = card();
+        let mem = DeviceMemory { total_bytes: d.total_bytes, free_bytes: d.free_bytes };
+        for id in ["qwen3-30b-a3b", "gpt-oss-20b"] {
+            let m = footprint(&model(id));
+            for want in [Context::Largest, Context::Tokens(8_192), Context::Tokens(32_768)] {
+                let by_experts =
+                    engine(mem, &m, &Policy { bias: Bias::Experts, ..Policy::default() }, want)
+                        .expect("plans");
+                let by_context =
+                    engine(mem, &m, &Policy { bias: Bias::Context, ..Policy::default() }, want)
+                        .expect("plans");
+                assert_eq!(
+                    (
+                        by_experts.resident_experts,
+                        by_experts.context_tokens,
+                        by_experts.kv_pages,
+                        by_experts.expert_bytes,
+                        by_experts.kv_bytes
+                    ),
+                    (
+                        by_context.resident_experts,
+                        by_context.context_tokens,
+                        by_context.kv_pages,
+                        by_context.expert_bytes,
+                        by_context.kv_bytes
+                    ),
+                    "{id} at {want:?}: the bias changed the plan after all, so the interface \
+                     needs a control for it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_kv_width_is_the_one_the_header_was_read_at() {
+        // Guards the seam against being wired up before the engine can honour it: today the
+        // only width is the one `moearc-model` measured, so the scale is the identity.
+        let m = model("qwen3-30b-a3b");
+        assert_eq!(
+            footprint(&m).kv_bytes_per_token,
+            m.kv_bytes_per_token,
+            "a scale applied before the engine supports it would misplan every context"
+        );
+        assert_eq!(KvPrecision::default().label(), "f16");
+    }
+
+    #[test]
+    fn the_context_ladder_is_ascending_and_reaches_the_target() {
+        // 64K is the length the product is aimed at, so it is a stop on the dial rather than
+        // something a user has to land on with a linear step.
+        let rungs: Vec<u32> = CONTEXT_LADDER.iter().flatten().copied().collect();
+        assert!(rungs.windows(2).all(|w| w[0] < w[1]), "{rungs:?}");
+        assert!(rungs.contains(&65_536));
+        assert_eq!(CONTEXT_LADDER[0], None, "the first stop is `largest that fits`");
+    }
+
+    #[test]
+    fn every_rung_maps_back_to_its_own_position() {
+        for (i, rung) in CONTEXT_LADDER.iter().enumerate() {
+            assert_eq!(ladder_index(*rung), i, "{rung:?}");
+        }
+        // A context typed with --ctx that is not on the ladder lands on the first rung that
+        // covers it, so the next press is a step rather than a jump back to the bottom.
+        assert_eq!(ladder_index(Some(3_000)), ladder_index(Some(4_096)));
+        assert_eq!(ladder_index(Some(4_000_000)), CONTEXT_LADDER.len() - 1);
+    }
+
+    #[test]
+    fn context_and_residency_trade_against_each_other_along_the_ladder() {
+        // The coupling the second dial exists to show, asserted rather than asserted-at. The
+        // arithmetic is the engine's; this only checks that walking the dial actually moves
+        // both numbers, and in opposite directions.
+        let (d, m) = (card(), model("qwen3-30b-a3b"));
+        let mut last: Option<(u32, u32)> = None;
+        for rung in CONTEXT_LADDER.iter().skip(1).flatten() {
+            let FitOutcome::Fits { resident_experts, context_tokens, .. } =
+                plan(&d, &m, Some(*rung)).outcome
+            else {
+                break; // the ladder runs past what this card can serve, which is the point
+            };
+            if let Some((slots, ctx)) = last {
+                assert!(context_tokens > ctx, "a longer context should be longer");
+                assert!(resident_experts <= slots, "and it should cost slots, never gain them");
+            }
+            last = Some((resident_experts, context_tokens));
+        }
+        assert!(last.is_some(), "at least one rung must plan");
+    }
+
+    #[test]
+    fn the_tier_column_is_wide_enough_for_every_word_it_can_hold() {
+        // A fixed width is only safe while it is checked against the strings it has to hold.
+        use moearc_engine::host_budget::Tier;
+        for tier in [Tier::RunsFromRam, Tier::RunsPagesFromDisk, Tier::WillNotFit] {
+            assert!(
+                tier.label().chars().count() <= Columns::TIER,
+                "`{}` does not fit the {}-column host tier",
+                tier.label(),
+                Columns::TIER
+            );
+        }
+    }
+
+    #[test]
+    fn the_residency_and_context_columns_do_not_move_when_a_plan_changes() {
+        // The property the video depends on: dragging the budget must not reflow the table.
+        // Both widths come from the model's own geometry, so a different plan cannot widen
+        // them.
+        let (d, m) = (card(), model("qwen3-30b-a3b"));
+        let wide = Columns::of(std::slice::from_ref(&m));
+        for ctx in [None, Some(8_192), Some(32_768)] {
+            let f = plan(&d, &m, ctx);
+            assert!(f.residency_cell().chars().count() <= wide.residency, "{}", f.residency_cell());
+            assert!(f.context_cell().chars().count() <= wide.ctx, "{}", f.context_cell());
+        }
     }
 
     #[test]
