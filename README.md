@@ -4,127 +4,36 @@
 One command to install, one command to run, OpenAI- and Anthropic-compatible
 out of the box.
 
-> **Status: the thesis is demonstrated in the engine.**
+> **Status: it beats llama.cpp on a 59 GiB model, on a 12 GB card.**
 >
-> ✅ **Qwen3-30B-A3B — 17.3 GiB of model — runs on an 11.3 GiB Arc B580**, with greedy
-> output matching llama.cpp **token id for token id** (64/64), independently re-verified.
+> ✅ **gpt-oss-120B — 59.0 GiB of weights — runs on an 11.33 GiB Arc B580 at 17.2 tok/s**,
+> with **13% of the expert bank resident** and greedy output matching llama.cpp for all
+> 64 tokens. Independently re-verified.
 >
-> ✅ **Dynamic residency beats a static split at matched capacity: 45.08 vs 13.44 tok/s,
-> and 24× less data across the bus.** Identical output. That is the claim this project
-> exists to make, measured in the engine rather than simulated.
+> ✅ **llama.cpp does 15.47 tok/s on the same model and card — and cannot run it at all
+> below `--n-cpu-moe 31`.** Below that it crashes with `OUT_OF_DEVICE_MEMORY`. Only 5 of
+> its 36 blocks fit in VRAM.
 >
-> ✅ **45.08 tok/s against llama.cpp's 50.13 on the same model and card — 90% of it.**
-> And llama.cpp needs 24 of 48 MoE layers pinned to the CPU permanently to run this model
-> at all; MoEArc decides per block, per token.
+> ✅ **On Qwen3-30B, dynamic residency beats a static split 45.08 vs 13.44 tok/s at matched
+> capacity**, with 24× less data crossing the bus and identical output.
 >
-> 🔴 **Not yet:** no batched prefill at all, so there is no counterpart to llama.cpp's
-> 3218 tok/s prefill. Every matvec runs at 25–29% of the card's peak bandwidth against
-> llama.cpp's 63%. And no adaptive residency policy — the numbers above come from constant
-> policies chosen by sweeping, not by the engine deciding for itself.
+> 🔴 **Not yet:** no batched prefill, so there is no counterpart to llama.cpp's prefill
+> throughput. Matvecs run at 25–29% of the card's peak bandwidth against llama.cpp's 63%.
+> No adaptive policy — the residency fractions above were found by sweeping, not chosen by
+> the engine. Sliding-window models are refused above 128 tokens of context rather than
+> silently approximated.
 
-## Install
-
-**One command, and you do not need to know what oneAPI is.**
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/chrisdesrochers/MoEArc/main/packaging/install.sh | sh
-moearc                       # device report: what card you have and what will fit on it
+```
+╭ What will fit ──────────────────────────────────────────────────────────────────╮
+│  ✓ gpt-oss-120b              mxfp4  59.0 GiB   612 / 4,608 experts · 2,048 ctx  │
+│  ✓ qwen3.6-35b-a3b-ud        q4_K   20.6 GiB  3,976 / 10,240 experts            │
+│  ✓ qwen3-30b-a3b             q4_K   17.3 GiB  3,108 / 6,144 experts             │
+│  ✓ olmoe-1b-7b-0924-instruct q4_K    3.9 GiB  1,024 / 1,024 experts             │
+╰──────────────────────────────────────────────── moearc info <model> ────────────╯
 ```
 
-⚠️ **Pre-release, and this is the honest state of it.** There is no tagged release yet, so the
-installer has nothing to download until there is one. Build the tarball yourself and point the
-installer at it:
-
-```sh
-packaging/bundle.sh --build              # needs Intel DPC++ on the BUILD machine, never on yours
-MOEARC_TARBALL=dist/moearc-*.tar.gz sh packaging/install.sh
-```
-
-### What you need
-
-| | |
-|---|---|
-| an Intel Arc GPU | B-series (Battlemage) or A-series. Also runs, slowly, on Arrow Lake / Lunar Lake iGPUs. |
-| the kernel GPU driver | `xe` for B-series, `i915` for A-series. Ships with your kernel. |
-| the Intel GPU user-space driver | `libze1` + `libze-intel-gpu1` + `libigdgmm12` (Debian/Ubuntu), `intel-level-zero-gpu` (Fedora), `intel-compute-runtime` (Arch) |
-| glibc 2.39 or newer | Ubuntu 24.04+, Fedora 40+, Debian 13+. **Debian 12 and RHEL 9 are too old.** |
-| python3 | used once, to fetch the SYCL runtime |
-
-🔴 **The GPU driver is the one dependency we are allowed to have, and its version matters more
-than you would expect.** Three things were measured on a B580, and each fails later than the
-last — which is the dangerous part, because the earlier steps keep passing:
-
-| driver | `moearc` finds the card | SYCL starts | a model actually runs |
-|---|---|---|---|
-| Ubuntu 24.04 stock (build 27642) | ❌ reports your **iGPU** instead | — | — |
-| Intel's client repo for 24.04 (25.18.33578) | ✅ | ✅ | ❌ `host-to-device copy failed` |
-| Ubuntu 26.04 (26.05.37020) | ✅ | ✅ | ✅ |
-
-**On Ubuntu 24.04, add [Intel's GPU repository](https://dgpu-docs.intel.com/driver/client/overview.html)**
-— and be aware that inference has been verified only against the newer stack. A recent distro,
-or Intel's current repo, is the supported answer.
-
-📌 **`libigdgmm12` is a `Recommends`, not a `Depends`.** If it is absent, detection succeeds, a
-SYCL queue is created, and only the model load dies — with an abort inside the driver's
-`gmm_helper`. Install it explicitly.
-
-**That list is the whole list.** No oneAPI toolkit, no Python environment, no conda, no
-matching a wheel to a driver version.
-
-The tarball is **4.8 MB**. The SYCL runtime MoEArc needs is downloaded once at install time
-from Intel's own published packages, pinned by SHA-256 — about 230 MB fetched, 78 MiB kept, for
-a 92 MB install. It is deliberately **not** redistributed inside our tarball;
-[`packaging/THIRD-PARTY.md`](packaging/THIRD-PARTY.md) says exactly why not, and the short
-version is that Intel's redistribution grant points at a file list that does not exist in the
-toolkit we build against, and two of its conditions would follow you home.
-
-For an air-gapped machine, `packaging/bundle.sh --with-runtime` produces a 29 MB tarball that
-needs no network at all — proven under `podman --network none`. Read `THIRD-PARTY.md` before
-you publish one: that archive is not wholly Apache-2.0.
-
-### Verifying it on your machine
-
-```sh
-moearc --no-tui        # names your card, or says precisely what is missing
-moearc-selftest        # loads the SYCL kernels and reports the device they found
-```
-
-This has been run end to end on a machine that has never had oneAPI installed — Ubuntu 24.04,
-glibc 2.39, an empty environment — and finds the B580. The procedure is
-`packaging/verify-clean.sh`, and it is a container rather than a unit test on purpose: a
-previous packaging bug survived 309 green tests because every one of them ran in a shell where
-`setvars.sh` had been sourced.
-
-### Reproducing the numbers below
-
-```sh
-bench/reproduce.sh /path/to/Qwen3-30B-A3B-Q4_K_M.gguf
-```
-
-Prints the box, the driver, the commit, the model and the runtime *before* it prints a number,
-runs the headline configuration three times because the run-to-run spread on this hardware is
-about ±10%, and ends with an explicit list of the claims on this page that it did **not**
-measure. It also prints the box's load average and refuses to call a contended run citable.
-
-⏱️ Budget time: each repeat reloads the model, and on the reference box a single 128-token run
-of the 30B model takes several minutes. `--quick` does one short run and checks the harness
-rather than the number. See [`bench/README.md`](bench/README.md) for the protocol.
-
-### Building from source
-
-You need Intel's DPC++ compiler (`icpx`) and a Rust toolchain. That requirement lands on the
-build machine and never on a user's — which is the entire point of the packaging above.
-
-```sh
-source /opt/intel/oneapi/setvars.sh
-cargo build --release -p moearc-cli -p moearc-server \
-  --features moearc-server/engine,moearc-engine/gpu
-```
-
-📌 A `cargo build` produces a **development** build: the kernel object's soname carries this
-build tree's absolute path, so the binaries only run on the machine that built them. That is
-deliberate, and `packaging/bundle.sh` is what makes a copy that travels.
-[`docs/packaging.md`](docs/packaging.md) explains both.
+*`moearc` on an Arc B580 — real devices, real models, real plans. Every number above is
+read from this machine.*
 
 ## Why
 
