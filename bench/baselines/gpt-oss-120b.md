@@ -17,7 +17,9 @@ memory strategy and the host executor are both load-bearing rather than optional
 Everything in sections 1 to 3 was measured **at one context depth — effectively zero** — and
 with llama.cpp on **its default thread count**. Both of those turn out to decide the result, so
 every figure below now carries its depth and its thread count, and **section 6 is the one to
-quote.** Two corrections, in order of how much they matter:
+quote — as corrected by section 7**, which re-measures section 6's own configuration on a quiet
+box, finds a better host policy than the one section 6 swept at, and shows that one cell of
+section 6.3 is not reproducible at all. Two corrections, in order of how much they matter:
 
 1. **llama.cpp's 15.47 is llama.cpp on 4 of the machine's 20 cores.** `llama-bench`'s default
    `n_threads` is **4** — read out of its own `-o csv` output, not inferred — and `-ncmoe 31`
@@ -320,6 +322,11 @@ the wrong question.
 
 ### 6.3 The curve
 
+🔴 **Corrected by section 7.5.** Every row here is `frac:0.5`, which is **not the best host
+policy at any depth** — `frac:0.75` beats it by 1.06x to 1.73x — and the depth-2048 row was taken
+at a load average of 21 and **understates by 34%**. The depth-8192 cell should not be quoted in
+either direction: a clean re-run of it came out 1.6x *lower* while reading 1.48 TiB from disk.
+
 llama.cpp, `-ncmoe 31`, `-r 3`, decode-only at each depth. MoEArc, 600 slots at `frac:0.5`,
 64 generated tokens, decode-only, cold and warm reported separately.
 
@@ -349,6 +356,10 @@ narrow, and does not merely become context-dependent. It inverts, at every depth
 - The gap goes from **1.9x against us at depth 128 to 13.2x against us at depth 8192.**
 
 ### 6.4 Attributing the fall: staging, not attention
+
+🔴 **True in the regime measured here, and it inverts outside it — see section 7.6.** Both rows
+below are `frac:0.5` at depths 512 and 2048. At `frac:0.75`, staging is 1–4 ms at *every* depth,
+and by depth 8192 the decode step is roughly **69% attention and 1.4% staging**.
 
 Two explanations fit a falling curve, and they call for opposite fixes: attention over more keys
 costs more, or a deeper prompt leaves the resident pool holding a more diluted working set so the
@@ -442,3 +453,217 @@ that is the sweep measuring itself**: `frac:0.5` drives the host pool across 19 
 1-minute average carries the *previous* depth's own work. It is reported because a row that
 cannot say what else was running is not evidence — but the number that shows the box was quiet
 is the pre-run one, not the mid-sweep one.
+
+---
+
+## 7. Host policy against depth — and the two things that changes
+
+**Date:** 2026-09-06, later the same day. Run to test a specific worry: that `frac:0.5` — the
+setting section 6.3's whole curve was taken at — is a large **loss** at depth, because the host
+executor reads expert weights straight out of a 59.03 GiB mmap that cannot fit a 16 GiB ARC, so a
+host-routed expert at depth might be a **disk read** and `moe.host_sync` might be the GPU waiting
+on it.
+
+**That worry is wrong, and the opposite is true.** Host routing wins at every depth measured, and
+`frac:0.5` is not the best setting — it is the *third* best. Two things do come out of it, and
+both matter more than the question that prompted it.
+
+### 7.1 Protocol
+
+Section 6.1 exactly — 600 slots, 64 generated tokens, decode-only timing, cold and warm reported
+separately, `bench/references/gpt-oss-120b.longctx.ids` — plus four additions, all of which exist
+because the first attempt failed:
+
+- **One pinned binary for every run** (`81c22f09091fc949`). Three other agents were committing to
+  this repo during the sweep; rebuilding between arms would have compared engines, not policies.
+  *(`residency.rs` changed under the sweep and it did not matter: it is the offline trace
+  simulator, and the runtime imports only a plain `ExpertRef` from it.)*
+- **A gate that looks for processes, not just loadavg.** Load average is a lagging indicator, and
+  `ps comm` truncates at 15 characters — so a name-matching check waves the gcc driver
+  (`x86_64-linux-gn`) straight through. The gate sums foreign `%CPU` instead, which needs no list.
+  🔴 **`nice` protects CPU shares but not the ZFS ARC:** a niced build next door still evicts the
+  model's pages, and this workload is bound by what is resident.
+- **Disk and ARC counters around every pass** (`/proc/diskstats` on the pool's partition,
+  `arcstats`), bracketed **separately for prefill and decode** — at depth 8192 the prompt is 8,192
+  steps against 63 decode steps, so one figure for the pass would describe the prompt.
+- **Independent invocations, not repeats inside one.** Process-level variance is the variance that
+  bit this project (6.2.1).
+
+Every timed invocation below started at a 1-minute load average between **0.39 and 1.23**.
+
+### 7.2 The sweep
+
+Warm tok/s, mean ± half-range over independent invocations:
+
+| depth | `off` | `frac:0.25` | `frac:0.5` | **`frac:0.75`** | `frac:1.0` | best vs `frac:0.5` | best vs `off` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 6.78 ±0.02 | 10.47 † | 12.32 ±0.07 | **14.93 ±0.04** | 10.33 † | **1.21x** | 2.20x |
+| 512 | 8.66 ±0.00 | 11.98 † | 12.41 ±0.10 | **13.38 ±0.03** | 9.86 † | **1.08x** | 1.55x |
+| 2048 | 5.37 ±0.06 | 6.92 † | 7.63 ±0.15 | **8.74 ±0.06** | 7.10 † | **1.15x** | 1.63x |
+| 8192 | — | — | 1.31 † | **3.71 †** | — | **2.83x** | — |
+
+† n = 1; every other cell is n = 2. Cold, same runs: 128 `off` 5.39 ±1.26 / `frac:0.5` 12.16 ±0.08
+/ `frac:0.75` 11.70 ±2.94; 2048 `off` 5.20 ±0.13 / `frac:0.5` 7.79 ±0.02 / `frac:0.75` 8.55 ±0.33;
+8192 `frac:0.5` 1.53, `frac:0.75` 3.96. **Cold spreads are 10–25x wider than warm ones**, because
+cold depends on what the previous process left in ARC and warm does not.
+
+**There is no crossover in the `off`-versus-host axis.** `off` is worst at every depth; host
+routing is worth 1.55–2.20x. The movement is in the *fraction*: **`frac:0.75` wins at every depth,
+and its margin over `frac:0.5` grows from 1.08x at 512 to 2.83x at 8192.** The optimum is
+**interior** — `frac:1.0` is worse than `0.75` everywhere — so this is not "more host is always
+better"; it is that section 3.3's crossover, found at depth 6, **moves with depth**.
+
+⚠️ **Reproducibility is itself a result.** Warm spreads: `frac:0.75` **±0.2–0.7%**, `off`
+**±0.1–1.2%**, `frac:0.5` **±0.5–2.0%**, worst at the deepest row of each. The policy that stages
+least is the policy whose numbers hold still.
+
+### 7.3 The mechanism: staging is eliminated, not merely reduced
+
+Milliseconds per decode step, warm, ordinary asynchronous profile. **One round (A), so the phase
+and disk columns describe the same invocations** — the second round's phases reproduce these to
+within 1.3% (`frac:0.75` at 128: `moe.stage` 1.74 against 1.75, `moe.host_sync` 37.06 against
+36.60):
+
+| depth | policy | `decode.total` | `moe.stage` | `moe.host_sync` | `moe.readback` | warm-decode disk |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | `off` | 147.52 | 86.41 | 0.00 | 52.46 | 0 MiB |
+| 128 | `frac:0.5` | 81.46 | 28.04 | 7.64 | 37.05 | 0 MiB |
+| 128 | `frac:0.75` | 66.69 | **1.75** | 36.60 | 20.32 | 0 MiB |
+| 2048 | `off` | 183.86 | 79.85 | 0.00 | 95.34 | 0 MiB |
+| 2048 | `frac:0.5` | 128.39 | 32.19 | 6.79 | 80.30 | 0 MiB |
+| 2048 | `frac:0.75` | 113.48 | **3.96** | 38.34 | 63.06 | 50 MiB |
+| 8192 | `frac:0.5` | 760.66 | 159.61 | 48.97 | 370.81 | **4,512 MiB** |
+| 8192 | `frac:0.75` | 269.73 | **3.82** | 42.72 | 207.85 | **0 MiB** |
+
+🔴 **`moe.host_sync` is flat in depth** — at `frac:0.75` it is 36.60 / 36.50 / 38.34 / 42.72 ms
+across 128 → 8192, a 17% rise over a 64x change in depth. **The host executor does not stall more
+at depth, and the worry that prompted this section is answered: no.** What heavy host routing does
+is send most misses to the CPU *instead of admitting them*, so `moe.stage` — the thing 6.4 calls
+80% of the depth penalty — falls to **1–4 ms and stays there at every depth.**
+
+### 7.4 Where the disk actually bites, and where it does not
+
+**Warm-decode disk reads are 0 MiB in almost every cell of the matrix** — staging at depth is
+served from RAM, not NVMe. There is exactly one exception, and it is dramatic:
+
+| @ 8192 | `frac:0.5` | `frac:0.75` |
+| --- | ---: | ---: |
+| staged, whole pass | 2.71 TiB | 0.30 TiB |
+| cold-prefill disk read | **1.48 TiB** | 27 GiB |
+| **warm-decode disk read** | **4,512 MiB** (71.6 MiB/step) | **0 MiB** |
+| warm tok/s | 1.31 | **3.71** |
+
+`frac:0.5` at depth 8192 faults **~55% of its staged bytes from NVMe**; `frac:0.75` faults 9% and
+**nothing at all during warm decode**. 📌 **Staging is disk-bound only in the regime where staging
+is large — and the policy that removes staging removes the disk dependence with it.** A pinned
+host-memory staging ring would not help here; not staging would.
+
+### 7.5 🔴 Does 6.3's curve understate MoEArc? Yes — and one of its rows is not reproducible
+
+Same policy (`frac:0.5`), same protocol, quiet box:
+
+| depth | 6.3 published | this section | delta | 6.3's own `load` column |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 12.12 | 12.32 ±0.07 | +1.7% | 3.64 |
+| 512 | 12.62 | 12.41 ±0.10 | −1.7% | 14.45 |
+| 2048 | 5.69 | **7.63 ±0.15** | **+34.1%** | 21.05 |
+| 8192 | 2.14 | **1.31** | **−38.8%** | 19.57 |
+
+6.3 reproduces at 128 and 512 and **understates by 34% at 2048**, which is where its own load
+column reads 21. Its 8192 row is a different problem: this section's clean-box run of the *same
+configuration* came out **worse**, and it read **1.48 TiB** from disk doing it. **Two quiet-box
+measurements 1.6x apart mean that cell measures the storage, not the engine** (PROTOCOL §4). It
+should not be quoted in either direction.
+
+Against the **best** policy rather than `frac:0.5`, the curve is:
+
+| depth | 6.3 (`frac:0.5`) | best (`frac:0.75`) | ratio |
+| ---: | ---: | ---: | ---: |
+| 128 | 12.12 | **14.93** | 1.23x |
+| 512 | 12.62 | **13.38** | 1.06x |
+| 2048 | 5.69 | **8.74** | 1.54x |
+| 8192 | 2.14 | **3.71** | 1.73x |
+
+**The published 5.9x falloff from 512 to 8192 is 3.6x at `frac:0.75`.** (At `frac:0.5` this
+session measured 9.5x — the same instability as the row above.) MoEArc still falls with depth and
+llama.cpp still does not; the fall is **smaller than published and the deep end is understated by
+up to 1.73x.**
+
+### 7.6 🔴 "Staging, not attention" inverts by depth 8192
+
+Section 6.4 concluded that staging, not attention, dominates the cost of depth. **That was
+measured at depths 512 and 2048 only** — its own text says 8192 was skipped for time — **and at
+`frac:0.5`, where staging is large by construction.** At `frac:0.75` and depth 8192, `moe.stage` is
+**3.82 ms of a 269.73 ms step: 1.4%.**
+
+`MOEARC_SYNC_EACH=1` at `frac:0.75`, matching 6.4's protocol:
+
+| depth | `attn.attend` — this run (`frac:0.75`) | 6.4's run (`frac:0.5`) |
+| ---: | ---: | ---: |
+| 512 | 15.24 | 15.21 |
+| 2048 | 49.65 | 49.51 |
+
+**The two agree to 0.2%, across different policies and different sessions** — as they must, since
+attention does not depend on expert routing. That makes `attn.attend` the one trustworthy quantity
+in a sync-each run, and it supports an extrapolation the raw milliseconds do not.
+
+gpt-oss declares `sliding_window = 128` on **alternating** blocks, so **18 of 36 blocks are capped
+and 18 are full causal**: attention is `const + slope · depth` by construction, not by curve
+fitting. The two points give `attn(d) = 3.77 + 0.02240·d` ms, hence **187.3 ms at depth 8192**.
+*(6.4's own `frac:0.5` pair gives 186.7 — a 0.3% difference.)*
+
+Testing that against the **asynchronous** `moe.readback`, the phase that drains the queue:
+
+| depth | async `moe.readback` | predicted `attn.attend` | residual | attention as % of decode step |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 20.32 | 6.64 | 13.68 | 10% |
+| 512 | 29.18 | 15.24 | 13.94 | 20% |
+| 2048 | 63.06 | 49.65 | 13.41 | 44% |
+| **8192** | **207.85** | **187.29** | 20.56 | **69%** |
+
+**The residual is constant at 13.68 ± 0.27 ms across three depths spanning 16x.** `moe.readback` is
+attention's device time plus a fixed ~14 ms, which is what a queue-drain phase should look like.
+
+📌 **At depth 8192 the decode step is roughly 69% attention and 1.4% staging.** 6.4's conclusion is
+correct in the regime it measured and **inverts outside it** — and the inversion is partly *caused*
+by fixing the staging: eliminate staging and attention is what is left. **Attention kernel work,
+not a staging optimisation, is what buys the deep end.**
+
+⚠️ **Limits, stated rather than buried.** The 8192 attention figure is an **extrapolation 4x beyond
+the measured range**, not a measurement. It rests on three things — the SWA structure that makes
+the linear form correct, reproduction of both anchor points across two independent runs, and the
+constant residual at three depths — but the residual at 8192 is **20.56 against 13.68**, 50%
+larger, so something there is either slightly super-linear or not accounted for. A direct
+measurement would need sync-each at 8192, which this session costed at **8–12 hours** from its own
+prefill scaling (86 s at depth 512, 1,330 s at 2048) and did not run. ⚠️ The sync-each run's
+`moe.stage` and `moe.host_sync` are **discarded**: it faulted 507 GiB during the 2048 prefill and
+measured the storage.
+
+### 7.7 A one-line fix that would make this cheap
+
+`moearc_track` is called **only** from the matvec paths in `kernels.cpp`, so `moearc_attn_decode`
+appears in no device-counter row and `MOEARC_PROFILE_EVENTS=1` — which attributes per-kernel device
+time *without* serialising — cannot see attention either. **That is the only reason section 6.4 and
+this section both had to reach for `MOEARC_SYNC_EACH`,** and it is why the number above is an
+extrapolation rather than a measurement.
+
+📌 **Adding one `moearc_track` call to `moearc_attn_decode` would make attention attributable from
+an ordinary asynchronous run at any depth** — about 45 minutes at depth 8192 instead of 8–12 hours,
+and permanently, for every future depth question. *(Not made here: `crates/moearc-kernels/` is not
+this section's to edit.)*
+
+### 7.8 Raw output
+
+| file | what |
+| --- | --- |
+| `bench/results/2026-09-06-moearc-host-policy-depth.txt` | 7.2's sweep, rounds A and B |
+| `bench/results/2026-09-06-moearc-host-policy-8192.txt` | the depth-8192 rows |
+| `bench/results/2026-09-06-moearc-sync-each-frac075.txt` | 7.6's sync-each pair |
+| `bench/results/2026-09-06-moearc-host-policy-DISCARDED-round1.txt` | ⚠️ the discarded first round — see below |
+
+⚠️ **The discarded round is in the tree on purpose.** Its gate was loadavg-only and its
+process check matched on truncated names, so it ran against another agent's build. The tell was
+internal, not external: **`frac:0.25` at depth 512 reported warm 1.43 against cold 3.63.** A warm
+pass slower than the cold pass before it is not a measurement, whichever number you prefer.
+Controlled re-runs of those same cells gave **10.47 and 11.98** — an 8–13x swing from box state
+alone, which is the fourth route this repo has found to the same class of contamination.

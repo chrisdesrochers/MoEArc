@@ -1,0 +1,48 @@
+# MOEARC_SYNC_EACH=1 at frac:0.75, matching 6.4s protocol so attn.attend is comparable
+# to its frac:0.5 rows. Depth 8192 was NOT run: its own prefill scaling (86s at 512,
+# 1330s at 2048) puts one pass at 4-6 hours and the run at 8-12.
+# WARNING: this run faulted 507 GiB during the 2048 prefill, so its moe.stage and
+# moe.host_sync measured the storage, not the engine (PROTOCOL section 4). Only
+# attn.attend is quoted from it, and only because it reproduces 6.4s independent
+# frac:0.5 run to 0.2% -- attention does not depend on expert routing.
+
+=== policy frac:0.75 | depths 512,2048 | MOEARC_SYNC_EACH=1
+=== git 3e53947 | binary 81c22f09091fc949
+=== PRE-RUN loadavg(1m) = 1.91   foreign CPU% = 31
+=== loadavg 1/5/15 = 1.91 8.09 15.38
+=== started 2026-09-06T21:50:07+00:00
+residency `600`, host `frac:0.75`, 64 generated tokens per depth
+16384 token ids available
+
+| depth | n_ctx | KV MiB | slots | load | prefill tok/s | **cold tok/s** | **warm tok/s** | hit (all) | staged MiB (all) | p50 ms | first 1/8 | last 1/8 | drift |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 512 | 577 | 26 | 600 | 1.92 | 2.79 | **3.52** | **6.21** | 96.8% | 15607 | 128.1 | 124.3 | 129.0 | +3.8% |
+depth 2048: the cold and warm passes produced different ids
+| 2048 | 2113 | 80 | 600 | 21.89 | 3.13 | **5.51** | **2.16** | 96.1% | 69842 | 428.2 | 417.7 | 489.8 | +17.3% |
+
+| depth | decode.total | attn.attend | attn.qkv | attn.proj | moe.stage | moe.expert_matvec | moe.host_sync | moe.readback |
+|---|---|---|---|---|---|---|---|---|
+| 512 | 160.87 | 15.24 | 9.98 | 5.96 | 9.37 | 11.78 | 83.33 | 0.60 |
+| 2048 | 462.50 | 49.65 | 17.34 | 7.05 | 74.17 | 13.79 | 256.61 | 1.11 |
+
+ms per decode step, warm pass, **decode steps only** -- `profile::reset()` runs at the first mark, so prefill is excluded from every column above.
+
+⚠ `hit (all)` and `staged MiB (all)` cover the WHOLE pass, prompt included: the cache counters can only be zeroed through the session, and `generate_with` holds its lock. At depth 8192 the 8,192 prefill steps outnumber the 63 decode steps 130 to 1, so those two columns describe prefill and must not be read as a decode hit rate. The decode-only staging cost is `moe.stage` in the phase table, which is fenced correctly.
+
+| depth | pass | disk read MiB | disk MiB/step | ARC miss % | staged MiB | disk/staged |
+|---|---|---|---|---|---|---|
+| 512 | cold prefill | 60253 | 117.7 | 0.3% | - | - |
+| 512 | cold decode | 3178 | 50.5 | 0.5% | 23070 | 0.14 |
+| 512 | warm prefill | 89045 | 173.9 | 0.3% | - | - |
+| 512 | warm decode | 4406 | 69.9 | 0.2% | 15607 | 0.28 |
+| 2048 | cold prefill | 505233 | 246.7 | 0.2% | - | - |
+| 2048 | cold decode | 5866 | 93.1 | 0.3% | 75477 | 0.08 |
+| 2048 | warm prefill | 507622 | 247.9 | 0.2% | - | - |
+| 2048 | warm decode | 21354 | 338.9 | 0.2% | 69842 | 0.31 |
+
+🔴 `disk read MiB` is the whole device, not this process: another tenant's reads land in it too, which is why the load average is gated before every run. `staged MiB` covers the WHOLE pass (see the caveat above), so `disk/staged` is an upper bound on the share of staging served from NVMe rather than from ARC.
+
+1 depth(s) failed
+!! exit 1
+=== finished 2026-09-06T22:19:58+00:00
+=== POST-RUN loadavg = 23.44 23.15 21.98 1/1219 3061726  foreign CPU% = 71

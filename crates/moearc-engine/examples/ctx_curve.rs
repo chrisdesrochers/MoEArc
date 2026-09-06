@@ -72,6 +72,84 @@ fn load_avg() -> f64 {
         .unwrap_or(f64::NAN)
 }
 
+/// Disk reads and ZFS ARC hits, so "slow" can be told apart from "waiting on the disk".
+///
+/// 🔴 The model is 59.03 GiB against a `zfs_arc_max` of 16 GiB, so it **cannot** be cached.
+/// That makes cache residency an uncontrolled variable that moves throughput by more than the
+/// setting under test, and it makes two very different failures look identical in a `tok/s`
+/// column: staging that is bound by the PCIe bus, and staging that is bound by a page fault to
+/// NVMe. Pinned host memory fixes the first and does nothing at all for the second, so the two
+/// must be separated before anyone optimises for either.
+///
+/// Both counters are cumulative and kernel-wide, so only differences over a bracketed window
+/// mean anything, and any other tenant's I/O lands in them too — which is the same reason the
+/// load average is read before every run.
+#[derive(Clone, Copy, Default)]
+struct Io {
+    /// 512-byte sectors read from the device backing the model's pool.
+    disk_sectors: u64,
+    arc_hits: u64,
+    arc_misses: u64,
+}
+
+/// The partition backing the pool the model lives on, e.g. `nvme0n1p4`.
+///
+/// Unset means the I/O table is omitted rather than guessed: summing every block device would
+/// silently count an unrelated tenant's disk, and a number that cannot be attributed is worse
+/// than no number.
+fn disk_dev() -> Option<String> {
+    std::env::var("MOEARC_BENCH_DISK").ok().filter(|s| !s.is_empty())
+}
+
+impl Io {
+    fn now(dev: Option<&str>) -> Self {
+        let mut io = Self::default();
+        if let Some(dev) = dev {
+            if let Ok(text) = std::fs::read_to_string("/proc/diskstats") {
+                for line in text.lines() {
+                    let f: Vec<&str> = line.split_whitespace().collect();
+                    // major minor name reads_completed reads_merged sectors_read ...
+                    if f.len() > 5 && f[2] == dev {
+                        io.disk_sectors = f[5].parse().unwrap_or(0);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string("/proc/spl/kstat/zfs/arcstats") {
+            for line in text.lines() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() >= 3 {
+                    match f[0] {
+                        "hits" => io.arc_hits = f[2].parse().unwrap_or(0),
+                        "misses" => io.arc_misses = f[2].parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        io
+    }
+
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            disk_sectors: self.disk_sectors.saturating_sub(earlier.disk_sectors),
+            arc_hits: self.arc_hits.saturating_sub(earlier.arc_hits),
+            arc_misses: self.arc_misses.saturating_sub(earlier.arc_misses),
+        }
+    }
+
+    fn disk_mib(self) -> f64 {
+        (self.disk_sectors as f64) * 512.0 / (1024.0 * 1024.0)
+    }
+
+    /// Share of ARC lookups in this window that missed. `None` when nothing was looked up.
+    fn arc_miss_pct(self) -> Option<f64> {
+        let total = self.arc_hits + self.arc_misses;
+        (total > 0).then(|| 100.0 * self.arc_misses as f64 / total as f64)
+    }
+}
+
 /// Token ids, one per line or comma-separated, `#` to end of line ignored.
 fn read_ids(path: &Path) -> Result<Vec<u32>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -101,6 +179,9 @@ struct Measured {
     staged_mib: f64,
     /// Decode-only phase totals, in seconds over `decode_steps` steps.
     phases: Vec<profile::Phase>,
+    /// Disk and ARC counters over the prompt, and over the decode steps alone.
+    io_prefill: Io,
+    io_decode: Io,
 }
 
 impl Measured {
@@ -143,6 +224,10 @@ fn measure(session: &Session, prompt: &[u32], n: usize) -> Result<Measured, Stri
     let stop = StopConditions { max_tokens: n, stop_tokens: Vec::new() };
     let mut ids = Vec::new();
     let mut marks: Vec<Instant> = Vec::with_capacity(n);
+    let dev = disk_dev();
+    let dev = dev.as_deref();
+    let io_start = Io::now(dev);
+    let mut io_first_mark = io_start;
     let started = Instant::now();
     {
         let mut sample = |logits: &[f32], _: &[u32]| {
@@ -150,6 +235,8 @@ fn measure(session: &Session, prompt: &[u32], n: usize) -> Result<Measured, Stri
                 // Prefill has just finished and no decode step has started. See the module note
                 // on why this is the free function and not a call on the session.
                 profile::reset();
+                // Same fence, for the same reason: everything before this is the prompt.
+                io_first_mark = Io::now(dev);
             }
             marks.push(Instant::now());
             argmax(logits)
@@ -169,8 +256,11 @@ fn measure(session: &Session, prompt: &[u32], n: usize) -> Result<Measured, Stri
     let step_ms: Vec<f64> =
         marks.windows(2).map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.0).collect();
     let decode_seconds = marks[marks.len() - 1].duration_since(marks[0]).as_secs_f64();
+    let io_end = Io::now(dev);
     let r = session.residency().map_err(|e| e.to_string())?;
     Ok(Measured {
+        io_prefill: io_first_mark.since(io_start),
+        io_decode: io_end.since(io_first_mark),
         prefill_seconds,
         decode_seconds,
         decode_steps: step_ms.len(),
@@ -239,7 +329,7 @@ fn main() -> ExitCode {
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 
-    let mut phase_rows: Vec<(usize, Measured)> = Vec::new();
+    let mut phase_rows: Vec<(usize, Measured, Measured)> = Vec::new();
     let mut failures = 0;
     for &depth in &depths {
         if depth > pool.len() {
@@ -304,7 +394,7 @@ fn main() -> ExitCode {
             warm.staged_mib,
             100.0 * (tail / head - 1.0),
         );
-        phase_rows.push((depth, warm));
+        phase_rows.push((depth, cold, warm));
     }
 
     // The attribution. Every column is decode-only and per decode step.
@@ -313,7 +403,7 @@ fn main() -> ExitCode {
          moe.expert_matvec | moe.host_sync | moe.readback |"
     );
     println!("|---|---|---|---|---|---|---|---|---|");
-    for (depth, m) in &phase_rows {
+    for (depth, _cold, m) in &phase_rows {
         println!(
             "| {depth} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
             m.phase_ms("decode.total"),
@@ -338,6 +428,54 @@ fn main() -> ExitCode {
          The decode-only staging cost is `moe.stage` in the phase table, which is fenced \
          correctly."
     );
+
+    // Disk and ARC, the two counters that separate "the bus is busy" from "the page was not
+    // resident". Prefill and decode are bracketed separately because at depth 8192 the prompt
+    // is 8,192 steps against 63 decode steps, so one figure for the pass would describe the
+    // prompt and be read as the decode.
+    if disk_dev().is_some() {
+        println!(
+            "\n| depth | pass | disk read MiB | disk MiB/step | ARC miss % | staged MiB | \
+             disk/staged |"
+        );
+        println!("|---|---|---|---|---|---|---|");
+        for (depth, cold, warm) in &phase_rows {
+            for (label, m) in [("cold", cold), ("warm", warm)] {
+                for (phase, io, steps) in
+                    [("prefill", m.io_prefill, *depth), ("decode", m.io_decode, m.decode_steps)]
+                {
+                    let per_step = if steps > 0 { io.disk_mib() / steps as f64 } else { f64::NAN };
+                    let miss =
+                        io.arc_miss_pct().map_or_else(|| "-".to_string(), |v| format!("{v:.1}%"));
+                    // Staged bytes are tracked only for the whole pass, so the ratio is quoted
+                    // on the decode row alone, where both cover a comparable window.
+                    let staged =
+                        if phase == "decode" { format!("{:.0}", m.staged_mib) } else { "-".into() };
+                    let ratio = if phase == "decode" && m.staged_mib > 0.0 {
+                        format!("{:.2}", io.disk_mib() / m.staged_mib)
+                    } else {
+                        "-".to_string()
+                    };
+                    println!(
+                        "| {depth} | {label} {phase} | {:.0} | {per_step:.1} | {miss} | {staged} \
+                         | {ratio} |",
+                        io.disk_mib()
+                    );
+                }
+            }
+        }
+        println!(
+            "\n\u{1f534} `disk read MiB` is the whole device, not this process: another tenant's \
+             reads land in it too, which is why the load average is gated before every run. \
+             `staged MiB` covers the WHOLE pass (see the caveat above), so `disk/staged` is an \
+             upper bound on the share of staging served from NVMe rather than from ARC."
+        );
+    } else {
+        println!(
+            "\nnote: MOEARC_BENCH_DISK is unset (e.g. `nvme0n1p4`), so the disk/ARC table is \
+             omitted rather than guessed at."
+        );
+    }
 
     if failures > 0 {
         eprintln!("\n{failures} depth(s) failed");

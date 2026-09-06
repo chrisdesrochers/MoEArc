@@ -1,0 +1,66 @@
+# Depth 8192, the row that decides whether 6.3 understates. Same protocol.
+
+########## c-d8192-frac_0_75-rA.txt
+=== policy frac:0.75 | depths 8192 | round A | CONTROLLED
+=== git a48dd5b | binary 81c22f09091fc949
+=== PRE-RUN loadavg(1m) = 0.93   foreign CPU% = 28
+=== loadavg 1/5/15 = 0.93 6.98 10.69
+=== started 2026-09-06T18:04:13+00:00
+residency `600`, host `frac:0.75`, 64 generated tokens per depth
+16384 token ids available
+
+| depth | n_ctx | KV MiB | slots | load | prefill tok/s | **cold tok/s** | **warm tok/s** | hit (all) | staged MiB (all) | p50 ms | first 1/8 | last 1/8 | drift |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8192 | 8257 | 296 | 600 | 0.93 | 5.88 | **3.96** | **3.71** | 95.4% | 309535 | 250.0 | 250.0 | 420.8 | +68.3% |
+
+| depth | decode.total | attn.attend | attn.qkv | attn.proj | moe.stage | moe.expert_matvec | moe.host_sync | moe.readback |
+|---|---|---|---|---|---|---|---|---|
+| 8192 | 269.73 | 0.08 | 0.45 | 0.23 | 3.82 | 0.23 | 42.72 | 207.85 |
+
+ms per decode step, warm pass, **decode steps only** -- `profile::reset()` runs at the first mark, so prefill is excluded from every column above.
+
+⚠ `hit (all)` and `staged MiB (all)` cover the WHOLE pass, prompt included: the cache counters can only be zeroed through the session, and `generate_with` holds its lock. At depth 8192 the 8,192 prefill steps outnumber the 63 decode steps 130 to 1, so those two columns describe prefill and must not be read as a decode hit rate. The decode-only staging cost is `moe.stage` in the phase table, which is fenced correctly.
+
+| depth | pass | disk read MiB | disk MiB/step | ARC miss % | staged MiB | disk/staged |
+|---|---|---|---|---|---|---|
+| 8192 | cold prefill | 27585 | 3.4 | 0.3% | - | - |
+| 8192 | cold decode | 58 | 0.9 | 0.3% | 313796 | 0.00 |
+| 8192 | warm prefill | 9937 | 1.2 | 0.5% | - | - |
+| 8192 | warm decode | 0 | 0.0 | 1.2% | 309535 | 0.00 |
+
+🔴 `disk read MiB` is the whole device, not this process: another tenant's reads land in it too, which is why the load average is gated before every run. `staged MiB` covers the WHOLE pass (see the caveat above), so `disk/staged` is an upper bound on the share of staging served from NVMe rather than from ARC.
+=== finished 2026-09-06T18:50:08+00:00
+=== POST-RUN loadavg = 21.38 21.30 20.73 1/1182 2883207  foreign CPU% = 27
+
+########## c-d8192-frac_0_5-rA.txt
+=== policy frac:0.5 | depths 8192 | round A | CONTROLLED
+=== git a48dd5b | binary 81c22f09091fc949
+=== PRE-RUN loadavg(1m) = 1.23   foreign CPU% = 29
+=== loadavg 1/5/15 = 1.23 7.48 14.66
+=== started 2026-09-06T18:55:48+00:00
+residency `600`, host `frac:0.5`, 64 generated tokens per depth
+16384 token ids available
+
+| depth | n_ctx | KV MiB | slots | load | prefill tok/s | **cold tok/s** | **warm tok/s** | hit (all) | staged MiB (all) | p50 ms | first 1/8 | last 1/8 | drift |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8192 | 8257 | 296 | 600 | 1.37 | 2.33 | **1.53** | **1.31** | 72.4% | 2837818 | 739.1 | 747.4 | 687.6 | -8.0% |
+
+| depth | decode.total | attn.attend | attn.qkv | attn.proj | moe.stage | moe.expert_matvec | moe.host_sync | moe.readback |
+|---|---|---|---|---|---|---|---|---|
+| 8192 | 760.66 | 0.11 | 0.58 | 0.28 | 159.61 | 3.46 | 48.97 | 370.81 |
+
+ms per decode step, warm pass, **decode steps only** -- `profile::reset()` runs at the first mark, so prefill is excluded from every column above.
+
+⚠ `hit (all)` and `staged MiB (all)` cover the WHOLE pass, prompt included: the cache counters can only be zeroed through the session, and `generate_with` holds its lock. At depth 8192 the 8,192 prefill steps outnumber the 63 decode steps 130 to 1, so those two columns describe prefill and must not be read as a decode hit rate. The decode-only staging cost is `moe.stage` in the phase table, which is fenced correctly.
+
+| depth | pass | disk read MiB | disk MiB/step | ARC miss % | staged MiB | disk/staged |
+|---|---|---|---|---|---|---|
+| 8192 | cold prefill | 1553749 | 189.7 | 0.2% | - | - |
+| 8192 | cold decode | 17811 | 282.7 | 0.3% | 2839167 | 0.01 |
+| 8192 | warm prefill | 1293541 | 157.9 | 0.3% | - | - |
+| 8192 | warm decode | 4512 | 71.6 | 0.3% | 2837818 | 0.00 |
+
+🔴 `disk read MiB` is the whole device, not this process: another tenant's reads land in it too, which is why the load average is gated before every run. `staged MiB` covers the WHOLE pass (see the caveat above), so `disk/staged` is an upper bound on the share of staging served from NVMe rather than from ARC.
+=== finished 2026-09-06T20:56:40+00:00
+=== POST-RUN loadavg = 22.50 22.23 22.40 2/1216 2985799  foreign CPU% = 129
+
