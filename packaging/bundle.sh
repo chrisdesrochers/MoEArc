@@ -139,10 +139,21 @@ if [ "$with_runtime" = 1 ]; then
     python3 "$here/fetch-runtime.py" --dest "$root/runtime" --lock "$here/runtime.lock.json"
 fi
 
+# 🔴 The artefact has to be able to be built twice and come out the same, or the sha256 in a
+# release is only checkable by the person who produced it. Two things made this tarball differ
+# from itself: the wall-clock `built:` stamp, and the mtime/uid/gid/order tar records for every
+# member. Both are pinned to SOURCE_DATE_EPOCH, defaulting to the commit's own timestamp, so
+# they are a property of the commit rather than of the minute someone typed the command.
+#
+# This is repeatability on one machine, and packaging/RELEASE.md says so rather than claiming
+# more: a different rustc or icpx may still produce different bytes, and nobody has checked.
+source_date_epoch=${SOURCE_DATE_EPOCH:-$(cd "$repo" && git log -1 --format=%ct 2>/dev/null || date -u +%s)}
+
 # Provenance. A tarball that cannot say what built it is not evidence of anything.
 {
     echo "name:        $name"
-    echo "built:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "built:       $(date -u -d "@$source_date_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+    echo "source date: $source_date_epoch (SOURCE_DATE_EPOCH)"
     echo "commit:      $(cd "$repo" && git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "dirty:       $(cd "$repo" && { git diff --quiet 2>/dev/null && echo no || echo YES; })"
     echo "rustc:       $(rustc --version 2>/dev/null || echo unknown)"
@@ -159,9 +170,22 @@ fi
 } > "$root/share/moearc/BUILD-INFO.txt"
 
 mkdir -p "$out_dir"
-tar -C "$stage" -czf "$out_dir/$name.tar.gz" "$name"
+# --sort/--owner/--group/--mtime remove everything about *when and by whom* this ran from the
+# archive; `gzip -n` keeps the original filename and timestamp out of the gzip header, which
+# `tar -z` would otherwise leave there.
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$source_date_epoch" \
+    --format=gnu -C "$stage" -cf - "$name" | gzip -n -9 > "$out_dir/$name.tar.gz"
 ( cd "$out_dir" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
 
 echo
 echo "==> $out_dir/$name.tar.gz  ($(du -h --apparent-size "$out_dir/$name.tar.gz" | cut -f1))"
 cat "$root/share/moearc/BUILD-INFO.txt"
+
+# A tarball whose provenance reads `unknown` is not evidence of anything, and the way to get
+# one is undramatic: run bundle.sh in a shell where rustc or icpx is not on PATH and every
+# field quietly falls back. Said out loud here rather than discovered in a release.
+if grep -qE ': +unknown|^dirty: +YES' "$root/share/moearc/BUILD-INFO.txt"; then
+    echo
+    echo "bundle.sh: ⚠️  this build is not release-grade -- BUILD-INFO.txt above has an" >&2
+    echo "           'unknown' field or a dirty tree. See packaging/RELEASE.md." >&2
+fi

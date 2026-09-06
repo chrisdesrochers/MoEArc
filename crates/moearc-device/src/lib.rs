@@ -17,7 +17,15 @@
 //!
 //! This module reports what the hardware *is*. Deciding what will fit on it is
 //! `moearc-engine`'s `cache_budget`, which takes the byte figures from here.
+//!
+//! 🔴 **Between the two sits [`fitness`], and skipping it is a bug that has already shipped.**
+//! "What the hardware is" includes devices whose memory figure is not a VRAM budget at all — an
+//! integrated GPU reports a share of system RAM there, 85.58 GiB of it on the reference
+//! machine — and handing that number to a planner produces a confident wrong answer rather than
+//! a failure. [`fitness::vram_budget`] is the only sanctioned way to turn a [`GpuDevice`] into
+//! a number to plan with.
 
+pub mod fitness;
 pub mod pci;
 pub mod sysman;
 mod ze;
@@ -64,6 +72,10 @@ pub struct GpuDevice {
     /// Sum of every local memory region's `totalSize`. This is the card's *installed* memory,
     /// not what is free right now — nothing here allocates, so nothing here can measure free
     /// memory.
+    ///
+    /// 🔴 **Not a budget, and on an integrated device not even video memory.** The reference
+    /// iGPU reports 91,890,372,608 bytes here — 93.5% of the machine's RAM. Read it through
+    /// [`fitness::vram_budget`], which refuses that case instead of returning it.
     pub total_memory_bytes: u64,
     /// Largest single allocation the driver will accept. Distinct from, and usually well
     /// below, `total_memory_bytes`: a plan that fits in total memory can still be rejected
@@ -88,6 +100,22 @@ pub struct GpuDevice {
 }
 
 impl GpuDevice {
+    /// The Intel compute-runtime build number carried in [`Self::driver_version`].
+    ///
+    /// 🔴 **Only the low 16 bits, and the restraint is the point.** The Level Zero
+    /// specification defines `driverVersion` as "a non-zero, monotonically increasing value"
+    /// and specifies *no* encoding, so any `major.minor.build` reading of it is invented. This
+    /// project invented one once, rendering the reference card's 17,010,844 as `1.3.37020`;
+    /// the `1.3` matched nothing on the machine.
+    ///
+    /// The low half is not a guess. It reads **37020**, and three independent sources on that
+    /// same machine agree: `sycl-ls` prints `[1.14.37020]`, `clinfo` prints `26.05.037020`,
+    /// and `dpkg` has `libze-intel-gpu1 26.05.37020.3-1`. The high half appears in none of
+    /// them, so it is not displayed and nothing is decided by it.
+    pub fn driver_build(&self) -> u32 {
+        self.driver_version & 0xFFFF
+    }
+
     /// The UUID in the conventional 8-4-4-4-12 form, for display and for logs.
     pub fn uuid_string(&self) -> String {
         let hex: Vec<String> = self.uuid.iter().map(|b| format!("{b:02x}")).collect();

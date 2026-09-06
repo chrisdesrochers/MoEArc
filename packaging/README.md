@@ -14,6 +14,9 @@ packaging/verify-clean.sh                    # run it where oneAPI does not exis
 bench/reproduce.sh <model.gguf>              # reproduce the headline number, with provenance
 ```
 
+Publishing what comes out of them is [`RELEASE.md`](RELEASE.md) — tag name, asset names,
+checksums, and the clean-room gate, in the order they have to happen.
+
 `verify-clean.sh` is not optional before publishing a tarball. It is the only step that
 actually answers the question the artefact exists to answer.
 
@@ -40,7 +43,8 @@ directory to reuse between runs so the 230 MB fetch happens once.
 | `launcher.sh` | installed under four names; sets `LD_LIBRARY_PATH` and execs the real binary in `libexec/`. This is what closes the dlopen gap. |
 | `fetch-runtime.py` | downloads Intel's published SYCL runtime, verified against pinned digests. Standard library only; no `pip`. |
 | `runtime.lock.json` | the pins. Versions, SHA-256, per-package file allowlist, licences. |
-| `install.sh` | the `curl \| sh` entry point: download, unpack, fetch the runtime, link onto `PATH`. |
+| `install.sh` | the `curl \| sh` entry point: download, unpack, fetch the runtime, link onto `PATH`. Publishes nothing itself — it expects the assets `RELEASE.md` names, and says exactly that when they are not there. |
+| `RELEASE.md` | the owner's checklist for cutting a release. One asset name for every tag, and why. |
 | `Containerfile.clean` | Ubuntu 24.04 + the Intel GPU driver + nothing else. `DRIVER=distro` reproduces the too-old-driver case deliberately. |
 | `verify-clean.sh` | runs a tarball in that container and asserts, by name, that the Arc card is found. |
 | `THIRD-PARTY.md` | what is redistributed, what is not, and why. |
@@ -75,6 +79,22 @@ succeeds, prints its result, and *then* dies with
 `Abort was called at 433 line in file: ./shared/source/os_interface/linux/drm_neo.cpp`.
 Pass the render node — `--device /dev/dri/renderD129` — not the directory. `verify-clean.sh`
 does this for you.
+
+## The tarball is byte-repeatable, and only that
+
+`bundle.sh` pins the `built:` stamp and every tar member's mtime, uid, gid and order to
+`SOURCE_DATE_EPOCH`, which defaults to the commit's own timestamp; `gzip -n` keeps the name and
+time out of the gzip header. Two runs of the same commit on the same machine produce the same
+`sha256` — measured, twice, before the claim was written down.
+
+⚠️ **That is repeatability on one machine, not reproducibility from source by a third party.**
+Nobody has built this on a second host and compared, so a different `rustc` or `icpx` may well
+produce different bytes. `BUILD-INFO.txt` records the toolchain so the build is auditable; do
+not upgrade that into a reproducible-build claim.
+
+`bundle.sh` also warns when `BUILD-INFO.txt` comes out with an `unknown` field or a dirty tree.
+Both are undramatic ways to publish an artefact that cannot say what produced it: running it in
+a shell where `rustc` is not on `PATH` is enough.
 
 ## Rebuilding the pins
 

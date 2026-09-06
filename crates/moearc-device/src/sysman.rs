@@ -284,6 +284,24 @@ impl DeviceTelemetry {
         any.then_some(total)
     }
 
+    /// Capacity of the host-memory modules this device exposes, when the driver reports one.
+    ///
+    /// **Never a budget.** It is here to make a refusal concrete: on the reference iGPU this
+    /// reads 98,257,694,720 bytes, which is exactly `MemTotal` from `/proc/meminfo` — the fact
+    /// that explains where the 85.58 GiB the same device reports as "device memory" comes from.
+    /// See [`crate::fitness`].
+    pub fn host_memory_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        let mut any = false;
+        for module in self.memory.iter().filter(|m| !m.on_device) {
+            if let Some(physical) = module.physical_bytes {
+                total = total.saturating_add(physical);
+                any = true;
+            }
+        }
+        any.then_some(total)
+    }
+
     /// Modules the driver is actively complaining about.
     pub fn unhealthy_modules(&self) -> impl Iterator<Item = &MemoryModule> {
         self.memory.iter().filter(|m| m.health.is_a_problem())
@@ -526,6 +544,24 @@ mod tests {
         };
         assert_eq!(reading.free_device_memory_bytes(), None);
         assert_eq!(reading.used_device_memory_bytes(), None);
+    }
+
+    #[test]
+    fn the_host_pool_is_reported_separately_and_only_when_the_driver_gives_a_capacity() {
+        let igpu = DeviceTelemetry {
+            uuid: [0; 16],
+            memory: vec![module(Some(98_257_694_720), 42_207_121_408, false)],
+        };
+        assert_eq!(igpu.host_memory_bytes(), Some(98_257_694_720));
+        assert_eq!(igpu.free_device_memory_bytes(), None);
+
+        let b580 =
+            DeviceTelemetry { uuid: [0; 16], memory: vec![module(None, 12_567_810_048, true)] };
+        assert_eq!(b580.host_memory_bytes(), None);
+
+        // A host module the driver gave no capacity for is not a zero-byte pool.
+        let unknown = DeviceTelemetry { uuid: [0; 16], memory: vec![module(None, 1_000, false)] };
+        assert_eq!(unknown.host_memory_bytes(), None);
     }
 
     /// `UNKNOWN` is what the reference card reports, and it must never look like a fault.
