@@ -21,7 +21,8 @@ out of the box.
 > throughput. Matvecs run at 25–29% of the card's peak bandwidth against llama.cpp's 63%.
 > No adaptive policy — the residency fractions above were found by sweeping, not chosen by
 > the engine. Sliding-window models are refused above 128 tokens of context rather than
-> silently approximated.
+> silently approximated. **KV is fp16 only** -- there is no quantised KV path, so long
+> context costs twice what it needs to.
 
 ```
 ╭ What will fit ──────────────────────────────────────────────────────────────────╮
@@ -68,7 +69,9 @@ Vulkan path and hand-tuning flags. Contributions and hardware reports are welcom
 ## Design in one paragraph
 
 VRAM holds attention weights, the KV cache, shared experts and an LRU cache of
-routed experts. System RAM holds the full expert store in pinned memory. Per
+routed experts. System RAM holds the full expert store, memory-mapped from the
+GGUF rather than pinned -- pinning measures 22.8 GB/s against the pageable path's
+6.7-10.5 GB/s, but the extra mmap->pinned copy costs more than that gap buys. Per
 expert, per step, the scheduler picks the cheapest of three options: run it from
 the VRAM cache, fetch it over PCIe and run it on the GPU, or run it on the CPU
 and ship only the activation. The crossover is calibrated on first launch and
@@ -135,6 +138,43 @@ f32 activation to 8 bits before every K-quant matmul, while MoEArc keeps f32. So
 measured rather than a tolerance chosen — and llama.cpp's two backends disagree with each other
 more than MoEArc disagrees with either.
 
+### The second result that was not predicted
+
+Two claimants contest every byte of VRAM: the KV cache and the resident expert cache. We
+assumed experts should win. Measured against real routing, they should not.
+
+In `bench/traces/qwen3-30b-prose.decode.ndjson` -- real `ffn_moe_topk` values pulled from a
+running decode -- **not one expert slot in 6,144 is touched on every token.** The hottest
+reaches p = 0.979, only **83 slots (1.4%)** exceed p = 0.5, and **78% sit below p = 0.10**.
+A KV byte is touched on every token, p = 1.0. Per byte of VRAM, KV outranks every routed
+expert in the model.
+
+Three allocations for Qwen3-30B at 64K context, priced on the **measured pageable bandwidth
+of the path this engine actually uses** (10.5 GB/s):
+
+| allocation | KV resident | expert slots | touch coverage | PCIe per token | transfer-only |
+|---|---|---|---|---|---|
+| KV first | 6.44 GB (all) | 2,159 | 92.5% | **0.08 GB** | **7 ms** |
+| 50 / 50 | 6.08 GB (94%) | 2,295 | 94.0% | 0.42 GB | 40 ms |
+| experts first *(today's default)* | 0.61 GB (9%) | 4,361 | 100% | **5.83 GB** | **556 ms** |
+
+Surrendering 2,200 expert slots costs only 7.5 points of coverage, because the tail of that
+distribution is nearly worthless.
+
+Coverage above is top-N by frequency; measured LRU scores **95.2%** on this same trace, so
+the KV-first row is if anything understated.
+
+🔴 **KV residency is all-or-nothing; expert residency degrades gracefully.** The 50/50 row
+leaves just 6% of KV off the card, and that 6% alone costs 0.36 GB per token -- four times
+the entire expert miss traffic -- because an unresident KV byte is re-read on every
+subsequent token. An expert miss is paid once, occasionally.
+
+`memory::plan` already implements both orderings (`Bias::Context` / `Bias::Experts`) and
+yields expert slots back one at a time when an explicit context request cannot otherwise be
+met. **It defaults to experts-first, which this measurement says is the wrong default past
+roughly 32K of context.** The default is unchanged pending an end-to-end run; the evidence
+is committed ahead of it.
+
 ### What is not measured
 
 - **Prefill.** There is none. llama.cpp's 3218 tok/s has no counterpart here, and every number
@@ -144,8 +184,9 @@ more than MoEArc disagrees with either.
   **both died when measured in the engine** — see `docs/roadmap.md`.
 - **An adaptive policy.** `frac:0.75` and `frac:1.0` were found by sweeping. The engine does not
   yet choose for itself, and the mechanism costs 1–4% when it routes almost nothing.
-- **Anything above 17.3 GiB.** A 63.4 GB model is staged for the next test; nothing is claimed
-  about it yet.
+- **Long context.** Every decode figure in this file is at **2,048 tokens or fewer**. The KV
+  analysis above is config arithmetic over real routing traces, not an end-to-end 64K run --
+  no throughput at long context is claimed here.
 
 📌 **Three findings were retracted during this work** — a fabricated driver-version string, a
 profile that mis-attributed device time under an async queue, and two microbenchmark results
