@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "The Intel SYCL runtime MoEArc runs against, pinned by version and SHA-256.",
+    "",
+    "These files are NOT redistributed by MoEArc. packaging/fetch-runtime.py downloads them",
+    "from Intel's own published channel on PyPI and verifies each against the digest here.",
+    "docs/packaging.md, section 'The licence position', says why.",
+    "",
+    "'files' is an allowlist of basenames, not a glob. intel-sycl-rt alone is 134 MB, most of",
+    "it libsycl-jit.so (186 MB unpacked) which nothing here loads. Naming the members keeps",
+    "the installed runtime at 73 MB and keeps the set auditable.",
+    "",
+    "The four adapters are listed even though exactly one is selected at run time. A partial",
+    "adapter set does not degrade -- it fails, with UR_RESULT_ERROR_UNSUPPORTED_VERSION, which",
+    "reads like a version mismatch and is not one. Measured 2026-09-05."
+  ],
+  "abi_note": "Built against oneAPI DPC++ 2026.1.1; this runtime is 2026.1.2. Verified working across that skew on an Arc B580. The soname set (libsycl.so.9, libur_*.so.0) is what actually has to match.",
+  "packages": [
+    {
+      "name": "intel-sycl-rt",
+      "version": "2026.1.2",
+      "sha256": "9f4c9aff11177a29ff81bcecffd47e43b1edf54b766f97ed1dac13a820b649e6",
+      "license": "Intel End User License Agreement for Developer Tools",
+      "files": ["libsycl.so.9"]
+    },
+    {
+      "name": "intel-cmplr-lib-ur",
+      "version": "2026.1.2",
+      "sha256": "b27207f3b42d12ce88cd53ca8b3b7a7e79755aa07a84eccf1c209fcbefe468bf",
+      "license": "Intel End User License Agreement for Developer Tools",
+      "files": [
+        "libur_loader.so.0",
+        "libur_adapter_level_zero.so.0",
+        "libur_adapter_level_zero_v2.so.0",
+        "libur_adapter_opencl.so.0"
+      ]
+    },
+    {
+      "name": "intel-cmplr-lib-rt",
+      "version": "2026.1.2",
+      "sha256": "b4a975deeb97eee26c15e7038f63635c4dacc33151506f2e5c56cc5758cbe462",
+      "license": "Intel End User License Agreement for Developer Tools",
+      "files": ["libimf.so", "libsvml.so", "libintlc.so.5", "libirng.so"]
+    },
+    {
+      "name": "umf",
+      "version": "1.1.0",
+      "sha256": "567152c5ee6b8e16cc56b29a8a9a6b918de1febf89877f71ea2e8247ef39fc32",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "files": ["libumf.so.1"]
+    },
+    {
+      "name": "tcmlib",
+      "version": "1.5.0",
+      "sha256": "9d7c01cff35aae9bf5390b620680ebdf10a7d211c22d6488a27a029502e7d0aa",
+      "license": "Intel Simplified Software License",
+      "files": ["libhwloc.so.15"]
+    },
+    {
+      "name": "intel-cmplr-lic-rt",
+      "version": "2026.1.2",
+      "sha256": "f4d8ec7bada4e21f1c16555b6a2be7ba1d28a11463dd7bbb57055e0c41c4a2fb",
+      "license": "Intel End User License Agreement for Developer Tools",
+      "files": ["Intel Developer Tools EULA"]
+    }
+  ]
+}

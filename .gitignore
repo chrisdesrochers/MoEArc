@@ -49,3 +49,6 @@ bench/baselines/sweep.log
 
 # rust build output
 target/
+
+# packaging output (packaging/bundle.sh)
+dist/

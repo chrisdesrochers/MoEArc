@@ -67,9 +67,12 @@ known-good loader with `include_bytes!`, writes it to a cache directory on first
 unavailable; for an ICD loader it is not a fallback, it is the only correct answer — the whole
 job of that library is to find *other* libraries at runtime.
 
-🔴 Still open: whether the embedded loader is preferred over a system one, or only used when the
-system has none. Preferring ours guarantees a known-good version and risks disagreeing with the
-installed compute runtime it has to talk to. **Not yet decided; do not assume either.**
+✅ **Decided 2026-09-05, and the answer is neither: the loader is not embedded at all.** See
+*What is bundled and what is the system’s* below. Preferring ours guarantees a known-good
+version and risks disagreeing with the installed compute runtime it has to talk to — and that
+runtime is chosen by the user’s distribution to match the kernel module it ships beside.
+`MOEARC_ZE_LOADER` remains, as an override and as the way the loader-is-missing path gets
+tested; it is not the packaging default.
 
 ### TLS trust roots — the one that is data
 
@@ -170,32 +173,230 @@ the binary may point into the kernels build directory. Reintroduce the old
 `cargo:rustc-link-arg` and the first two tests start passing vacuously while this one fails
 and says why.
 
-## 🔴 Open gap: the SYCL runtime still needs `setvars.sh` to find a GPU
+## ✅ Closed: the SYCL runtime no longer needs `setvars.sh` to find a GPU
 
-Found while proving the above, and it is a *different* problem that the same clean-environment
-run exposed. With no environment set, a MoEArc binary now starts, links and calls into the
-kernels — and then reports **no usable GPU**, on a machine with a working Arc B580.
+**Status: fixed 2026-09-05, and verified where it could not have been faked** — Ubuntu 24.04
+in a container with no `/opt/intel`, an empty environment, and glibc 2.39 rather than the build
+host's 2.43:
 
-`libsycl` dlopens its Unified Runtime adapters, and `libur_adapter_level_zero.so.0` needs
-`libumf.so.1` and `libhwloc.so.15`. Those live in `umf/…/lib` and `tcm/…/lib`, *different*
-oneAPI component directories from the compiler's, which `setvars.sh` adds to
-`LD_LIBRARY_PATH`. `SYCL_UR_TRACE=1` names them exactly.
+```
+$ podman run --rm --device /dev/dri/renderD129 --group-add keep-groups moearc-clean:noble ...
+oneAPI:            ABSENT
+LD_LIBRARY_PATH:   [unset]
 
-⚠️ **No rpath on our object can fix this, and it was measured rather than assumed.** Both
-`DT_RUNPATH` and `DT_RPATH` were tried on `libmoearc_kernels.so` with those directories added;
-neither works. The failing lookup is a dependency of a `dlopen`d module several links away,
-and the loader consults neither our runpath (not inherited) nor our rpath (the dlopened
-adapter has no loader chain back to us).
+  ▸ Intel(R) Arc(TM) B580 Graphics   level_zero   xe / L0 build 33578   11.3 GiB / 11.3 GiB
+  ✓ Intel(R) Arc(TM) B580 Graphics is ready — 11.3 GiB free right now.
 
-So today MoEArc sees a GPU only if `setvars.sh` has been sourced — an environment dependency
-that `ux.md` does not permit and that nothing had written down, because every previous test
-run inherited it. It is the same shape as the `MOEARC_ZE_LOADER` question above and probably
-has the same answer: what gets embedded and extracted is not one library but the runtime's
-closure, and the extraction directory is a single place the process can point the loader at.
+$ env -i /opt/m/moearc-selftest
+moearc-kernels-smoke: ok device=Intel(R) Arc(TM) B580 Graphics
+```
 
-⬜ Open: decide whether the packaged runtime is preferred over a system one (see the Level Zero
-loader note above — it is the same decision), and whether the extracted set is discovered at
-package time by walking `DT_NEEDED` plus the adapters' dlopen list, or pinned by hand.
+The answer is the unglamorous one, and the section above is why: **`LD_LIBRARY_PATH`, set by a
+launcher, pointing at a directory that holds the runtime's whole closure.**
+
+That is not a shrug. It is the *only* mechanism that works, and the reason is structural. The
+failing lookup is `libur_adapter_level_zero.so.0` → `libumf.so.1`, where the adapter was
+`dlopen`ed by `libsycl` with no loader chain back to anything we control. `DT_RUNPATH` is not
+inherited across that boundary and `DT_RPATH` cannot be reached from it — both were tried and
+both failed, which is recorded above. `LD_LIBRARY_PATH` is the one search path that *is*
+consulted for a `dlopen`ed module's own dependencies, because it belongs to the process rather
+than to any object in it. So the launcher is not a workaround for not having done the rpath
+work; the rpath work has no solution and the process-wide path does.
+
+### The set, and why each member is in it
+
+Eleven libraries, 78 MiB installed. Discovered by `ldd` on our own object and on each adapter, plus
+the adapters themselves, which nothing links and `SYCL_UR_TRACE=1` names:
+
+| | why |
+| --- | --- |
+| `libsycl.so.9` | the SYCL runtime our kernels are linked against |
+| `libur_loader.so.0` | `libsycl`'s `DT_NEEDED`; loads the adapters |
+| `libur_adapter_level_zero.so.0`, `…_v2.so.0`, `libur_adapter_opencl.so.0` | `dlopen`ed by the loader |
+| `libumf.so.1`, `libhwloc.so.15` | the adapters' `DT_NEEDED` — **the original failure** |
+| `libimf.so`, `libsvml.so`, `libintlc.so.5`, `libirng.so` | Intel's compiler runtime; in the `DT_NEEDED` of both our kernel object and Intel's adapter |
+| Intel's EULA text | ships beside the binaries it covers |
+
+🔴 **The adapter list is load-bearing and a partial set fails misleadingly.** Installing only
+`libur_adapter_level_zero.so.0` — the one that is actually selected — produces
+`UR adapter initialization failed: 43 (UR_RESULT_ERROR_UNSUPPORTED_VERSION)` and no device.
+That reads as an ABI mismatch between the runtime and the adapter, and it is not one: it is a
+missing sibling — it cost one wrong hypothesis here before the full set was tried.
+`SYCL_UR_TRACE=1` also shows the
+**V2** adapter winning device selection, so the one you would have guessed was optional is the
+one in use.
+
+Nothing on `libstdc++` is bundled, which was checked rather than assumed: the kernel object
+needs `GLIBCXX_3.4.21`, i.e. GCC 5.1 from 2015. Shadowing a user's `libstdc++` from
+`LD_LIBRARY_PATH` would also shadow it for `libze_intel_gpu.so.1`, which is theirs and newer.
+
+## ✅ Decided: what is bundled and what is the system's — and it is not one decision
+
+The open question above ("whether the packaged runtime is preferred over a system one") assumed
+a single answer. **There are two questions and they go opposite ways**, split on what each
+library has to agree with:
+
+- **The SYCL/oneAPI runtime is version-coupled to our compiler.** It has to agree with
+  `libmoearc_kernels.so`, which we built. We ship the pin. It goes first on `LD_LIBRARY_PATH`
+  and wins over a system oneAPI if one exists.
+- **The Level Zero loader and GPU driver are version-coupled to the user's kernel.**
+  `libze_loader.so.1` and `libze_intel_gpu.so.1` have to agree with the `xe`/`i915` module
+  running on that machine, and a distribution ships them together for that reason. We use
+  theirs, and `moearc-device` already had the seam for it — `DEFAULT_LOADER_SONAME` looks the
+  loader up by soname so the system's rules find the system's copy.
+
+Both are MIT and could be bundled. Overriding the half of the stack that has to match a kernel
+we know nothing about is the place where "we know better" is most likely to be wrong, so
+`MOEARC_ZE_LOADER` stays an override rather than becoming the default.
+
+🔴 **That system half has a floor, and on Ubuntu 24.04 it is below Battlemage.** The stock
+`libze-intel-gpu1` is Level Zero build 27642 and predates the B580. Measured, because the same
+clean-room run was done twice:
+
+```
+                            distro driver (27642)        Intel's repo (33578)
+moearc --no-tui             Intel(R) Graphics  i915      Intel(R) Arc(TM) B580  xe
+                            85.6 GiB "free"               11.3 GiB free
+qwen3-235b-a22b 132.2 GiB   "✓ 70/128 experts resident"   "· will not fit"
+```
+
+⚠️ **The failure is not that it stops — it is that it does not.** With the old driver `moearc`
+enumerates the Arrow Lake iGPU, reports 85.6 GiB of "VRAM", and cheerfully declares a 132 GiB
+model will fit. `bench/README.md` already warns that a wrong-device Vulkan run "does not fail,
+it succeeds and lies"; this is the same failure reached a different way, and it is exactly the
+science-experiment experience `docs/ux.md` exists to prevent. The Arc card is not reported as
+present-but-unusable, because Level Zero never exposes it and the `unusable_hardware` field
+has nothing to correlate against inside a container.
+
+⬜ **Open, and it belongs to `moearc-device`, not to packaging:** an integrated device offered
+as *the* choice on a machine that also has a discrete Arc card is a wrong answer even when it
+is the only one Level Zero returned, and a Level Zero build number old enough to predate the
+installed hardware is a known-bad configuration `docs/ux.md` says the tool should recognise
+and name.
+
+## 🔴 The GPU driver floor is higher for inference than for detection
+
+Found by running an actual model in the clean container rather than stopping at the selftest,
+and it is the most useful thing this packaging work turned up.
+
+| driver stack (all on a B580, no oneAPI) | device report | SYCL queue | model load + decode |
+| --- | --- | --- | --- |
+| Ubuntu 24.04 stock, `libze-intel-gpu1` build 27642 | ❌ enumerates the **iGPU** | — | — |
+| Intel client repo for noble, 25.18.33578.15 + gmm 22.7.2 | ✅ B580 | ✅ B580 | ❌ `host-to-device copy failed on the device`, **then SIGSEGV** |
+| Ubuntu 26.04, 26.05.37020.3 + gmm 22.9.0 | ✅ B580 | ✅ B580 | ✅ 32.44 tok/s, token ids **16/16** vs llama.cpp |
+
+⚠️ **Each row fails one step later than the one above, and every step before the failure looks
+healthy.** A packaging check that stops at "the selftest found the card" declares the middle row
+working. It is not: it cannot load a model. The clean-room procedure therefore has to run a real
+forward pass, not just create a queue — the same lesson as the 309-green-tests one, applied to
+the layer below.
+
+📌 **Not isolated: whether the middle row fails on the Level Zero driver version or on
+`libigdgmm12` 22.7.2.** Both differ between the two working and non-working stacks, and
+separating them needs a mixed install that was not built. Recorded as unknown rather than
+guessed.
+
+🔴 **A load failure segfaults.** `moearc-bench` prints a clean `LOAD FAILED: unsupported model:
+device: host-to-device copy failed on the device` row and *then* dies with SIGSEGV — so the
+harness reports the failure correctly and the process still crashes. That is a robustness bug in
+the engine's teardown path, not in packaging, and it belongs to whoever owns
+`crates/moearc-engine`.
+
+📌 **`libigdgmm12` is a `Recommends` of the driver, not a `Depends`.** With
+`--no-install-recommends` it is absent, and the failure is
+`Abort was called at 15 line in file: ./shared/source/gmm_helper/resource_info.cpp` — *after*
+detection and the SYCL queue have both succeeded. `packaging/Containerfile.clean` names it
+explicitly and there is a comment there saying why it must stay named.
+
+## The licence position: nothing of Intel's is redistributed
+
+Full detail in [`packaging/THIRD-PARTY.md`](../packaging/THIRD-PARTY.md). The short version,
+because it determined the shape of everything above:
+
+`libimf`, `libsvml`, `libintlc` and `libirng` are Intel's proprietary compiler runtime, they
+have no open-source counterpart, and they are in the `DT_NEEDED` of both our kernel object and
+*Intel's own* Level Zero adapter — so they cannot be dropped. Intel's EULA grants redistribution
+of "Redistributables", defined as the files listed in a `redist.txt` — **and no such file exists
+anywhere in the oneAPI 2026.1 installation we build against.** The grant is real and we cannot
+show it covers any particular file. Two of its conditions would also propagate to our users:
+a no-reverse-engineering clause, and a prohibition on SaaS use — which is one of the things an
+inference server is for.
+
+So the default tarball contains **no third-party binaries at all**. `packaging/fetch-runtime.py`
+downloads Intel's runtime, on the user's machine, from Intel's own channel — packages Intel
+publishes precisely so that "executables can be deployed to hosts without the oneAPI
+development toolkits" — pinned by SHA-256 in `packaging/runtime.lock.json`. The user accepts
+Intel's terms from Intel. The tarball stays Apache-2.0. An honest dependency beats a licence
+violation.
+
+`bundle.sh --with-runtime` vendors it anyway, for air-gapped installs — a 29 MB tarball against
+the default 4.8 MB, verified under `podman --network none` with `MOEARC_NO_FETCH=1`. That
+archive is **not** Apache-2.0 and must not be published as though it were.
+
+## Installing without a network
+
+The fetch is the one step that needs the internet. On a machine that has none:
+
+```sh
+# on a machine that does, with the same tarball unpacked:
+python3 libexec/fetch-runtime.py --dest ./runtime --lock share/moearc/runtime.lock.json
+# then copy ./runtime across, or set MOEARC_RUNTIME_DIR at it
+```
+
+`MOEARC_NO_FETCH=1` makes the launcher refuse to download and say so, rather than hanging on a
+firewalled resolver.
+
+## The kernel object is relocatable now, without `patchelf`
+
+The section above records that the soname carries an absolute `OUT_DIR` path, that this is the
+only channel reaching a downstream binary, and that the artefact is therefore **not
+relocatable**. That is still true of a `cargo build`. `packaging/elf-relocatable.py` makes the
+*packaged* copy relocatable, and the mechanism is worth stating because it is smaller than it
+sounds:
+
+`DT_SONAME` and `DT_NEEDED` hold **offsets into `.dynstr`**, and the string we want is already a
+suffix of the string that is there — `…/out/libmoearc_kernels.so` ends with
+`libmoearc_kernels.so`. So the edit is to add the length of the directory prefix to the offset.
+No section is resized, no byte of `.dynstr` changes, nothing is relocated, and each rewritten
+entry differs from the original in exactly the eight bytes of one `Elf64_Dyn.d_val`. It is
+idempotent, because it only touches strings containing a slash.
+
+This is what `patchelf` would have been used for. It is not installed on the build host, and
+looking for the cheaper answer first found one that is easier to audit than a program that
+rewrites program headers. `bundle.sh` then asserts the result — any remaining `DT_NEEDED` with
+a slash in it fails the build — because that failure is silent until someone unpacks the
+tarball somewhere else, which is precisely how the original bug shipped.
+
+📌 The `include_bytes!` + extract + `dlopen` route described earlier is therefore **not needed
+and not implemented.** Embedding the object would mean writing it to a cache directory on first
+run and managing that cache's staleness; shipping it in `libexec/` next to the binary that
+names it achieves the same thing with a file copy. The `MOEARC_ZE_LOADER` seam stays, because
+its purpose was never vendoring — it is how the loader-is-missing path gets tested.
+
+## What is still not true
+
+- 🔴 **glibc 2.39 or newer.** `moearc` requires `GLIBC_2.39`, inherited from building on Ubuntu
+  26.04; the other three binaries need only 2.34. That is Ubuntu 24.04, Fedora 40, Debian 13 or
+  newer — and it silently excludes Debian 12 and RHEL 9. `share/moearc/BUILD-INFO.txt` in every
+  tarball states the measured floor per binary. Lowering it means building on an older host or
+  in a manylinux container; nothing else here needs to change.
+- 🔴 **x86-64 Linux only.** No aarch64, no Windows.
+- ⬜ `moearc serve` is still a fixture — the CLI's device report is real and its model list,
+  downloads and serving stats are not. The tarball ships `moearc-server` (real, links the
+  kernels) and `moearc-bench` beside it, so nothing in the bundle is a fixture *only*, but the
+  four-command journey in `docs/ux.md` is not yet walkable end to end.
+- ⬜ `install.sh` points at a GitHub release that does not exist yet, and `moearc.dev` is still
+  unregistered. `MOEARC_TARBALL=/path/to/tarball` installs a local build in the meantime, and
+  that is the path that was actually exercised end to end in the clean container.
+- 📌 **Two installer bugs were found by running it rather than reading it**, and both would have
+  hit the first stranger. It probed for `/dev/dri/renderD128` specifically — on any box with an
+  iGPU the discrete card is `renderD129`, so it refused to install on exactly the hardware the
+  packaging was proved on. And `find "$tmp" -maxdepth 1 -name 'moearc-*'` matched the staging
+  directory itself, which is called `moearc-install.XXXXXX`, so the whole tree landed one level
+  too deep. Neither is visible by inspection; both are obvious the first time it runs.
+- ⬜ The TLS trust-root question above is untouched: `hf-hub` downloads still need the host's CA
+  bundle. The runtime fetcher has the same dependency, and the clean-room image installs
+  `ca-certificates` for that reason.
 
 ## Standing rules
 
@@ -207,3 +408,10 @@ package time by walking `DT_NEEDED` plus the adapters' dlopen list, or pinned by
 - **Claims about linkage get verified against the resolved graph**, never against a manifest.
   `cargo tree -i <crate>` and `ldd` on the built binary. The correction above is exactly what
   reading a manifest gets you.
+
+- **A launcher is not a defeat.** `LD_LIBRARY_PATH` is the only search path a `dlopen`ed
+  module’s dependencies inherit. Where that is the failing edge, a process-wide path is the
+  correct mechanism and an rpath is not an option that was skipped.
+- **Publish nothing that has not run where the toolkit cannot be reached.**
+  `packaging/verify-clean.sh` is the gate, and it is a container rather than a test because the
+  bug it exists to catch is *the environment*.

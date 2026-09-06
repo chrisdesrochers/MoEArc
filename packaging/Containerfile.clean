@@ -1,0 +1,52 @@
+# A machine that has an Arc card and has never heard of oneAPI.
+#
+# This is the test that matters. docs/packaging.md records that the previous packaging bug
+# survived 309 passing tests because every one of them ran in a shell where setvars.sh had
+# been sourced. The only way not to repeat that is to run the artefact somewhere the toolkit
+# cannot possibly be reached -- a different distro release, a different glibc, no /opt/intel,
+# and a clean environment.
+#
+# Ubuntu 24.04 is chosen on purpose: glibc 2.39, which is exactly the floor the shipped
+# binaries require (see share/moearc/BUILD-INFO.txt in the tarball). If the bundle runs here
+# it runs on anything newer, and if it ever stops running here that is the failure we want to
+# see first.
+ARG BASE=docker.io/library/ubuntu:24.04
+FROM ${BASE}
+
+ARG DRIVER=intel-repo
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates gnupg wget python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The Intel *GPU driver* -- the user-space half of the kernel driver, not the toolkit. This is
+# the one dependency docs/ux.md permits, and it is what every Arc owner running any GPU
+# workload already has. Nothing installed here is oneAPI.
+#
+# 🔴 Ubuntu 24.04's own `libze-intel-gpu1` is Level Zero build 27642 and predates Battlemage:
+# on a box with a B580 it enumerates the Arrow Lake iGPU and nothing else. That is not a
+# packaging problem, it is the floor of the one dependency we are allowed to have, and
+# `DRIVER=distro` reproduces it deliberately so the difference stays measurable.
+#
+# 🔴 `libigdgmm12` is named explicitly and must stay named. It is a *Recommends* rather than a
+# Depends of the driver, so `--no-install-recommends` drops it -- and without it device
+# detection still succeeds, a SYCL queue is still created, and only an actual model load dies,
+# with `Abort was called at 15 line in file: ./shared/source/gmm_helper/resource_info.cpp`.
+# A dependency that only breaks the third thing you do is worth pinning in the image that
+# proves the packaging.
+RUN set -eux; \
+    if [ "$DRIVER" = intel-repo ]; then \
+        wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
+          | gpg --dearmor -o /usr/share/keyrings/intel-graphics.gpg; \
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble unified" \
+          > /etc/apt/sources.list.d/intel-gpu.list; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libze1 libze-intel-gpu1 intel-opencl-icd libigdgmm12; \
+    rm -rf /var/lib/apt/lists/*
+
+# Proof, not assertion: fail the build if the toolkit leaked into the image.
+RUN test ! -d /opt/intel || (echo "oneAPI present -- this image is not clean" && false)
+
+WORKDIR /work
