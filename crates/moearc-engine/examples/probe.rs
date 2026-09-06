@@ -210,18 +210,32 @@ fn main() -> ExitCode {
     if let Some(dir) = &refdir {
         println!("\n-- against {} --", dir.display());
         for (name, got) in &tap.items {
-            // `ffn_moe_weights-<il>` is llama.cpp's pre-normalisation tensor; under
-            // `norm_w = true` the value this engine's combine uses is `ffn_moe_weights_norm`.
-            // Prefer that name when the dump carries it, so a normalising model is compared
-            // against the same quantity rather than against the stage before it.
-            let alias = name
-                .strip_prefix("ffn_moe_weights-")
-                .map(|il| format!("ffn_moe_weights_norm-{il}"));
-            let file = alias.as_deref().and_then(|a| ref_file(dir, a));
-            let (label, file) = match file {
-                Some(p) => (alias.as_deref().unwrap_or(name), Some(p)),
-                None => (name.as_str(), ref_file(dir, name)),
+            // 🔴 Some of this engine's taps hold a *later* stage of llama.cpp's graph than
+            // the node of the same name, because they hold the value the next operation
+            // actually consumes. Comparing against the un-aliased name would report a
+            // difference on every block of a model that has the later stage at all:
+            //
+            //  - `ffn_moe_weights` is the pre-normalisation gather. Under `norm_w = true`
+            //    (Qwen3) the combine uses `ffn_moe_weights_norm`; under
+            //    `SOFTMAX_WEIGHT` (gpt-oss) it uses `ffn_moe_weights_softmax`.
+            // First alias the dump carries wins; the plain name is the fallback. (The router
+            // bias needs no alias: `moe.rs` taps the raw product and the biased product under
+            // llama.cpp's own two names.)
+            let aliases: Vec<String> = [
+                name.strip_prefix("ffn_moe_weights-")
+                    .map(|il| format!("ffn_moe_weights_norm-{il}")),
+                name.strip_prefix("ffn_moe_weights-")
+                    .map(|il| format!("ffn_moe_weights_softmax-{il}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let hit = aliases.iter().find_map(|a| ref_file(dir, a).map(|p| (a.clone(), p)));
+            let (label, file) = match hit {
+                Some((a, p)) => (a, Some(p)),
+                None => (name.clone(), ref_file(dir, name)),
             };
+            let label = label.as_str();
             if let Some(p) = file {
                 match read_f32(&p) {
                     Ok(want) => report(label, got, &want),

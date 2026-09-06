@@ -72,8 +72,30 @@ pub mod names {
     /// Optional QK-norm on the keys.
     pub const ATTN_K_NORM: &str = "attn_k_norm.weight";
 
+    /// Optional query-projection bias.
+    pub const ATTN_Q_BIAS: &str = "attn_q.bias";
+    /// Optional key-projection bias.
+    pub const ATTN_K_BIAS: &str = "attn_k.bias";
+    /// Optional value-projection bias.
+    pub const ATTN_V_BIAS: &str = "attn_v.bias";
+    /// Optional attention-output bias.
+    pub const ATTN_OUTPUT_BIAS: &str = "attn_output.bias";
+
+    /// Optional per-head **attention sink**: one extra logit that joins the softmax denominator
+    /// and has no value vector. `n_head` floats. Present in gpt-oss.
+    pub const ATTN_SINKS: &str = "attn_sinks.weight";
+
     /// Pre-FFN norm.
     pub const FFN_NORM: &str = "ffn_norm.weight";
+    /// The pre-FFN norm under its other spelling.
+    ///
+    /// 🔴 gpt-oss has exactly two norms per block and calls the second one this. llama.cpp's
+    /// symbol for it is `LLM_TENSOR_ATTN_POST_NORM` — "post-attention" — but structurally it
+    /// sits where [`FFN_NORM`] sits in every other architecture here: after the attention
+    /// residual and before the MoE branch. ⚠️ The C++ symbol and the GGUF string do **not**
+    /// match (`attn_post_norm` against `post_attention_norm`), so a lookup written from the
+    /// source's spelling silently finds nothing.
+    pub const POST_ATTENTION_NORM: &str = "post_attention_norm.weight";
     /// The MoE router.
     pub const FFN_GATE_INP: &str = "ffn_gate_inp.weight";
     /// Stacked expert gate projections; see [`super::ExpertBank`].
@@ -82,6 +104,16 @@ pub mod names {
     pub const FFN_UP_EXPS: &str = "ffn_up_exps.weight";
     /// Stacked expert down projections.
     pub const FFN_DOWN_EXPS: &str = "ffn_down_exps.weight";
+
+    /// Optional router bias, `n_expert` long. Added to the logits **before** the top-k.
+    pub const FFN_GATE_INP_BIAS: &str = "ffn_gate_inp.bias";
+    /// Optional per-expert gate bias, `[n_ff, n_expert]`.
+    pub const FFN_GATE_EXPS_BIAS: &str = "ffn_gate_exps.bias";
+    /// Optional per-expert up bias, `[n_ff, n_expert]`.
+    pub const FFN_UP_EXPS_BIAS: &str = "ffn_up_exps.bias";
+    /// Optional per-expert down bias, `[n_embd, n_expert]`. Applied **inside** the router's
+    /// weighting, not after it.
+    pub const FFN_DOWN_EXPS_BIAS: &str = "ffn_down_exps.bias";
 
     /// Shared-expert gate projection, where the architecture has one.
     pub const FFN_GATE_SHEXP: &str = "ffn_gate_shexp.weight";

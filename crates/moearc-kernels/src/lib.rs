@@ -43,7 +43,7 @@ pub mod reference;
 use std::ffi::CStr;
 use std::os::raw::c_int;
 
-pub use reference::{KvType, QK_K, QK8_0, QuantType, RopeKind};
+pub use reference::{Gating, KvType, QK_K, QK8_0, QuantType, RopeKind, RopeScaling};
 
 /// A GPU context: a SYCL queue and the device it targets.
 ///
@@ -196,7 +196,21 @@ impl Context {
 
     /// Turn a kernel's return code into a `Result`, and wait for it if asked to.
     fn finish(&self, rc: c_int, what: &'static str) -> Result<(), KernelError> {
-        check(rc, what)?;
+        if rc != 0 {
+            // 🔴 Drain before reporting. Every wrapper in this file funnels its return code
+            // through here, so this is the one place that knows a device operation has failed —
+            // and the caller's next act, on every error path in the engine, is to unwind and
+            // **free the buffers that operation was using**. The queue is asynchronous, so work
+            // submitted before the failure may still be reading them. Freeing USM out from under
+            // a live kernel is a segfault in the driver, arriving after the error message and
+            // looking like a crash in whatever ran next.
+            //
+            // The drain's own verdict is discarded on purpose: the queue is already in a failed
+            // state and `check(rc)` below carries the diagnosis the caller wants. What matters
+            // is that nothing is in flight when this returns `Err`.
+            let _ = unsafe { ffi::moearc_sync(self.raw) };
+            return check(rc, what);
+        }
         if self.sync_each { self.sync() } else { Ok(()) }
     }
 
@@ -681,6 +695,97 @@ impl Context {
         self.finish(rc, "swiglu halves")
     }
 
+    /// The OpenAI MoE activation: `(min(gate, limit) * sigmoid(alpha * min(gate, limit))) *
+    /// (clamp(up, -limit, limit) + 1)`.
+    ///
+    /// 🔴 Not a variant of [`Context::swiglu`] with extra clamping. The gate is clamped **above
+    /// only**, the sigmoid is alpha-scaled rather than plain SiLU, and the up branch carries a
+    /// **`+ 1`**, so an up projection of zero passes the gate through instead of cancelling it.
+    /// Substituting plain SwiGLU on a model that wants this one runs and produces fluent text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_oai(
+        &self,
+        out: &DeviceBuffer<'_>,
+        gate: &DeviceBuffer<'_>,
+        up: &DeviceBuffer<'_>,
+        n: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> Result<(), KernelError> {
+        gate.require("swiglu_oai gate", n * 4)?;
+        up.require("swiglu_oai up", n * 4)?;
+        out.require("swiglu_oai output", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_swiglu_oai(
+                self.raw,
+                out.ptr.cast(),
+                gate.ptr.cast(),
+                up.ptr.cast(),
+                n as ffi::c_ulong,
+                alpha,
+                limit,
+            )
+        };
+        self.finish(rc, "swiglu_oai")
+    }
+
+    /// [`Context::swiglu_oai`] over the two halves of one buffer — the counterpart of
+    /// [`Context::swiglu_halves`], for a fused gate-and-up batched launch.
+    pub fn swiglu_oai_halves(
+        &self,
+        out: &DeviceBuffer<'_>,
+        gu: &DeviceBuffer<'_>,
+        n: usize,
+        alpha: f32,
+        limit: f32,
+    ) -> Result<(), KernelError> {
+        gu.require("swiglu_oai gate and up", 2 * n * 4)?;
+        out.require("swiglu_oai output", n * 4)?;
+        let rc = unsafe {
+            ffi::moearc_swiglu_oai_halves(
+                self.raw,
+                out.ptr.cast(),
+                gu.ptr.cast(),
+                n as ffi::c_ulong,
+                alpha,
+                limit,
+            )
+        };
+        self.finish(rc, "swiglu_oai halves")
+    }
+
+    /// `out[m * n_rows + r] += bias[idx[m] * n_rows + r]` — llama.cpp's `ggml_add_id`.
+    ///
+    /// The bias a batched expert matvec needs: one f32 row per expert per bank, gathered by the
+    /// router's own selection. `idx` names, for each matrix of the batch, which row group of
+    /// `bias` belongs to it, and is carried into the kernel by value rather than uploaded — an
+    /// upload waits, and waiting drains the in-order queue.
+    pub fn add_bias_id(
+        &self,
+        out: &DeviceBuffer<'_>,
+        bias: &DeviceBuffer<'_>,
+        idx: &[u32],
+        n_rows: usize,
+    ) -> Result<(), KernelError> {
+        if idx.len() > MAX_BATCHED_MATS {
+            return Err(KernelError::BadArgument("more bias rows than a batched launch covers"));
+        }
+        out.require("bias destination", idx.len() * n_rows * 4)?;
+        let need = idx.iter().copied().max().map_or(0, |m| (m as usize + 1) * n_rows * 4);
+        bias.require("bias bank", need)?;
+        let rc = unsafe {
+            ffi::moearc_add_bias_id(
+                self.raw,
+                out.ptr.cast(),
+                bias.ptr.cast(),
+                idx.as_ptr(),
+                idx.len() as std::os::raw::c_uint,
+                n_rows as ffi::c_ulong,
+            )
+        };
+        self.finish(rc, "expert bias")
+    }
+
     /// Row-wise softmax, max-subtracted, unmasked and unscaled.
     pub fn softmax(
         &self,
@@ -711,10 +816,42 @@ impl Context {
         freq_base: f32,
         kind: RopeKind,
     ) -> Result<(), KernelError> {
+        self.rope_ext(dst, src, pos, n_tokens, n_heads, head_dim, n_dims, freq_base, None, kind)
+    }
+
+    /// [`Context::rope`] with YaRN context extension.
+    ///
+    /// 🔴 `scaling` is `None` for every model whose GGUF does not declare
+    /// `rope.scaling.type = yarn`, and that is not the same as "a short sequence does not need
+    /// it". llama.cpp's `rope_yarn` has **no position gate at all**: the frequency
+    /// interpolation and the magnitude scaling are applied from position 0, and the only thing
+    /// the ramp consults is the channel index. A YaRN model run with plain RoPE is wrong on its
+    /// first token, not just past its original context length.
+    ///
+    /// See [`RopeScaling`] for where each field comes from — in particular
+    /// [`RopeScaling::attn_factor`], which is **not** the YaRN paper's mscale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_ext(
+        &self,
+        dst: &DeviceBuffer<'_>,
+        src: &DeviceBuffer<'_>,
+        pos: &DeviceBuffer<'_>,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_dims: usize,
+        freq_base: f32,
+        scaling: Option<RopeScaling>,
+        kind: RopeKind,
+    ) -> Result<(), KernelError> {
         let n = n_tokens * n_heads * head_dim;
         src.require("rope input", n * 4)?;
         dst.require("rope output", n * 4)?;
         pos.require("rope positions", n_tokens * 4)?;
+        // The identity: `freq_scale = 1` and `ext_factor = 0` reduce the kernel to
+        // `cos(theta_extrap) * 1.0`, both operations exact, so an unscaled model is bit-for-bit
+        // what it was before YaRN existed here.
+        let sc = scaling.unwrap_or(RopeScaling::NONE);
         let rc = unsafe {
             ffi::moearc_rope(
                 self.raw,
@@ -726,6 +863,11 @@ impl Context {
                 head_dim as ffi::c_ulong,
                 n_dims as ffi::c_ulong,
                 freq_base,
+                sc.freq_scale,
+                sc.ext_factor,
+                sc.attn_factor,
+                sc.corr_lo,
+                sc.corr_hi,
                 match kind {
                     RopeKind::Normal => 0,
                     RopeKind::Neox => 1,
@@ -751,7 +893,7 @@ impl Context {
         n_tokens: usize,
         n_expert: usize,
         k: usize,
-        normalize: bool,
+        gating: Gating,
     ) -> Result<(), KernelError> {
         logits.require("router logits", n_tokens * n_expert * 4)?;
         idx.require("router indices", n_tokens * k * 4)?;
@@ -765,7 +907,7 @@ impl Context {
                 n_tokens as ffi::c_ulong,
                 n_expert as ffi::c_ulong,
                 k as std::os::raw::c_uint,
-                i32::from(normalize),
+                gating as std::os::raw::c_uint,
             )
         };
         self.finish(rc, "top-k router")
@@ -1002,6 +1144,49 @@ impl Context {
         scale: f32,
         kv: KvType,
     ) -> Result<(), KernelError> {
+        self.attn_decode_ext(
+            out,
+            q,
+            k_pages,
+            v_pages,
+            block_table,
+            None,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_kv,
+            page_tokens,
+            scale,
+            kv,
+        )
+    }
+
+    /// [`Context::attn_decode`] with **attention sinks**.
+    ///
+    /// 🔴 A sink is one extra logit per query head that enters the softmax denominator and has
+    /// no value vector — llama.cpp's `ggml_soft_max_add_sinks`. Its effect is that a head's
+    /// attention weights **do not sum to one**; the sink drains mass in proportion to how weak
+    /// the real scores are. `sinks` is `n_heads` floats and is compared against scores that have
+    /// already been multiplied by `scale`, while it is itself raw.
+    ///
+    /// Passing `None` is the ordinary softmax and is exactly [`Context::attn_decode`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_ext(
+        &self,
+        out: &DeviceBuffer<'_>,
+        q: &DeviceBuffer<'_>,
+        k_pages: &DeviceBuffer<'_>,
+        v_pages: &DeviceBuffer<'_>,
+        block_table: &DeviceBuffer<'_>,
+        sinks: Option<&DeviceBuffer<'_>>,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_kv: usize,
+        page_tokens: usize,
+        scale: f32,
+        kv: KvType,
+    ) -> Result<(), KernelError> {
         if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
             return Err(KernelError::BadArgument("n_heads is not a multiple of n_kv_heads"));
         }
@@ -1011,6 +1196,9 @@ impl Context {
         q.require("query", n_heads * head_dim * 4)?;
         out.require("attention output", n_heads * head_dim * 4)?;
         block_table.require("block table", n_kv.div_ceil(page_tokens) * 4)?;
+        if let Some(s) = sinks {
+            s.require("attention sinks", n_heads * 4)?;
+        }
         let rc = unsafe {
             ffi::moearc_attn_decode(
                 self.raw,
@@ -1019,6 +1207,7 @@ impl Context {
                 k_pages.ptr,
                 v_pages.ptr,
                 block_table.ptr.cast(),
+                sinks.map_or(std::ptr::null(), |s| s.ptr.cast()),
                 n_heads as ffi::c_ulong,
                 n_kv_heads as ffi::c_ulong,
                 head_dim as ffi::c_ulong,

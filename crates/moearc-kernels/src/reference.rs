@@ -33,6 +33,10 @@ pub enum QuantType {
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    /// The OCP microscaling 4-bit float: 32 elements sharing one **power-of-two** E8M0
+    /// exponent. Not a K-quant — there is no scale/min pair and no super-block — and it is what
+    /// every expert of gpt-oss is stored in.
+    Mxfp4 = 39,
 }
 
 /// Elements per K-quant super-block. `QK_K` in `ggml/src/ggml-common.h`.
@@ -40,6 +44,30 @@ pub const QK_K: usize = 256;
 
 /// Elements per Q8_0 block. `QK8_0` in `ggml/src/ggml-common.h`.
 pub const QK8_0: usize = 32;
+
+/// Elements per MXFP4 block. `QK_MXFP4` in `ggml/src/ggml-common.h`.
+pub const QK_MXFP4: usize = 32;
+
+/// MXFP4's E2M1 code table — `kvalues_fp4` in `ggml/src/ggml-common.h`, aliased there as
+/// `kvalues_mxfp4`.
+///
+/// 🔴 These are the true E2M1 values **doubled**, which is what lets the table be integral. The
+/// scale must therefore be halved to match; see [`e8m0_half`]. Index 8 is negative zero.
+pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// `ggml_e8m0_to_fp32_half` from `ggml/src/ggml-impl.h`: `2^(x - 128)`.
+///
+/// 🔴 Half of the true E8M0 value `2^(x - 127)`, deliberately, to cancel the doubling in
+/// [`KVALUES_MXFP4`]. Using the unhalved scale with that table doubles every weight in the
+/// model — an error that produces finite, fluent, wrong output.
+///
+/// `x < 2` is a separate arm because the result is then a **subnormal** f32, which the
+/// normalised `(x - 1) << 23` form cannot express.
+pub fn e8m0_half(x: u8) -> f32 {
+    // 0x00200000 = 2^-128, 0x00400000 = 2^-127.
+    let bits = if x < 2 { 0x0020_0000u32 << x } else { (u32::from(x) - 1) << 23 };
+    f32::from_bits(bits)
+}
 
 impl QuantType {
     /// Bytes one super-block occupies on disk.
@@ -55,6 +83,8 @@ impl QuantType {
             Self::Q4K => 144,
             Self::Q5K => 176,
             Self::Q6K => 210,
+            // `sizeof(block_mxfp4)` = one E8M0 byte + `QK_MXFP4/2` nibble pairs.
+            Self::Mxfp4 => 17,
         }
     }
 
@@ -64,6 +94,7 @@ impl QuantType {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q80 => QK8_0,
+            Self::Mxfp4 => QK_MXFP4,
             Self::Q4K | Self::Q5K | Self::Q6K => QK_K,
         }
     }
@@ -82,6 +113,7 @@ impl QuantType {
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
+            39 => Some(Self::Mxfp4),
             _ => None,
         }
     }
@@ -153,6 +185,7 @@ pub fn dequant(ty: QuantType, src: &[u8], nblocks: usize) -> Vec<f32> {
             QuantType::Q4K => dequant_block_q4_k(blk, y),
             QuantType::Q5K => dequant_block_q5_k(blk, y),
             QuantType::Q6K => dequant_block_q6_k(blk, y),
+            QuantType::Mxfp4 => dequant_block_mxfp4(blk, y),
         }
     }
     out
@@ -163,6 +196,22 @@ fn dequant_block_q8_0(blk: &[u8], y: &mut [f32]) {
     let d = ld_f16(blk, 0);
     for (j, out) in y.iter_mut().enumerate() {
         *out = f32::from(blk[2 + j] as i8) * d;
+    }
+}
+
+/// `dequantize_row_mxfp4` from `ggml/src/ggml-quants.c`, one block, transcribed as written.
+///
+/// 🔴 The two nibbles of `qs[j]` are elements `j` and `j + 16` — the **halves** of the block,
+/// not an adjacent pair. The C writes `y[i*qk + j + 0]` from the low nibble and
+/// `y[i*qk + j + qk/2]` from the high one. Reading them as `2j`/`2j+1` shuffles every expert's
+/// weights into a permutation of themselves, which is exactly the kind of error that leaves the
+/// model fluent.
+fn dequant_block_mxfp4(blk: &[u8], y: &mut [f32]) {
+    let d = e8m0_half(blk[0]);
+    for j in 0..QK_MXFP4 / 2 {
+        let b = blk[1 + j];
+        y[j] = f32::from(KVALUES_MXFP4[(b & 0x0F) as usize]) * d;
+        y[j + QK_MXFP4 / 2] = f32::from(KVALUES_MXFP4[(b >> 4) as usize]) * d;
     }
 }
 
@@ -322,6 +371,30 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     gate.iter().zip(up).map(|(g, u)| (g / (1.0 + (-g).exp())) * u).collect()
 }
 
+/// `ggml_swiglu_oai`, elementwise — the gpt-oss expert activation.
+///
+/// From `ggml/src/ggml-cpu/ops.cpp`:
+///
+/// ```text
+///   x = min(gate, limit)
+///   y = clamp(up, -limit, limit)
+///   out = (x / (1 + exp(-alpha * x))) * (y + 1)
+/// ```
+///
+/// 🔴 Three departures from [`swiglu`], each survivable and each wrong: the gate is clamped
+/// **above only**, the sigmoid is alpha-scaled, and the up branch carries a **`+ 1`**.
+pub fn swiglu_oai(gate: &[f32], up: &[f32], alpha: f32, limit: f32) -> Vec<f32> {
+    assert_eq!(gate.len(), up.len());
+    gate.iter()
+        .zip(up)
+        .map(|(g, u)| {
+            let x = g.min(limit);
+            let y = u.clamp(-limit, limit);
+            (x / (1.0 + (alpha * -x).exp())) * (y + 1.0)
+        })
+        .collect()
+}
+
 /// Row-wise softmax, max-subtracted, summed in `f64`.
 pub fn softmax(x: &[f32], n_rows: usize, n_cols: usize) -> Vec<f32> {
     softmax_ext(x, None, n_rows, n_cols, 1.0)
@@ -434,6 +507,90 @@ pub fn rope(
     out
 }
 
+/// How a router turns logits into the weights the combine applies.
+///
+/// 🔴 All three select the same experts — softmax is monotonic — and produce **different
+/// weights**. Nothing in a GGUF records which one an architecture wants; each comes from
+/// llama.cpp's `build_moe_ffn` call site, which is why `moe.rs` allowlists architectures by
+/// name rather than inferring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Gating {
+    /// Softmax over **all** experts, the k largest taken as-is. Their weights do not sum to
+    /// one. `build_moe_ffn(..., norm_w = false, ..., SOFTMAX)` — OLMoE.
+    Softmax = 0,
+    /// Softmax over all experts, then the k selected divided by their sum (clamped up to the
+    /// smallest normal f16). `norm_w = true` — Qwen3-MoE.
+    SoftmaxNormalised = 1,
+    /// Top-k on the **raw** logits, then a softmax over just those k.
+    /// `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT`, which sets `probs = logits` and defers
+    /// `ggml_soft_max` until after `ggml_get_rows` — gpt-oss.
+    ///
+    /// 🔴 Not the same as [`Self::SoftmaxNormalised`]. A softmax over 128 experts renormalised
+    /// to 4 is not a softmax over those 4: the former's ratios are set by the full logit
+    /// spread, the latter's only by the four selected. Both sum to one, and they differ.
+    SoftmaxAfterTopK = 2,
+}
+
+/// YaRN context-extension parameters, as the RoPE kernel wants them.
+///
+/// Built by the engine from `rope.scaling.*`; see [`RopeScaling::yarn`] for where each number
+/// comes from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RopeScaling {
+    /// `1 / rope.scaling.factor`.
+    pub freq_scale: f32,
+    /// llama.cpp forces this to 1.0 whenever the scaling type is YaRN, and 0.0 otherwise. At
+    /// 0.0 the kernel degenerates to plain RoPE.
+    pub ext_factor: f32,
+    /// 🔴 **Not the YaRN paper's mscale.** llama.cpp computes `0.1*ln(s)+1` into
+    /// `cparams.yarn_attn_factor` and then divides it straight back out, so that the *kernel*
+    /// can multiply it in; the value that crosses this boundary is therefore **1.0** for a
+    /// model with no `rope.scaling.attn_factor` key. Passing the paper's 1.3466 here squares
+    /// it.
+    pub attn_factor: f32,
+    /// `ggml_rope_yarn_corr_dims()[0]` — below this channel, pure extrapolation.
+    pub corr_lo: f32,
+    /// `ggml_rope_yarn_corr_dims()[1]` — above this channel, pure interpolation.
+    pub corr_hi: f32,
+}
+
+impl RopeScaling {
+    /// No scaling: the kernel computes `cos(theta_extrap) * 1.0`, both exact, so a model
+    /// carrying this is bit-for-bit what plain RoPE gives.
+    pub const NONE: Self =
+        Self { freq_scale: 1.0, ext_factor: 0.0, attn_factor: 1.0, corr_lo: 0.0, corr_hi: 0.0 };
+
+    /// YaRN, from the four GGUF keys and the model's geometry.
+    ///
+    /// `ggml_rope_yarn_corr_dims`, `ggml/src/ggml.c`:
+    ///
+    /// ```text
+    ///   corr(beta) = n_dims * ln(n_ctx_orig / (beta * 2*pi)) / (2 * ln(freq_base))
+    ///   lo = max(0, floor(corr(beta_fast)))   hi = min(n_dims - 1, ceil(corr(beta_slow)))
+    /// ```
+    pub fn yarn(
+        n_dims: usize,
+        n_ctx_orig: usize,
+        freq_base: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> Self {
+        let corr = |beta: f32| -> f32 {
+            n_dims as f32 * (n_ctx_orig as f32 / (beta * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * freq_base.ln())
+        };
+        Self {
+            freq_scale: 1.0 / factor,
+            ext_factor: 1.0,
+            attn_factor: 1.0,
+            corr_lo: corr(beta_fast).floor().max(0.0),
+            corr_hi: corr(beta_slow).ceil().min(n_dims as f32 - 1.0),
+        }
+    }
+}
+
 /// Top-k expert selection: `(indices, weights)`, both `n_tokens * k` long.
 ///
 /// Mirrors `llm_graph_context::build_moe_ffn` for the softmax-gated case: softmax over all
@@ -444,7 +601,7 @@ pub fn topk_router(
     n_tokens: usize,
     n_expert: usize,
     k: usize,
-    normalize: bool,
+    gating: Gating,
 ) -> (Vec<u32>, Vec<f32>) {
     assert_eq!(logits.len(), n_tokens * n_expert);
     assert!(k > 0 && k <= n_expert);
@@ -458,8 +615,15 @@ pub fn topk_router(
         let mut order: Vec<usize> = (0..n_expert).collect();
         order.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).expect("router logits must not be NaN"));
         let chosen = &order[..k];
+        if gating == Gating::SoftmaxAfterTopK {
+            // A softmax over the k selected **logits**, not a restriction of the full softmax.
+            let sel: Vec<f32> = chosen.iter().map(|&e| row[e]).collect();
+            idx.extend(chosen.iter().map(|e| *e as u32));
+            wts.extend(softmax(&sel, 1, k));
+            continue;
+        }
         let mut w: Vec<f32> = chosen.iter().map(|&e| probs[t * n_expert + e]).collect();
-        if normalize {
+        if gating == Gating::SoftmaxNormalised {
             // llama.cpp clamps to 6.103515625e-5 — the smallest normal f16, i.e. 2^-14 —
             // before dividing. Written as a power of two so the value is exact and the
             // provenance is still legible.
@@ -749,7 +913,7 @@ mod tests {
     #[test]
     fn the_router_picks_the_largest_and_the_weights_sum_to_one() {
         let logits = vec![0.1, 5.0, -2.0, 4.0, 4.0];
-        let (idx, w) = topk_router(&logits, 1, 5, 3, true);
+        let (idx, w) = topk_router(&logits, 1, 5, 3, Gating::SoftmaxNormalised);
         assert_eq!(idx, vec![1, 3, 4], "expected the two 4.0s to tie-break by index");
         let sum: f32 = w.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "normalised weights summed to {sum}");

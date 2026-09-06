@@ -27,7 +27,7 @@
 mod common;
 
 use common::{Rng, assert_close, gpu_available, max_abs_diff, synth_blocks};
-use moearc_kernels::{Context, KernelError, QK_K, QuantType, RopeKind, reference};
+use moearc_kernels::{Context, Gating, KernelError, QK_K, QuantType, RopeKind, reference};
 
 /// f32 unit roundoff, 2^-24. Half an ulp of 1.0.
 const U: f64 = 5.960_464_477_539_063e-8;
@@ -427,24 +427,27 @@ fn the_router_picks_the_same_experts_and_weights_as_the_cpu_reference() {
     let dw = ctx.alloc_n::<f32>(TOKENS * K).unwrap();
     ctx.upload_slice(&dl, &logits).unwrap();
 
-    for normalize in [false, true] {
-        ctx.topk_router(&didx, &dw, &dl, TOKENS, EXPERTS, K, normalize).unwrap();
+    for gating in [Gating::Softmax, Gating::SoftmaxNormalised, Gating::SoftmaxAfterTopK] {
+        let normalize = gating;
+        ctx.topk_router(&didx, &dw, &dl, TOKENS, EXPERTS, K, gating).unwrap();
         let mut idx = vec![0u32; TOKENS * K];
         let mut w = vec![0.0f32; TOKENS * K];
         ctx.download_slice(&mut idx, &didx).unwrap();
         ctx.download_slice(&mut w, &dw).unwrap();
 
-        let (want_idx, want_w) = reference::topk_router(&logits, TOKENS, EXPERTS, K, normalize);
-        assert_eq!(idx, want_idx, "normalize={normalize}: the router chose different experts");
+        let (want_idx, want_w) = reference::topk_router(&logits, TOKENS, EXPERTS, K, gating);
+        assert_eq!(idx, want_idx, "gating={gating:?}: the router chose different experts");
         assert_eq!(idx[0], 3, "the planted tie must resolve to the lower expert index");
         assert_eq!(idx[1], 77, "the planted tie must place the higher index second");
 
         // Weights are probabilities, bounded by 1, so the tolerance is absolute: two `exp`s at
         // 4 ulp, a 128-term sum, and one divide.
         let tol = (4.0 + 4.0 + EXPERTS as f64 / 32.0 + 5.0 + 1.0) * U;
-        assert_close(&format!("router weights normalize={normalize}"), &w, &want_w, tol);
+        assert_close(&format!("router weights gating={normalize:?}"), &w, &want_w, tol);
 
-        if normalize {
+        if normalize != Gating::Softmax {
+            // Both normalising gatings produce a distribution over the k selected experts —
+            // the unnormalised one deliberately does not.
             for t in 0..TOKENS {
                 let s: f64 = w[t * K..(t + 1) * K].iter().map(|v| f64::from(*v)).sum();
                 assert!((s - 1.0).abs() < 1e-5, "token {t}: normalised weights summed to {s}");
@@ -472,7 +475,7 @@ fn a_k_larger_than_the_router_supports_is_refused() {
     let logits = ctx.alloc_n::<f32>(16).unwrap();
     let idx = ctx.alloc_n::<u32>(64).unwrap();
     let w = ctx.alloc_n::<f32>(64).unwrap();
-    let err = ctx.topk_router(&idx, &w, &logits, 1, 16, 64, true).unwrap_err();
+    let err = ctx.topk_router(&idx, &w, &logits, 1, 16, 64, Gating::SoftmaxNormalised).unwrap_err();
     assert!(matches!(err, KernelError::BadArgument(_)), "expected a refusal, got {err:?}");
 }
 

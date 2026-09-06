@@ -190,7 +190,11 @@ fn the_geometry_is_read_from_the_file_and_not_assumed() {
 
     // The two switches no GGUF key records.
     assert!(c.qk_norm_per_head, "qwen3moe normalises each head, not the whole projection");
-    assert!(c.normalize_router_weights, "build_moe_ffn is called with norm_w = true");
+    assert_eq!(
+        c.gating,
+        moearc_kernels::Gating::SoftmaxNormalised,
+        "build_moe_ffn is called with norm_w = true"
+    );
 
     // This file carries no `bos_token_id` at all, and `add_bos_token` is false.
     assert_eq!(c.bos, None);

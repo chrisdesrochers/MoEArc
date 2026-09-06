@@ -63,6 +63,12 @@ pub fn synth_blocks(ty: QuantType, nblocks: usize, rng: &mut Rng) -> Vec<u8> {
             QuantType::Q6K => blk[208..210].copy_from_slice(&scale_bits(rng).to_le_bytes()),
             // Q8_0 carries one delta and nothing else.
             QuantType::Q80 => blk[0..2].copy_from_slice(&scale_bits(rng).to_le_bytes()),
+            // MXFP4's scale is a single E8M0 exponent byte. It is constrained away from the
+            // extremes for the same reason the f16 deltas are: `e < 2` and `e > 200` give
+            // subnormal or astronomically large blocks, where a comparison against a reference
+            // measures float formatting rather than the unpacking. Every nibble pattern is
+            // still exercised, because the payload stays random.
+            QuantType::Mxfp4 => blk[0] = 100 + (rng.next_u32() % 56) as u8,
             // f32 and f16 are blocks of one, so the "payload" is the value itself and random
             // bytes would be NaN or infinity often enough to make every comparison meaningless.
             QuantType::F32 => blk[0..4].copy_from_slice(&rng.unit().to_le_bytes()),

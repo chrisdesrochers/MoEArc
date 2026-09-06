@@ -45,6 +45,9 @@ using namespace sycl;
 // Q8_0 format uses a smaller, independent block: `#define QK8_0 32`.
 static constexpr int QK_K = 256;
 static constexpr int QK8_0 = 32;
+// MXFP4's block, from `ggml-common.h`: `#define QK_MXFP4 32`, and a `block_mxfp4` of one E8M0
+// scale byte followed by `QK_MXFP4/2` nibble pairs.
+static constexpr int QK_MXFP4 = 32;
 
 // Bytes per block, from the `static_assert`s in `ggml-common.h`:
 //   Q4_K: 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2       = 2 + 2 + 12 + 128 = 144
@@ -55,6 +58,8 @@ static constexpr int Q4_K_BYTES = 144;
 static constexpr int Q5_K_BYTES = 176;
 static constexpr int Q6_K_BYTES = 210;
 static constexpr int Q8_0_BYTES = 34;
+//   MXFP4: sizeof(uint8_t) + QK_MXFP4/2                     = 1 + 16 = 17
+static constexpr int MXFP4_BYTES = 17;
 
 // GGUF type ids, from `gguf-py/gguf/constants.py`, `class GGMLQuantizationType(IntEnum)`.
 // The same ids the `moearc-model` crate's `quant` table carries.
@@ -64,6 +69,7 @@ static constexpr unsigned int GGML_TYPE_Q8_0 = 8;
 static constexpr unsigned int GGML_TYPE_Q4_K = 12;
 static constexpr unsigned int GGML_TYPE_Q5_K = 13;
 static constexpr unsigned int GGML_TYPE_Q6_K = 14;
+static constexpr unsigned int GGML_TYPE_MXFP4 = 39;
 
 /// Load a little-endian 16-bit word from an arbitrary byte address.
 ///
@@ -311,6 +317,47 @@ static inline float q6k_elem(const unsigned char *blk, int i) {
     return d * (float) s * (float) q;
 }
 
+/// The E2M1 code table MXFP4 indexes with each nibble.
+///
+/// 🔴 These are the true E2M1 values **doubled** — `ggml-common.h` calls the table
+/// `kvalues_fp4` and aliases `kvalues_mxfp4` to it, precisely so it can be `int8_t`. Index 8 is
+/// negative zero and decodes to 0. Pairing this table with the *undoubled* scale gives every
+/// expert weight twice its value: finite, fluent, wrong.
+static constexpr signed char KVALUES_MXFP4[16] = {0, 1, 2,  3,  4,  6,  8,  12,
+                                                  0, -1, -2, -3, -4, -6, -8, -12};
+
+/// The E8M0 scale byte, **halved** — `ggml_e8m0_to_fp32_half` from `ggml/src/ggml-impl.h`.
+///
+/// 🔴 The halving is not a rounding convenience, it is the other half of the doubled table
+/// above: `half_scale * doubled_value == true_scale * true_value`. `GGML_E8M0_TO_FP32` (without
+/// `_HALF`) is a different function and is *not* the one `dequantize_row_mxfp4` calls.
+///
+/// `x < 2` is a separate arm because 2^(x-128) for x in {0,1} is a **subnormal** f32, which the
+/// normalised `(x-1) << 23` form cannot express — it would underflow the exponent field and
+/// produce a large number rather than a tiny one. Transcribed from the C, not derived.
+static inline float e8m0_half(unsigned int x) {
+    // 0x00200000 = 2^-128, 0x00400000 = 2^-127.
+    const unsigned int bits = (x < 2u) ? (0x00200000u << x) : ((x - 1u) << 23);
+    return sycl::bit_cast<float>(bits);
+}
+
+/// One dequantised element of an MXFP4 block. `i` is 0..31.
+///
+/// Block layout (`block_mxfp4`, `ggml-common.h`): `[0]` the E8M0 scale, `[1..17)` sixteen bytes
+/// of two 4-bit codes each.
+///
+/// 🔴 The two nibbles of a byte are elements `j` and `j + 16` — **split halves, not adjacent**.
+/// `dequantize_row_mxfp4` writes `y[i*qk + j]` from the low nibble and `y[i*qk + j + qk/2]` from
+/// the high one. Reading them as `2j` and `2j+1` is the same bytes in the wrong order, which
+/// gives a model that runs and is wrong; llama.cpp's own HF converter carries a
+/// `transform_nibble_layout()` for exactly this reason.
+static inline float mxfp4_elem(const unsigned char *blk, int i) {
+    const float d = e8m0_half(blk[0]);
+    const unsigned int b = blk[1 + (i & 15)];
+    const int q = KVALUES_MXFP4[(i < 16) ? (b & 0xFu) : (b >> 4)];
+    return (float) q * d;
+}
+
 /// One dequantised element of a Q8_0 block. `i` is 0..31.
 ///
 /// Block layout (`block_q8_0`, `ggml-common.h`): `[0..2)` a `ggml_half` delta, `[2..34)` thirty-
@@ -336,6 +383,7 @@ static inline int block_bytes(unsigned int type_id) {
         case GGML_TYPE_Q4_K: return Q4_K_BYTES;
         case GGML_TYPE_Q5_K: return Q5_K_BYTES;
         case GGML_TYPE_Q6_K: return Q6_K_BYTES;
+        case GGML_TYPE_MXFP4: return MXFP4_BYTES;
         default: return 0;
     }
 }
@@ -347,6 +395,7 @@ static inline int block_elems(unsigned int type_id) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16: return 1;
         case GGML_TYPE_Q8_0: return QK8_0;
+        case GGML_TYPE_MXFP4: return QK_MXFP4;
         default: return QK_K;
     }
 }
@@ -364,6 +413,7 @@ static inline float elem_at(unsigned int type_id, const unsigned char *blk, int 
         case GGML_TYPE_Q8_0: return q80_elem(blk, i);
         case GGML_TYPE_Q4_K: return q4k_elem(blk, i);
         case GGML_TYPE_Q5_K: return q5k_elem(blk, i);
+        case GGML_TYPE_MXFP4: return mxfp4_elem(blk, i);
         default: return q6k_elem(blk, i);  // Q6_K; block_bytes rejected everything else
     }
 }
@@ -452,7 +502,7 @@ static constexpr int ERR_ARG = -2;
 /// 32-element units per block of `TY`. A K-quant super-block holds eight; a Q8_0 block is one.
 template <unsigned int TY>
 static constexpr int units_per_block() {
-    return TY == GGML_TYPE_Q8_0 ? 1 : QK_K / 32;
+    return (TY == GGML_TYPE_Q8_0 || TY == GGML_TYPE_MXFP4) ? 1 : QK_K / 32;
 }
 
 /// Bytes per block of `TY`, as a compile-time constant so the address arithmetic folds.
@@ -461,6 +511,7 @@ static constexpr int const_block_bytes() {
     return TY == GGML_TYPE_Q4_K   ? Q4_K_BYTES
            : TY == GGML_TYPE_Q5_K ? Q5_K_BYTES
            : TY == GGML_TYPE_Q6_K ? Q6_K_BYTES
+           : TY == GGML_TYPE_MXFP4 ? MXFP4_BYTES
                                   : Q8_0_BYTES;
 }
 
@@ -522,6 +573,17 @@ static inline void unit_acc(float &acc, const unsigned char *blk, const float *x
                 const unsigned int hb = (qh[l] >> shift) & 3u;
                 acc += (ds * (float) ((int) (lo | (hb << 4)) - 32)) * xs[l];
             }
+        }
+    } else if constexpr (TY == GGML_TYPE_MXFP4) {
+        // One E8M0 scale for the whole 32, and the unit *is* the block. The two halves are
+        // walked in one pass over `qs` rather than two, so each of the sixteen bytes is loaded
+        // once; the per-element expression is `mxfp4_elem`'s, term for term.
+        const float d = e8m0_half(blk[0]);
+        const unsigned char *qs = blk + 1;
+        for (int l = 0; l < 16; ++l) {
+            const unsigned int b = qs[l];
+            acc += ((float) KVALUES_MXFP4[b & 0xFu] * d) * xs[l];
+            acc += ((float) KVALUES_MXFP4[b >> 4] * d) * xs[l + 16];
         }
     } else {  // Q8_0: no sub-block structure, one delta for the whole 32
         const float d = f16_to_f32(ld_u16le(blk));
@@ -596,6 +658,12 @@ static constexpr int MAX_BATCHED_MATS = 32;
 /// construction: there is no table for the kernel to race.
 struct mat_table {
     const unsigned char *p[MAX_BATCHED_MATS];
+};
+
+/// The per-matrix bias row indices of one batched launch, carried by value for the same reason
+/// `mat_table` is. See `moearc_add_bias_id`.
+struct idx_table {
+    unsigned int i[MAX_BATCHED_MATS];
 };
 
 /// The same product as `matvec_q_submit`, over `n_mat` matrices of one shape and type, in one
@@ -1026,6 +1094,10 @@ int moearc_matvec_q(moearc_ctx *c, unsigned int type_id, float *out, const void 
                 moearc_track(c, "mvq Q8_0", n_rows, 1,
                              matvec_q_submit<GGML_TYPE_Q8_0>(c->q, out, w, x, n_rows, n_cols));
                 break;
+            case GGML_TYPE_MXFP4:
+                moearc_track(c, "mvq MXFP4", n_rows, 1,
+                             matvec_q_submit<GGML_TYPE_MXFP4>(c->q, out, w, x, n_rows, n_cols));
+                break;
             default:
                 // f32 and f16 are "blocks" of one element, so there is no unit to hoist
                 // anything out of and no constraint that `n_cols` be a multiple of 32. One
@@ -1110,6 +1182,11 @@ int moearc_matvec_q_batched(moearc_ctx *c, unsigned int type_id, float *out,
             case GGML_TYPE_Q8_0:
                 moearc_track(c, "mvq_batched Q8_0", n_rows, n_mat,
                              matvec_q_batched_submit<GGML_TYPE_Q8_0>(
+                                 c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
+                break;
+            case GGML_TYPE_MXFP4:
+                moearc_track(c, "mvq_batched MXFP4", n_rows, n_mat,
+                             matvec_q_batched_submit<GGML_TYPE_MXFP4>(
                                  c->q, out, t, n_mat, x, x_stride, n_rows, n_cols));
                 break;
             default:
@@ -1321,7 +1398,8 @@ int moearc_softmax(moearc_ctx *c, float *out, const float *x, const float *mask,
 // deliberately keeps ggml's iterated form so the test measures the gap rather than hiding it.
 int moearc_rope(moearc_ctx *c, float *dst, const float *src, const int *pos,
                 unsigned long n_tokens, unsigned long n_heads, unsigned long head_dim,
-                unsigned long n_dims, float freq_base, int neox) {
+                unsigned long n_dims, float freq_base, float freq_scale, float ext_factor,
+                float attn_factor, float corr_lo, float corr_hi, int neox) {
     if (!c || !dst || !src || !pos) return ERR;
     if (n_dims == 0 || n_dims % 2 != 0 || n_dims > head_dim) return ERR_ARG;
     if (n_tokens == 0 || n_heads == 0) return OK;
@@ -1357,9 +1435,34 @@ int moearc_rope(moearc_ctx *c, float *dst, const float *src, const int *pos,
                 i0 = lo;
             }
 
-            const float theta = (float) pos[t] * sycl::pow(theta_scale, (float) i0 / 2.0f);
-            const float ct = sycl::cos(theta);
-            const float st = sycl::sin(theta);
+            // `rope_yarn` from `ggml/src/ggml-cpu/ops.cpp`, transcribed.
+            //
+            // 🔴 There is **no position gate**. `theta_interp = freq_scale * theta_extrap` runs
+            // before the branch, and the only thing the ramp consults is `i0` — the *dimension*.
+            // A model with `rope.scaling.type = yarn` is scaled from position 0; there is no
+            // regime below `original_context_length` in which plain RoPE is equivalent.
+            //
+            // 🔴 The magnitude scaling is likewise unconditional whenever `ext_factor != 0`, and
+            // it is applied **here**, not by the caller: llama.cpp computes
+            // `cparams.yarn_attn_factor` and then divides it by `1 + 0.1*ln(1/freq_scale)`
+            // precisely so this line can multiply it back. The value arriving as `attn_factor`
+            // is 1.0 for gpt-oss and the effective mscale is 1.3466. Passing the paper's mscale
+            // in from outside squares it.
+            //
+            // With `freq_scale = 1` and `ext_factor = 0` — every non-YaRN model — this is
+            // `theta_extrap` and a multiply by 1.0f, both exact, so no existing model moves.
+            const float theta_extrap = (float) pos[t] * sycl::pow(theta_scale, (float) i0 / 2.0f);
+            float theta = freq_scale * theta_extrap;
+            float mscale = attn_factor;
+            if (ext_factor != 0.0f) {
+                const float y = ((float) (i0 / 2) - corr_lo) / sycl::fmax(0.001f, corr_hi - corr_lo);
+                const float ramp = 1.0f - sycl::fmin(1.0f, sycl::fmax(0.0f, y));
+                const float ramp_mix = ramp * ext_factor;
+                theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+            }
+            const float ct = sycl::cos(theta) * mscale;
+            const float st = sycl::sin(theta) * mscale;
             const float x0 = s[lo];
             const float x1 = s[hi];
             o[d] = is_lo ? (x0 * ct - x1 * st) : (x0 * st + x1 * ct);
@@ -1391,9 +1494,10 @@ int moearc_rope(moearc_ctx *c, float *dst, const float *src, const int *pos,
 // matvecs it gates.
 int moearc_topk_router(moearc_ctx *c, unsigned int *idx, float *weights, const float *logits,
                        unsigned long n_tokens, unsigned long n_expert, unsigned int k,
-                       int normalize) {
+                       unsigned int gating) {
     if (!c || !idx || !weights || !logits) return ERR;
     if (k == 0 || k > (unsigned int) MAX_TOPK || (unsigned long) k > n_expert) return ERR_ARG;
+    if (gating > 2u) return ERR_ARG;
     if (n_tokens == 0) return OK;
     try {
         c->q.parallel_for(
@@ -1444,22 +1548,123 @@ int moearc_topk_router(moearc_ctx *c, unsigned int *idx, float *weights, const f
                    // would change the router's weights in the last bits — a change to the
                    // model's arithmetic, bought for a few microseconds on a 64-element sum.
                    if (lid == 0) {
+                       for (unsigned int r = 0; r < k; ++r) {
+                           idx[t * k + r] = (unsigned int) sel[r];
+                       }
+                       if (gating == 2u) {
+                           // 🔴 gpt-oss: the softmax is over the **k selected logits only**,
+                           // taken *after* the top-k — `LAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT`
+                           // sets `probs = logits` and defers `ggml_soft_max` until after
+                           // `ggml_get_rows`. The selection is identical either way (softmax is
+                           // monotonic) but the weights are not: a softmax over 128 experts
+                           // renormalised to 4 is a different vector from a softmax over those
+                           // 4, and the difference lands on every expert's contribution.
+                           float smax = NEG_MAX;
+                           for (unsigned int r = 0; r < k; ++r) smax = sycl::fmax(smax, l[sel[r]]);
+                           float d2 = 0.0f;
+                           for (unsigned int r = 0; r < k; ++r) d2 += sycl::exp(l[sel[r]] - smax);
+                           for (unsigned int r = 0; r < k; ++r) {
+                               weights[t * k + r] = sycl::exp(l[sel[r]] - smax) / d2;
+                           }
+                           return;
+                       }
                        float denom = 0.0f;
                        for (size_t j = 0; j < n_expert; ++j) denom += sycl::exp(l[j] - mx);
 
                        float wsum = 0.0f;
                        for (unsigned int r = 0; r < k; ++r) {
                            const float w = sycl::exp(l[sel[r]] - mx) / denom;
-                           idx[t * k + r] = (unsigned int) sel[r];
                            weights[t * k + r] = w;
                            wsum += w;
                        }
-                       if (normalize) {
+                       if (gating == 1u) {
                            const float clamped = sycl::fmax(wsum, 6.103515625e-5f);
                            for (unsigned int r = 0; r < k; ++r) weights[t * k + r] /= clamped;
                        }
                    }
                });
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// The OpenAI MoE activation — `ggml_swiglu_oai`, `ggml/src/ggml-cpu/ops.cpp`:
+//
+//     x = min(gate, limit)
+//     y = clamp(up, -limit, limit)
+//     out = (x / (1 + exp(-alpha * x))) * (y + 1)
+//
+// 🔴 Three departures from plain SwiGLU, each of which leaves a running model that is quietly
+// wrong rather than an error:
+//
+//  - the gate is clamped **on one side only** (`min`, unbounded below) while the up branch is
+//    clamped on both;
+//  - there is a **`+ 1` on the up branch**, so an up projection of zero passes the gate
+//    through rather than annihilating it;
+//  - the sigmoid is **alpha-scaled** (`alpha = 1.702`), which is the tanh-free GELU
+//    approximation, not SiLU.
+//
+// `alpha` and `limit` are hard-coded constants in llama.cpp (`llama-graph.cpp`,
+// `LLM_FFN_SWIGLU_OAI_MOE`) rather than hparams, but they are passed in here so the kernel
+// states its arithmetic rather than hiding two magic numbers.
+static inline float swiglu_oai_one(float g, float u, float alpha, float limit) {
+    const float x = sycl::fmin(g, limit);
+    const float y = sycl::fmin(sycl::fmax(u, -limit), limit);
+    return (x / (1.0f + sycl::exp(alpha * (-x)))) * (y + 1.0f);
+}
+
+int moearc_swiglu_oai(moearc_ctx *c, float *out, const float *gate, const float *up,
+                      unsigned long n, float alpha, float limit) {
+    if (!c || !out || !gate || !up) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) {
+            out[it[0]] = swiglu_oai_one(gate[it[0]], up[it[0]], alpha, limit);
+        });
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// `moearc_swiglu_oai` for the case where both halves came out of one batched launch and lie end
+// to end in one buffer — the counterpart of `moearc_swiglu_halves`.
+int moearc_swiglu_oai_halves(moearc_ctx *c, float *out, const float *gu, unsigned long n,
+                             float alpha, float limit) {
+    if (!c || !out || !gu) return ERR;
+    if (n == 0) return OK;
+    try {
+        c->q.parallel_for(range<1>{n}, [=](id<1> it) {
+            out[it[0]] = swiglu_oai_one(gu[it[0]], gu[n + it[0]], alpha, limit);
+        });
+        return OK;
+    } catch (...) { return ERR; }
+}
+
+// Add a per-expert bias row to each matrix of a batched matvec's output:
+//
+//     out[m * n_rows + r] += bias[idx[m] * n_rows + r]
+//
+// gpt-oss carries an f32 bias for every expert of every bank, and llama.cpp applies it with
+// `ggml_add_id` — a gather by the router's own selection — immediately after each
+// `mul_mat_id` and *before* the activation and the weighted combine. That ordering is why this
+// is a separate launch rather than something folded into `moearc_moe_combine`: the down bias is
+// inside the weighting, not outside it.
+//
+// `idx` is a host array of `n_mat` bank-relative row-group indices, copied into a by-value
+// struct for the same reason `mat_table` is one — a table in device memory would need an
+// upload, and `moearc_copy_h2d` drains the in-order queue.
+int moearc_add_bias_id(moearc_ctx *c, float *out, const float *bias, const unsigned int *idx,
+                       unsigned int n_mat, unsigned long n_rows) {
+    if (!c || !out || !bias || !idx) return ERR;
+    if (n_mat == 0 || n_rows == 0) return OK;
+    if (n_mat > (unsigned int) MAX_BATCHED_MATS) return ERR_ARG;
+    idx_table t{};
+    for (unsigned int i = 0; i < n_mat; ++i) t.i[i] = idx[i];
+    try {
+        c->q.parallel_for(range<1>{(size_t) n_mat * n_rows}, [=](id<1> it) {
+            const size_t g = it[0];
+            const size_t m = g / n_rows;
+            const size_t r = g - m * n_rows;
+            out[g] += bias[(size_t) t.i[m] * n_rows + r];
+        });
         return OK;
     } catch (...) { return ERR; }
 }
@@ -1621,7 +1826,7 @@ int moearc_kv_append(moearc_ctx *c, void *k_pages, void *v_pages, const float *k
 // 🔴 Unoptimised: one work-group of `head_dim` lanes per head, one whole-group reduction per
 // cached key. There is no tiling, no shared memory staging of K, and no vectorised load.
 int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_pages,
-                       const void *v_pages, const unsigned int *block_table,
+                       const void *v_pages, const unsigned int *block_table, const float *sinks,
                        unsigned long n_heads, unsigned long n_kv_heads, unsigned long head_dim,
                        unsigned long n_kv, unsigned long page_tokens, float scale,
                        unsigned int kv_type) {
@@ -1644,8 +1849,22 @@ int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_
                    const size_t kvh = h / group;
                    const float qv = q[h * head_dim + d];
 
-                   float m = -3.402823466e+38f;  // running max of the scores seen so far
-                   float l = 0.0f;               // running softmax denominator
+                   // 🔴 An attention **sink** is one extra logit per query head that enters the
+                   // softmax denominator and has no value vector — `ggml_soft_max_add_sinks`,
+                   // which llama.cpp's `build_attn` folds in for gpt-oss. Seeding the online
+                   // softmax with it (`m = s_h`, `l = exp(s_h - s_h) = 1`, `acc = 0`) is exactly
+                   // the `max = MAX(max, sk)` / `sum += expf(sk - max)` pair in
+                   // `ggml-cpu/ops.cpp`, expressed in the running form.
+                   //
+                   // The consequence is that the attention weights **do not sum to one**: the
+                   // sink drains mass. Omitting it leaves every head's output uniformly too
+                   // large on every block from the first token, with nothing to point at.
+                   //
+                   // 🔴 The sink is compared against scores that have already been scaled by
+                   // `scale`, and is itself raw. That is llama.cpp's order, not a choice here.
+                   const bool have_sink = sinks != nullptr;
+                   float m = have_sink ? sinks[h] : -3.402823466e+38f;  // running max
+                   float l = have_sink ? 1.0f : 0.0f;  // running softmax denominator
                    float acc = 0.0f;             // running sum of p_j * V_j, this lane's channel
 
                    for (size_t j = 0; j < n_kv; ++j) {

@@ -201,6 +201,8 @@ fn the_threaded_executor_reproduces_the_single_threaded_expert() {
         n_expert_used: info.active_experts as usize,
         n_embd: specs[0].gate.n_cols,
         n_ff: specs[0].gate.n_rows,
+        expert_bias: false,
+        act: moearc_engine::moe::Activation::Swiglu,
     };
     // Deliberately more than one thread and more than one expert: the fork-join, the barrier
     // between the two phases and the router-weighted combine are all only exercised together.

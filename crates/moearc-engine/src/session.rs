@@ -168,12 +168,36 @@ impl Session {
                 EngineError::Unsupported(format!("could not start the device thread: {e}"))
             })?;
 
+        // 🔴 Every failure path **joins the device thread** before it returns, and that is not
+        // tidiness — it is the difference between a clean error and a SIGSEGV.
+        //
+        // A load that gets as far as `Weights::upload` has put gigabytes of USM on the card. When
+        // it then fails, the worker returns and runs the whole teardown — thousands of
+        // `moearc_free_device` calls and a SYCL queue destructor — on a thread this function was
+        // about to **detach** by dropping its `JoinHandle`. The caller meanwhile prints the error
+        // and, in a one-shot tool, returns from `main`. Process exit runs the SYCL and Level Zero
+        // atexit handlers *concurrently with* that teardown, and the crash lands after the error
+        // message, which reads as "this project is broken" rather than "my driver is too old".
+        //
+        // ⚠️ It is a race, so it does not reproduce on a machine whose load succeeds, or whose
+        // main thread happens to be slower than the teardown. Joining removes the race rather
+        // than shortening it. The wait is bounded: the worker has already sent its reply and has
+        // nothing left to do but drop.
+        let joined = |t: JoinHandle<()>, e: EngineError| -> EngineError {
+            let _ = t.join();
+            e
+        };
         let info = match rep_rx.recv() {
             Ok(Reply::Ready(info)) => *info,
-            Ok(Reply::Failed(m)) => return Err(EngineError::Unsupported(m)),
+            Ok(Reply::Failed(m)) => {
+                return Err(joined(thread, EngineError::Unsupported(m)));
+            }
             _ => {
-                return Err(EngineError::Unsupported(
-                    "the device thread stopped before reporting a model".to_string(),
+                return Err(joined(
+                    thread,
+                    EngineError::Unsupported(
+                        "the device thread stopped before reporting a model".to_string(),
+                    ),
                 ));
             }
         };
@@ -416,6 +440,21 @@ impl Drop for Session {
     }
 }
 
+/// The text a failed load reports.
+///
+/// The reply channel carries a `String`, not an `EngineError`, so the variant is lost crossing
+/// the thread and `load_with` has to rebuild one — and it can only pick `Unsupported`, whose
+/// `Display` prepends `unsupported model: `. For an error that was *already* `Unsupported` that
+/// stutters: `unsupported model: unsupported model: ...`. Unwrapping it here keeps the sentence
+/// a reader actually sees to one prefix. This is the string a stranger with the wrong driver
+/// meets, so it is worth the six lines.
+fn failure_text(e: &EngineError) -> String {
+    match e {
+        EngineError::Unsupported(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// The device thread. Everything it owns is a stack local, so the borrows are ordinary.
 fn worker(
     path: &Path,
@@ -450,14 +489,14 @@ fn worker(
     let mapped = match MappedModel::open(path) {
         Ok(v) => std::sync::Arc::new(v),
         Err(e) => {
-            let _ = tx.send(Reply::Failed(EngineError::from(e).to_string()));
+            let _ = tx.send(Reply::Failed(failure_text(&EngineError::from(e))));
             return;
         }
     };
     let ctx = match Context::new() {
         Ok(v) => v,
         Err(e) => {
-            let _ = tx.send(Reply::Failed(EngineError::from(e).to_string()));
+            let _ = tx.send(Reply::Failed(failure_text(&EngineError::from(e))));
             return;
         }
     };
@@ -467,7 +506,7 @@ fn worker(
         None => match Config::from_model(&mapped) {
             Ok(c) => c.n_ctx_train,
             Err(e) => {
-                let _ = tx.send(Reply::Failed(e.to_string()));
+                let _ = tx.send(Reply::Failed(failure_text(&e)));
                 return;
             }
         },
@@ -476,7 +515,7 @@ fn worker(
     let mut model = match Model::new_hybrid(&ctx, &mapped, n_ctx, residency, host) {
         Ok(m) => m,
         Err(e) => {
-            let _ = tx.send(Reply::Failed(e.to_string()));
+            let _ = tx.send(Reply::Failed(failure_text(&e)));
             return;
         }
     };

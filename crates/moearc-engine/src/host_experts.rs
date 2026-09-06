@@ -52,8 +52,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use moearc_kernels::QuantType;
-use moearc_kernels::reference::f16_to_f32;
-use moearc_model::tensors::{ExpertBank, MappedModel};
+use moearc_kernels::reference::{KVALUES_MXFP4, e8m0_half, f16_to_f32};
+use moearc_model::tensors::{ExpertBank, MappedModel, names};
+
+use crate::moe::Activation;
 
 /// Why the host executor could not start or run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +182,9 @@ impl BankSpec {
     }
 
     fn check(&self, what: &str) -> Result<(), HostError> {
-        if !matches!(self.ty, QuantType::Q4K | QuantType::Q6K) {
+        if !matches!(self.ty, QuantType::Q4K | QuantType::Q6K | QuantType::Mxfp4) {
             return Err(HostError::Unsupported(format!(
-                "{what} is {:?}; only Q4_K and Q6_K have host kernels",
+                "{what} is {:?}; only Q4_K, Q6_K and MXFP4 have host kernels",
                 self.ty
             )));
         }
@@ -205,7 +207,13 @@ pub struct BlockSpec {
 }
 
 /// What the executor needs to know about the model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 🔴 The last two fields are graph facts, not shapes, and they are here because the host path
+/// must compute the **same function** as the device path. An executor that ran plain SwiGLU
+/// where the device ran `swiglu_oai`, or skipped a bias the device applied, would produce a
+/// model whose output changed with the host policy — and the policy is a performance knob.
+/// `tests/host_experts_gpu.rs` asserts that it does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
     pub n_block: usize,
     pub n_expert: usize,
@@ -213,6 +221,10 @@ pub struct Geometry {
     pub n_expert_used: usize,
     pub n_embd: usize,
     pub n_ff: usize,
+    /// Whether each expert bank carries a per-expert f32 bias.
+    pub expert_bias: bool,
+    /// The activation the gate and up projections feed.
+    pub act: Activation,
 }
 
 // =======================================================================================
@@ -281,6 +293,8 @@ struct Job {
     spec: BlockSpec,
     /// `[gate, up, down]` per routed expert, in the order the router named them.
     banks: Vec<[Weights; 3]>,
+    /// `[gate, up, down]` biases for the same experts, or empty when the model has none.
+    bias: Vec<[Weights; 3]>,
     /// The block's post-norm activation, `n_embd` long.
     x: Vec<f32>,
     /// `x` summed in groups of 32 — what the Q4_K kernel needs to hoist the block minimum out
@@ -301,6 +315,7 @@ impl Job {
         Self {
             spec: BlockSpec { gate: NO_BANK, up: NO_BANK, down: NO_BANK },
             banks: Vec::new(),
+            bias: Vec::new(),
             x: Vec::new(),
             xsum: Vec::new(),
             n_experts: 0,
@@ -335,6 +350,11 @@ struct Shared {
     n_threads: usize,
     /// `[(block * 3 + bank) * n_expert + expert]`, resolved once through `MappedModel::expert`.
     table: Vec<Weights>,
+    /// The same index over the expert biases, or empty. Unlike `table` these **are** derived by
+    /// arithmetic, and legitimately so: a bias is a plain contiguous f32 matrix whose shape the
+    /// header states outright (`[n_ff, n_expert]`, `[n_embd, n_expert]`), and that shape is
+    /// checked against the tensor's own dimensions before a single offset is taken.
+    bias_table: Vec<Weights>,
 
     stop: AtomicBool,
     /// Bumped by `submit`. Workers wait for it to move.
@@ -480,6 +500,47 @@ impl HostExecutor {
             }
         }
 
+        // The per-expert biases, sliced out of three plain f32 matrices per block.
+        let mut bias_table = Vec::new();
+        if geom.expert_bias {
+            for b in 0..geom.n_block {
+                for (bank, (suffix, rows)) in [
+                    (names::FFN_GATE_EXPS_BIAS, geom.n_ff),
+                    (names::FFN_UP_EXPS_BIAS, geom.n_ff),
+                    (names::FFN_DOWN_EXPS_BIAS, geom.n_embd),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let v = mapped
+                        .block_tensor(b as u32, suffix)
+                        .map_err(|e| HostError::Unsupported(e.to_string()))?;
+                    // 🔴 Checked, not assumed. The offsets below are arithmetic, and arithmetic
+                    // on a shape read wrongly indexes into a neighbouring expert's bias — which
+                    // is finite, small, and invisible in the output.
+                    if v.dims != [rows as u64, geom.n_expert as u64] {
+                        return Err(HostError::Unsupported(format!(
+                            "`{}` is {:?}; expected [{rows}, {}]",
+                            v.name, v.dims, geom.n_expert
+                        )));
+                    }
+                    if v.data.len() != rows * geom.n_expert * 4 {
+                        return Err(HostError::Unsupported(format!(
+                            "`{}` holds {} B for {rows} x {} f32",
+                            v.name,
+                            v.data.len(),
+                            geom.n_expert
+                        )));
+                    }
+                    debug_assert_eq!(bias_table.len(), (b * 3 + bank) * geom.n_expert);
+                    for e in 0..geom.n_expert {
+                        bias_table
+                            .push(Weights { ptr: v.data[e * rows * 4..].as_ptr(), len: rows * 4 });
+                    }
+                }
+            }
+        }
+
         let cap = geom.n_expert_used;
         let n_threads = n_threads.max(1);
         let shared = Arc::new(Shared {
@@ -487,6 +548,7 @@ impl HostExecutor {
             geom,
             n_threads,
             table,
+            bias_table,
             stop: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             acks: (0..n_threads).map(|_| AtomicU64::new(0)).collect(),
@@ -574,6 +636,7 @@ impl HostExecutor {
         job.spec = spec;
         job.n_experts = experts.len();
         job.banks.clear();
+        job.bias.clear();
         let banks = [spec.gate, spec.up, spec.down];
         for (e, _) in experts {
             let at = |bank: usize| self.shared.table[(block * 3 + bank) * g.n_expert + *e as usize];
@@ -595,6 +658,12 @@ impl HostExecutor {
                 }
             }
             job.banks.push(w);
+            if g.expert_bias {
+                let bat = |bank: usize| {
+                    self.shared.bias_table[(block * 3 + bank) * g.n_expert + *e as usize]
+                };
+                job.bias.push([bat(0), bat(1), bat(2)]);
+            }
         }
         job.x.clear();
         job.x.extend_from_slice(x);
@@ -769,7 +838,26 @@ fn run_job(s: &Shared) {
         let act = unsafe { s.act.range_mut(e * g.n_ff + r0, r1 - r0) };
         let gate = unsafe { job.banks[e][0].as_slice() };
         let up = unsafe { job.banks[e][1].as_slice() };
-        swiglu_rows(job.spec.gate, gate, job.spec.up, up, &job.x, &job.xsum, r0, r1, act);
+        // SAFETY: the bias views point into the same mapping `Shared` keeps alive, and are
+        // never written.
+        let (gb, ub) = match job.bias.get(e) {
+            Some(b) => unsafe { (Some(b[0].as_slice()), Some(b[1].as_slice())) },
+            None => (None, None),
+        };
+        swiglu_rows(
+            job.spec.gate,
+            gate,
+            gb,
+            job.spec.up,
+            up,
+            ub,
+            &job.x,
+            &job.xsum,
+            r0,
+            r1,
+            act,
+            g.act,
+        );
         if s.done_a.fetch_add(1, Ordering::AcqRel) + 1 == total_a {
             // The last worker out of phase A prepares what phase B needs. Here rather than in
             // every phase-B task, so it stays O(experts) instead of O(tasks).
@@ -812,7 +900,9 @@ fn run_job(s: &Shared) {
         let axs = unsafe { s.xsum_act.range(e * per_xsum, per_xsum) };
         let o = unsafe { s.out.range_mut(e * g.n_embd + r0, r1 - r0) };
         let down = unsafe { job.banks[e][2].as_slice() };
-        matvec_rows(job.spec.down, down, a, axs, r0, r1, o);
+        // SAFETY: as above.
+        let db = job.bias.get(e).map(|b| unsafe { b[2].as_slice() });
+        matvec_rows(job.spec.down, down, db, a, axs, r0, r1, o);
         if s.done_b.fetch_add(1, Ordering::AcqRel) + 1 == total_b {
             s.busy_nanos.fetch_add(job.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
@@ -960,6 +1050,45 @@ fn dot_q6k(w: &[u8], x: &[f32], nb: usize) -> f32 {
     acc
 }
 
+/// One f32 out of a bias row, read byte-wise.
+///
+/// The mapping is aligned enough in practice; reading it byte-wise makes that irrelevant, and
+/// it costs one load per *row*, against a dot product of thousands of elements.
+#[inline(always)]
+fn ld_f32(b: &[u8], i: usize) -> f32 {
+    f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+}
+
+/// One row's dot product against MXFP4 weights.
+///
+/// 🔴 Simpler than the K-quants, and deliberately not written like them. There is no block
+/// minimum, so there is nothing for the `xsum` trick to hoist: one block is
+/// `d * sum(kvalues[q] * x)` and that is the whole of it. There is also no sub-block structure —
+/// the block *is* the 32-element unit.
+///
+/// The two nibbles of `qs[j]` are elements `j` and `j + 16`, the **halves** of the block. The
+/// two accumulators keep the halves apart so the compiler can vectorise each, and they are
+/// summed at the end; the order differs from `reference::dequant` followed by a serial dot, and
+/// float addition is not associative, so this is a different rounding — the same licence the
+/// device kernel's tree reduction already takes.
+#[inline(always)]
+fn dot_mxfp4(w: &[u8], x: &[f32], nb: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for b in 0..nb {
+        let blk = &w[b * 17..b * 17 + 17];
+        let d = e8m0_half(blk[0]);
+        let xs = &x[b * 32..b * 32 + 32];
+        let (mut lo, mut hi) = (0.0f32, 0.0f32);
+        for l in 0..16 {
+            let byte = blk[1 + l];
+            lo += f32::from(KVALUES_MXFP4[(byte & 0x0F) as usize]) * xs[l];
+            hi += f32::from(KVALUES_MXFP4[(byte >> 4) as usize]) * xs[l + 16];
+        }
+        acc += d * (lo + hi);
+    }
+    acc
+}
+
 /// One row's dot product, dispatched on the bank's format.
 ///
 /// 🔴 Returns NaN rather than a plausible number for a format with no host kernel.
@@ -970,6 +1099,7 @@ fn dot_row(ty: QuantType, row: &[u8], x: &[f32], xsum: &[f32]) -> f32 {
     match ty {
         QuantType::Q4K => dot_q4k(row, x, xsum, x.len() / 256),
         QuantType::Q6K => dot_q6k(row, x, x.len() / 256),
+        QuantType::Mxfp4 => dot_mxfp4(row, x, x.len() / 32),
         _ => f32::NAN,
     }
 }
@@ -979,27 +1109,49 @@ fn dot_row(ty: QuantType, row: &[u8], x: &[f32], xsum: &[f32]) -> f32 {
 fn swiglu_rows_body(
     gs: BankSpec,
     g: &[u8],
+    gb: Option<&[u8]>,
     us: BankSpec,
     u: &[u8],
+    ub: Option<&[u8]>,
     x: &[f32],
     xsum: &[f32],
     r0: usize,
     r1: usize,
     act: &mut [f32],
+    activation: Activation,
 ) {
     let (grb, urb) = (gs.row_bytes(), us.row_bytes());
     for r in r0..r1 {
-        let gv = dot_row(gs.ty, &g[r * grb..r * grb + grb], x, xsum);
-        let uv = dot_row(us.ty, &u[r * urb..r * urb + urb], x, xsum);
-        // `silu(gate) * up`, exactly as `reference::swiglu` writes it.
-        act[r - r0] = (gv / (1.0 + (-gv).exp())) * uv;
+        let mut gv = dot_row(gs.ty, &g[r * grb..r * grb + grb], x, xsum);
+        let mut uv = dot_row(us.ty, &u[r * urb..r * urb + urb], x, xsum);
+        // 🔴 The bias goes on before the activation, which is where `ggml_add_id` sits — after
+        // each `mul_mat_id` and before the GLU. Adding it afterwards would put it outside a
+        // clamp and outside a sigmoid.
+        if let Some(b) = gb {
+            gv += ld_f32(b, r);
+        }
+        if let Some(b) = ub {
+            uv += ld_f32(b, r);
+        }
+        act[r - r0] = match activation {
+            // `silu(gate) * up`, exactly as `reference::swiglu` writes it.
+            Activation::Swiglu => (gv / (1.0 + (-gv).exp())) * uv,
+            // `reference::swiglu_oai`, term for term.
+            Activation::SwigluOai { alpha, limit } => {
+                let xg = gv.min(limit);
+                let yu = uv.clamp(-limit, limit);
+                (xg / (1.0 + (alpha * -xg).exp())) * (yu + 1.0)
+            }
+        };
     }
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn matvec_rows_body(
     spec: BankSpec,
     w: &[u8],
+    bias: Option<&[u8]>,
     x: &[f32],
     xsum: &[f32],
     r0: usize,
@@ -1008,7 +1160,13 @@ fn matvec_rows_body(
 ) {
     let rb = spec.row_bytes();
     for r in r0..r1 {
-        out[r - r0] = dot_row(spec.ty, &w[r * rb..r * rb + rb], x, xsum);
+        let mut v = dot_row(spec.ty, &w[r * rb..r * rb + rb], x, xsum);
+        // 🔴 Inside the router's weighting: `sync` multiplies this by the expert's weight, and
+        // `build_moe_ffn` adds the down bias before it multiplies too.
+        if let Some(b) = bias {
+            v += ld_f32(b, r);
+        }
+        out[r - r0] = v;
     }
 }
 
@@ -1031,59 +1189,69 @@ fn have_avx2() -> bool {
 unsafe fn swiglu_rows_avx2(
     gs: BankSpec,
     g: &[u8],
+    gb: Option<&[u8]>,
     us: BankSpec,
     u: &[u8],
+    ub: Option<&[u8]>,
     x: &[f32],
     xsum: &[f32],
     r0: usize,
     r1: usize,
     act: &mut [f32],
+    activation: Activation,
 ) {
-    swiglu_rows_body(gs, g, us, u, x, xsum, r0, r1, act);
+    swiglu_rows_body(gs, g, gb, us, u, ub, x, xsum, r0, r1, act, activation);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 /// # Safety
 /// The target must support AVX2 and FMA; checked by [`have_avx2`].
+#[allow(clippy::too_many_arguments)]
 unsafe fn matvec_rows_avx2(
     spec: BankSpec,
     w: &[u8],
+    bias: Option<&[u8]>,
     x: &[f32],
     xsum: &[f32],
     r0: usize,
     r1: usize,
     out: &mut [f32],
 ) {
-    matvec_rows_body(spec, w, x, xsum, r0, r1, out);
+    matvec_rows_body(spec, w, bias, x, xsum, r0, r1, out);
 }
 
-/// `act[r - r0] = silu(gate_r . x) * (up_r . x)` for `r0..r1`.
+/// `act[r - r0] = activation(gate_r . x + gb_r, up_r . x + ub_r)` for `r0..r1`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn swiglu_rows(
     gs: BankSpec,
     g: &[u8],
+    gb: Option<&[u8]>,
     us: BankSpec,
     u: &[u8],
+    ub: Option<&[u8]>,
     x: &[f32],
     xsum: &[f32],
     r0: usize,
     r1: usize,
     act: &mut [f32],
+    activation: Activation,
 ) {
     #[cfg(target_arch = "x86_64")]
     if have_avx2() {
         // SAFETY: guarded by the runtime feature check.
-        unsafe { swiglu_rows_avx2(gs, g, us, u, x, xsum, r0, r1, act) };
+        unsafe { swiglu_rows_avx2(gs, g, gb, us, u, ub, x, xsum, r0, r1, act, activation) };
         return;
     }
-    swiglu_rows_body(gs, g, us, u, x, xsum, r0, r1, act);
+    swiglu_rows_body(gs, g, gb, us, u, ub, x, xsum, r0, r1, act, activation);
 }
 
-/// `out[r - r0] = row_r . x` for `r0..r1`.
+/// `out[r - r0] = row_r . x + bias_r` for `r0..r1`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matvec_rows(
     spec: BankSpec,
     w: &[u8],
+    bias: Option<&[u8]>,
     x: &[f32],
     xsum: &[f32],
     r0: usize,
@@ -1093,10 +1261,10 @@ pub(crate) fn matvec_rows(
     #[cfg(target_arch = "x86_64")]
     if have_avx2() {
         // SAFETY: guarded by the runtime feature check.
-        unsafe { matvec_rows_avx2(spec, w, x, xsum, r0, r1, out) };
+        unsafe { matvec_rows_avx2(spec, w, bias, x, xsum, r0, r1, out) };
         return;
     }
-    matvec_rows_body(spec, w, x, xsum, r0, r1, out);
+    matvec_rows_body(spec, w, bias, x, xsum, r0, r1, out);
 }
 
 /// `x` summed in groups of 32, which is what a Q4_K row needs to hoist its block minimum out of
@@ -1112,12 +1280,39 @@ pub fn group_sums(x: &[f32]) -> Vec<f32> {
 /// and the same activation — without standing up a thread pool, and so that the threaded path
 /// has something to be checked against that is not itself threaded.
 pub fn expert_ffn(spec: BlockSpec, gate: &[u8], up: &[u8], down: &[u8], x: &[f32]) -> Vec<f32> {
+    expert_ffn_ext(spec, gate, up, down, [None; 3], x, Activation::Swiglu)
+}
+
+/// [`expert_ffn`] with per-expert biases and a chosen activation — what gpt-oss needs.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_ffn_ext(
+    spec: BlockSpec,
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    bias: [Option<&[u8]>; 3],
+    x: &[f32],
+    activation: Activation,
+) -> Vec<f32> {
     let xs = group_sums(x);
     let mut act = vec![0.0f32; spec.gate.n_rows];
-    swiglu_rows(spec.gate, gate, spec.up, up, x, &xs, 0, spec.gate.n_rows, &mut act);
+    swiglu_rows(
+        spec.gate,
+        gate,
+        bias[0],
+        spec.up,
+        up,
+        bias[1],
+        x,
+        &xs,
+        0,
+        spec.gate.n_rows,
+        &mut act,
+        activation,
+    );
     let axs = group_sums(&act);
     let mut out = vec![0.0f32; spec.down.n_rows];
-    matvec_rows(spec.down, down, &act, &axs, 0, spec.down.n_rows, &mut out);
+    matvec_rows(spec.down, down, bias[2], &act, &axs, 0, spec.down.n_rows, &mut out);
     out
 }
 
@@ -1190,7 +1385,7 @@ mod tests {
         let xs = group_sums(&x);
         let want = reference::matvec_q(ty, &w, &x, n_rows, n_cols);
         let mut got = vec![0.0f32; n_rows];
-        matvec_rows(BankSpec { ty, n_rows, n_cols }, &w, &x, &xs, 0, n_rows, &mut got);
+        matvec_rows(BankSpec { ty, n_rows, n_cols }, &w, None, &x, &xs, 0, n_rows, &mut got);
         let mut worst = 0.0f32;
         for (a, b) in got.iter().zip(&want) {
             let scale = b.abs().max(1.0);

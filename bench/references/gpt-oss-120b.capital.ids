@@ -1,0 +1,27 @@
+# llama.cpp's greedy continuation, for `hybrid_sweep`, `residency_sweep` and the forward-pass
+# gate in `crates/moearc-engine/tests/gptoss_forward.rs`.
+#
+# model     gpt-oss-120b-MXFP4.gguf  (gpt-oss, 36 blocks, 128 experts, 4 active, MXFP4)
+# prompt    "The capital city of France is"  ->  976 9029 5030 328 10128 382
+#           tokenised with add_bos = false, which is what this file's
+#           `tokenizer.ggml.add_bos_token` says.
+# produced  llama-eval-callback with MOEARC_GREEDY_N=64, -ngl 0 (CPU backend)
+# llama.cpp e107984bcffcfd701e82738092a2b000b6fda7a2
+#
+# 🔴 Verified identical on llama.cpp's own two backends — `-ngl 0` (CPU) and
+# `-ngl 99 --n-cpu-moe 31` (SYCL) — before it was adopted. A greedy id is only a decision where
+# the top two logits are further apart than the arithmetic difference between implementations,
+# and on this model that difference reaches max|d| = 0.29 on the logit vector. The continuation
+# below is a repeating nine-token cycle whose winner clears the runner-up by about 2.8.
+#
+# ⚠️ The sequence is 64 tokens and this model's sliding window is 128, so nothing here is
+# affected by the SWA that `moe.rs` does not implement.
+
+12650 13 279 976 9029 5030 328 10128 382
+12650 13 279 976 9029 5030 328 10128 382
+12650 13 279 976 9029 5030 328 10128 382
+12650 13 279 976 9029 5030 328 10128 382
+12650 13 279 976 9029 5030 328 10128 382
+12650 13 279 976 9029 5030 328 10128 382
+12650 13 279 976 9029 5030 328 10128 382
+12650

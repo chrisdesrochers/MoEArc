@@ -129,7 +129,8 @@
 use std::sync::Arc;
 
 use moearc_kernels::{
-    Context, DeviceBuffer, KernelError, KvType, MAX_BATCHED_MATS, QuantType, RopeKind,
+    Context, DeviceBuffer, Gating, KernelError, KvType, MAX_BATCHED_MATS, QuantType, RopeKind,
+    RopeScaling,
 };
 use moearc_model::gguf::Value;
 use moearc_model::tensors::{ExpertBank, MappedModel, TensorView, names};
@@ -230,6 +231,29 @@ pub enum Arch {
     Olmoe,
     /// `qwen3moe` — Qwen3-30B-A3B and siblings: real GQA, per-head QK-norm, normalised router.
     Qwen3Moe,
+    /// `gpt-oss` — GPT-OSS-20B/120B. The same skeleton as the other two and different in six
+    /// places, every one of which runs and is wrong if left out: **biases on every projection
+    /// and every expert bank**, a **per-head attention sink**, **no QK-norm**, an
+    /// **alpha-scaled, clamped SwiGLU with a `+1` on the up branch**, a router that
+    /// **softmaxes after the top-k rather than before**, and **YaRN RoPE that engages from
+    /// position 0**. Its experts are **MXFP4**, which is not a K-quant.
+    ///
+    /// ⚠️ It also declares `attention.sliding_window = 128`, which this pass does **not**
+    /// implement — see [`Config::n_swa`].
+    GptOss,
+}
+
+/// What an expert's gate and up projections feed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Activation {
+    /// `silu(gate) * up` — the ordinary gated FFN.
+    Swiglu,
+    /// `ggml_swiglu_oai`: `(min(g, limit) * sigmoid(alpha * min(g, limit))) *
+    /// (clamp(u, -limit, limit) + 1)`.
+    ///
+    /// 🔴 `alpha` and `limit` are hard-coded constants at llama.cpp's `LLM_FFN_SWIGLU_OAI_MOE`
+    /// call site, not GGUF keys, so they are carried here rather than read from the file.
+    SwigluOai { alpha: f32, limit: f32 },
 }
 
 /// The model's geometry, read from the GGUF header — never assumed.
@@ -256,14 +280,45 @@ pub struct Config {
     pub rms_eps: f32,
     pub rope_freq_base: f32,
     /// Whether QK-norm normalises each head on its own (`qwen3moe`) or the whole projection at
-    /// once (`olmoe`). Checked against the length of `attn_q_norm.weight`.
+    /// once (`olmoe`). Checked against the length of `attn_q_norm.weight`. Meaningless when
+    /// [`Config::has_qk_norm`] is false.
     pub qk_norm_per_head: bool,
-    /// `build_moe_ffn`'s `norm_w`: whether the selected experts' weights are divided by their
-    /// sum. True for `qwen3moe`, false for `olmoe`.
+    /// Whether the architecture normalises Q and K at all. `gpt-oss` does not.
+    pub has_qk_norm: bool,
+    /// How the router turns logits into weights — llama.cpp's `norm_w` and `gating_op`
+    /// together.
     ///
-    /// 🔴 Not derivable from the file. It is a property of llama.cpp's call site, and nothing in
-    /// a GGUF records it — which is exactly why architectures are allowlisted above.
-    pub normalize_router_weights: bool,
+    /// 🔴 Not derivable from the file. It is a property of llama.cpp's `build_moe_ffn` call
+    /// site, and nothing in a GGUF records it — which is exactly why architectures are
+    /// allowlisted above.
+    pub gating: Gating,
+    /// The expert activation. Also a call-site property, also unrecorded in the file.
+    pub act: Activation,
+    /// YaRN, when the file declares `rope.scaling.type = yarn`.
+    ///
+    /// 🔴 `Some` means it applies at **every** position, including the first. llama.cpp's
+    /// `rope_yarn` has no position gate; see [`RopeScaling`].
+    pub rope_scaling: Option<RopeScaling>,
+    /// `attention.sliding_window`, when the file declares one.
+    ///
+    /// 🔴 This pass does **not** implement sliding-window attention. The value is carried so
+    /// that a session longer than the window can be refused by name rather than silently
+    /// attending to keys llama.cpp would have masked. Below the window an SWA mask and a plain
+    /// causal mask are the same mask — `is_masked_swa` masks on `p1 - p0 >= n_swa`, which no
+    /// pair of positions inside one window satisfies — so a short context is exact, not
+    /// approximate.
+    pub n_swa: Option<usize>,
+    /// The per-block suffix of the pre-FFN norm. `gpt-oss` spells it
+    /// `post_attention_norm.weight`; everything else here spells it `ffn_norm.weight`.
+    pub ffn_norm: &'static str,
+    /// Whether the Q, K, V and output projections carry biases.
+    pub has_attn_bias: bool,
+    /// Whether each block carries a per-head attention sink.
+    pub has_sinks: bool,
+    /// Whether the router logits carry a bias, added **before** the top-k.
+    pub has_router_bias: bool,
+    /// Whether each expert bank carries a per-expert bias.
+    pub has_expert_bias: bool,
     pub bos: Option<u32>,
     pub eos: Option<u32>,
 }
@@ -296,10 +351,11 @@ impl Config {
         let kind = match arch.as_str() {
             "olmoe" => Arch::Olmoe,
             "qwen3moe" => Arch::Qwen3Moe,
+            "gpt-oss" => Arch::GptOss,
             _ => {
                 return Err(EngineError::Unsupported(format!(
-                    "this forward pass implements `olmoe` and `qwen3moe`; the file declares \
-                     `{arch}`"
+                    "this forward pass implements `olmoe`, `qwen3moe` and `gpt-oss`; the file \
+                     declares `{arch}`"
                 )));
             }
         };
@@ -353,7 +409,11 @@ impl Config {
         // size every scratch buffer eight times too large and read past every expert's rows.
         let n_ff = match kind {
             Arch::Olmoe => need("feed_forward_length")? as usize,
-            Arch::Qwen3Moe => need("expert_feed_forward_length")? as usize,
+            // 🔴 `gpt-oss` states both keys and they happen to be equal (2880) on the 120B, so
+            // this file would run either way. `load_arch_hparams` reads `n_ff_exp`, so this
+            // does too: an equality that holds in one checkpoint is not a reason to read the
+            // other key.
+            Arch::Qwen3Moe | Arch::GptOss => need("expert_feed_forward_length")? as usize,
         };
         // The bank's own middle dimension is the same number, so disagreement means the key was
         // read wrongly — checked rather than trusted, because the failure is silent.
@@ -396,32 +456,134 @@ impl Config {
                 EngineError::Unsupported("no attention.layer_norm_rms_epsilon".to_string())
             })?;
 
-        // 🔴 The two graph switches that no GGUF key records. They come from llama.cpp's source
-        // — `load_arch_tensors`' norm shapes and the `norm_w` argument to `build_moe_ffn` — and
-        // are the reason `Arch` is an allowlist rather than a hint.
-        let (qk_norm_per_head, normalize_router_weights) = match kind {
-            Arch::Olmoe => (false, false),
-            Arch::Qwen3Moe => (true, true),
+        // 🔴 The graph switches that no GGUF key records. Every one comes from llama.cpp's
+        // source — `load_arch_tensors`' norm shapes, and `build_moe_ffn`'s `norm_w`,
+        // `gating_op` and `type_op` arguments — and they are the reason `Arch` is an allowlist
+        // rather than a hint. A file that is *nearly* one of these still needs a new arm.
+        let (qk_norm_per_head, has_qk_norm, gating, act, ffn_norm) = match kind {
+            Arch::Olmoe => (false, true, Gating::Softmax, Activation::Swiglu, names::FFN_NORM),
+            Arch::Qwen3Moe => {
+                (true, true, Gating::SoftmaxNormalised, Activation::Swiglu, names::FFN_NORM)
+            }
+            // `alpha` and `limit` are `constexpr` at llama.cpp's `LLM_FFN_SWIGLU_OAI_MOE` case,
+            // not hparams, so they are transcribed rather than read.
+            Arch::GptOss => (
+                false,
+                false,
+                Gating::SoftmaxAfterTopK,
+                Activation::SwigluOai { alpha: 1.702, limit: 7.0 },
+                names::POST_ATTENTION_NORM,
+            ),
         };
+        let n_embd_q = n_head * head_dim;
+        let n_embd_kv = n_head_kv * head_dim;
         // The QK-norm span is checkable, so it is checked. `attn_q_norm.weight` is `head_dim`
         // long under per-head normalisation and as wide as the projection otherwise; a file that
         // disagrees would be normalised over the wrong axis and never say so.
-        let n_embd_q = n_head * head_dim;
-        let n_embd_kv = n_head_kv * head_dim;
-        for (suffix, want) in [
-            (names::ATTN_Q_NORM, if qk_norm_per_head { head_dim } else { n_embd_q }),
-            (names::ATTN_K_NORM, if qk_norm_per_head { head_dim } else { n_embd_kv }),
-        ] {
-            let t = model.block_tensor(0, suffix)?;
-            let got = t.dims.iter().product::<u64>() as usize;
-            if got != want {
-                return Err(EngineError::Unsupported(format!(
-                    "`{}` is {got} long; `{arch}` normalises {} and needs {want}",
-                    t.name,
-                    if qk_norm_per_head { "each head" } else { "the whole projection" },
-                )));
+        if has_qk_norm {
+            for (suffix, want) in [
+                (names::ATTN_Q_NORM, if qk_norm_per_head { head_dim } else { n_embd_q }),
+                (names::ATTN_K_NORM, if qk_norm_per_head { head_dim } else { n_embd_kv }),
+            ] {
+                let t = model.block_tensor(0, suffix)?;
+                let got = t.dims.iter().product::<u64>() as usize;
+                if got != want {
+                    return Err(EngineError::Unsupported(format!(
+                        "`{}` is {got} long; `{arch}` normalises {} and needs {want}",
+                        t.name,
+                        if qk_norm_per_head { "each head" } else { "the whole projection" },
+                    )));
+                }
+            }
+        } else if model.optional_block_tensor(0, names::ATTN_Q_NORM)?.is_some() {
+            // The switch says this architecture has no QK-norm and the file disagrees. Rather
+            // than silently ignore a weight the model was trained with, say so.
+            return Err(EngineError::Unsupported(format!(
+                "`{arch}` is implemented without QK-norm, but the file carries \
+                 `blk.0.{}`",
+                names::ATTN_Q_NORM
+            )));
+        }
+
+        // 🔴 The optional tensors are discovered, not assumed — and then required to be
+        // *consistent across blocks*, because a bias that exists in block 0 and not in block 12
+        // would be applied to a third of the model and skipped for the rest.
+        let has = |suffix: &str| -> Result<bool, EngineError> {
+            Ok(model.optional_block_tensor(0, suffix)?.is_some())
+        };
+        let has_attn_bias = has(names::ATTN_Q_BIAS)?;
+        let has_sinks = has(names::ATTN_SINKS)?;
+        let has_router_bias = has(names::FFN_GATE_INP_BIAS)?;
+        let has_expert_bias = has(names::FFN_GATE_EXPS_BIAS)?;
+        if has_attn_bias {
+            for suffix in [names::ATTN_K_BIAS, names::ATTN_V_BIAS, names::ATTN_OUTPUT_BIAS] {
+                if !has(suffix)? {
+                    return Err(EngineError::Unsupported(format!(
+                        "`{arch}` carries `{}` but not `{suffix}`; this pass applies the four \
+                         attention biases together or not at all",
+                        names::ATTN_Q_BIAS
+                    )));
+                }
             }
         }
+        if has_expert_bias {
+            for suffix in [names::FFN_UP_EXPS_BIAS, names::FFN_DOWN_EXPS_BIAS] {
+                if !has(suffix)? {
+                    return Err(EngineError::Unsupported(format!(
+                        "`{arch}` carries `{}` but not `{suffix}`",
+                        names::FFN_GATE_EXPS_BIAS
+                    )));
+                }
+            }
+        }
+
+        // 🔴 YaRN is not a long-context-only correction. `rope_yarn` interpolates every
+        // frequency and rescales every magnitude from position 0; the only thing its ramp
+        // consults is the channel index. So this is read whenever the file declares it, and a
+        // model that declares it and is run without it is wrong on its first token.
+        let rope_freq_base = f32_key(model, &format!("{arch}.rope.freq_base")).unwrap_or(10_000.0);
+        let n_ctx_orig =
+            u64_key_opt(model, &format!("{arch}.rope.scaling.original_context_length"));
+        let scaling_type = match model.header().get(&format!("{arch}.rope.scaling.type")) {
+            Some(Value::String(v)) => Some(v.as_str()),
+            _ => None,
+        };
+        let rope_scaling = match (scaling_type, n_ctx_orig) {
+            (None, _) => None,
+            (Some("none"), _) | (Some("linear"), None) => None,
+            (Some("yarn"), Some(orig)) => {
+                let factor =
+                    f32_key(model, &format!("{arch}.rope.scaling.factor")).ok_or_else(|| {
+                        EngineError::Unsupported(
+                            "rope.scaling.type is yarn with no rope.scaling.factor".to_string(),
+                        )
+                    })?;
+                // llama.cpp's own defaults when the keys are absent
+                // (`llama_model_default_params`): beta_fast 32, beta_slow 1.
+                let beta_fast =
+                    f32_key(model, &format!("{arch}.rope.scaling.yarn_beta_fast")).unwrap_or(32.0);
+                let beta_slow =
+                    f32_key(model, &format!("{arch}.rope.scaling.yarn_beta_slow")).unwrap_or(1.0);
+                Some(RopeScaling::yarn(
+                    n_rot,
+                    orig as usize,
+                    rope_freq_base,
+                    factor,
+                    beta_fast,
+                    beta_slow,
+                ))
+            }
+            (Some(other), _) => {
+                return Err(EngineError::Unsupported(format!(
+                    "`{arch}` declares rope.scaling.type = `{other}`; this pass implements \
+                     plain RoPE and YaRN"
+                )));
+            }
+        };
+
+        let n_swa = u64_key_opt(model, &format!("{arch}.attention.sliding_window"))
+            .filter(|w| *w > 0)
+            .map(|w| w as usize);
 
         Ok(Self {
             n_block,
@@ -436,9 +598,18 @@ impl Config {
             n_vocab,
             n_ctx_train: need("context_length")? as usize,
             rms_eps,
-            rope_freq_base: f32_key(model, &format!("{arch}.rope.freq_base")).unwrap_or(10_000.0),
+            rope_freq_base,
             qk_norm_per_head,
-            normalize_router_weights,
+            has_qk_norm,
+            gating,
+            act,
+            rope_scaling,
+            n_swa,
+            ffn_norm,
+            has_attn_bias,
+            has_sinks,
+            has_router_bias,
+            has_expert_bias,
             bos: u64_key_opt(model, "tokenizer.ggml.bos_token_id").map(|v| v as u32),
             eos: u64_key_opt(model, "tokenizer.ggml.eos_token_id").map(|v| v as u32),
             arch,
@@ -519,12 +690,34 @@ struct Block<'c> {
     attn_k: QTensor<'c>,
     attn_v: QTensor<'c>,
     attn_output: QTensor<'c>,
-    attn_q_norm: DeviceBuffer<'c>,
-    attn_k_norm: DeviceBuffer<'c>,
+    /// QK-norm, where the architecture has it.
+    attn_q_norm: Option<DeviceBuffer<'c>>,
+    attn_k_norm: Option<DeviceBuffer<'c>>,
+    /// The four projection biases, applied before RoPE on Q and K and after the output matmul.
+    attn_q_bias: Option<DeviceBuffer<'c>>,
+    attn_k_bias: Option<DeviceBuffer<'c>>,
+    attn_v_bias: Option<DeviceBuffer<'c>>,
+    attn_output_bias: Option<DeviceBuffer<'c>>,
+    /// One sink logit per **query** head.
+    attn_sinks: Option<DeviceBuffer<'c>>,
     ffn_norm: DeviceBuffer<'c>,
     /// `[n_embd, n_expert]`. Uploaded as a matrix rather than assumed f32, so a quantised
     /// router in some other build would still be read through the right kernel.
     ffn_gate_inp: QTensor<'c>,
+    /// The router's bias, added to the logits **before** the top-k.
+    ffn_gate_inp_bias: Option<DeviceBuffer<'c>>,
+    /// The gate and up expert biases, **concatenated** into one buffer of
+    /// `[2 * n_expert, n_ff]` f32 rows: gate's experts first, then up's.
+    ///
+    /// 🔴 One buffer rather than two because the gate and up projections are computed in a
+    /// *single* batched launch whose output is one buffer of `2k` matrices, and
+    /// [`Context::add_bias_id`] indexes one bank. Concatenating lets the same call bias both
+    /// halves — expert `e`'s gate row is `e`, its up row is `n_expert + e` — and keeps the
+    /// fusion that the batched matvec exists for.
+    gate_up_bias: Option<DeviceBuffer<'c>>,
+    /// The down expert bias, `[n_expert, n_embd]`. Applied to each expert's output **before**
+    /// the router's weight multiplies it, which is where `ggml_add_id` sits in `build_moe_ffn`.
+    down_bias: Option<DeviceBuffer<'c>>,
     /// The shape of an expert in each bank. The weights themselves are **not** here: they are
     /// staged into pool slots on demand, straight out of the mapping.
     gate: BankShape,
@@ -585,12 +778,32 @@ impl<'c> Weights<'c> {
                 names::ATTN_K,
                 names::ATTN_V,
                 names::ATTN_OUTPUT,
-                names::ATTN_Q_NORM,
-                names::ATTN_K_NORM,
-                names::FFN_NORM,
+                cfg.ffn_norm,
                 names::FFN_GATE_INP,
             ] {
                 bytes += model.block_tensor(b, s)?.data.len() as u64;
+            }
+            // 🔴 Counted from what the file actually carries, not from the architecture's
+            // switches. gpt-oss's expert biases alone are 159 MiB across 36 blocks — f32, and
+            // therefore resident rather than streamed — and a `dense_bytes` that omitted them
+            // would under-report the always-resident half by that much, which is exactly the
+            // number a residency plan divides the card by.
+            for s in [
+                names::ATTN_Q_NORM,
+                names::ATTN_K_NORM,
+                names::ATTN_Q_BIAS,
+                names::ATTN_K_BIAS,
+                names::ATTN_V_BIAS,
+                names::ATTN_OUTPUT_BIAS,
+                names::ATTN_SINKS,
+                names::FFN_GATE_INP_BIAS,
+                names::FFN_GATE_EXPS_BIAS,
+                names::FFN_UP_EXPS_BIAS,
+                names::FFN_DOWN_EXPS_BIAS,
+            ] {
+                if let Some(v) = model.optional_block_tensor(b, s)? {
+                    bytes += v.data.len() as u64;
+                }
             }
             for s in [names::FFN_GATE_EXPS, names::FFN_UP_EXPS, names::FFN_DOWN_EXPS] {
                 expert_bytes += model.block_tensor(b, s)?.data.len() as u64;
@@ -598,6 +811,14 @@ impl<'c> Weights<'c> {
 
             let simple = |suffix: &str| -> Result<DeviceBuffer<'c>, EngineError> {
                 upload(ctx, &model.block_tensor(b, suffix)?)
+            };
+            // Present-or-absent is a fact about the file; `Config` has already refused a file
+            // whose blocks disagree with the architecture about which of these exist.
+            let opt = |suffix: &str| -> Result<Option<DeviceBuffer<'c>>, EngineError> {
+                match model.optional_block_tensor(b, suffix)? {
+                    Some(v) => Ok(Some(upload(ctx, &v)?)),
+                    None => Ok(None),
+                }
             };
             let matrix = |suffix: &str| -> Result<QTensor<'c>, EngineError> {
                 upload_matrix(ctx, &model.block_tensor(b, suffix)?)
@@ -624,16 +845,43 @@ impl<'c> Weights<'c> {
                 slot_bank_bytes[i] = slot_bank_bytes[i].max(sh.bytes);
             }
 
+            // The gate and up expert biases, laid end to end so one `add_bias_id` covers the
+            // fused launch. Concatenated on the host because a `DeviceBuffer` is written from
+            // its start and this crate has no offset upload; it is 2.9 MiB per block, once, at
+            // load.
+            let gate_up_bias = match (
+                model.optional_block_tensor(b, names::FFN_GATE_EXPS_BIAS)?,
+                model.optional_block_tensor(b, names::FFN_UP_EXPS_BIAS)?,
+            ) {
+                (Some(gb), Some(ub)) => {
+                    let mut joined = Vec::with_capacity(gb.data.len() + ub.data.len());
+                    joined.extend_from_slice(gb.data);
+                    joined.extend_from_slice(ub.data);
+                    let buf = ctx.alloc(joined.len())?;
+                    ctx.upload(&buf, &joined)?;
+                    Some(buf)
+                }
+                _ => None,
+            };
+
             blocks.push(Block {
                 attn_norm: simple(names::ATTN_NORM)?,
                 attn_q: matrix(names::ATTN_Q)?,
                 attn_k: matrix(names::ATTN_K)?,
                 attn_v: matrix(names::ATTN_V)?,
                 attn_output: matrix(names::ATTN_OUTPUT)?,
-                attn_q_norm: simple(names::ATTN_Q_NORM)?,
-                attn_k_norm: simple(names::ATTN_K_NORM)?,
-                ffn_norm: simple(names::FFN_NORM)?,
+                attn_q_norm: opt(names::ATTN_Q_NORM)?,
+                attn_k_norm: opt(names::ATTN_K_NORM)?,
+                attn_q_bias: opt(names::ATTN_Q_BIAS)?,
+                attn_k_bias: opt(names::ATTN_K_BIAS)?,
+                attn_v_bias: opt(names::ATTN_V_BIAS)?,
+                attn_output_bias: opt(names::ATTN_OUTPUT_BIAS)?,
+                attn_sinks: opt(names::ATTN_SINKS)?,
+                ffn_norm: simple(cfg.ffn_norm)?,
                 ffn_gate_inp: matrix(names::FFN_GATE_INP)?,
+                ffn_gate_inp_bias: opt(names::FFN_GATE_INP_BIAS)?,
+                gate_up_bias,
+                down_bias: opt(names::FFN_DOWN_EXPS_BIAS)?,
                 gate: g,
                 up: u,
                 down: d,
@@ -1213,6 +1461,28 @@ impl<'c, 'm> Model<'c, 'm> {
         let cfg = &weights.cfg;
         let n_slots = weights.n_slots();
 
+        // 🔴 Sliding-window attention is declared by `gpt-oss` and **not implemented here**.
+        //
+        // Below the window it does not have to be: llama.cpp masks a key when
+        // `p1 - p0 >= n_swa`, and no pair of positions inside a context of `n_swa` tokens
+        // satisfies that, so an SWA mask and a plain causal mask are the same mask and this
+        // pass is exact rather than approximate. Above it they diverge, silently and
+        // progressively — the first token past the window attends to one key llama.cpp has
+        // dropped, and the divergence grows from there.
+        //
+        // ⚠️ It is also **alternating**: `set_swa_pattern(2)` makes even blocks windowed and
+        // odd blocks full causal, so implementing it means two masks and two KV caches, not
+        // one shorter cache.
+        if cfg.n_swa.is_some_and(|w| n_ctx > w) {
+            let w = cfg.n_swa.unwrap_or_default();
+            return Err(EngineError::Unsupported(format!(
+                "`{}` uses sliding-window attention with a {w}-token window on alternating \
+                 blocks, which this forward pass does not implement; a context of {n_ctx} \
+                 tokens would diverge from llama.cpp past position {w}. Load with n_ctx <= {w}.",
+                cfg.arch
+            )));
+        }
+
         // A step activates `n_expert_used` distinct experts of one block, so no policy can serve
         // a pool smaller than that — `ExpertCache::admit` refuses it rather than thrashing, and
         // clamping here turns a confusing runtime refusal into a quiet, documented floor.
@@ -1276,6 +1546,10 @@ impl<'c, 'm> Model<'c, 'm> {
                     n_expert_used: cfg.n_expert_used,
                     n_embd: cfg.n_embd,
                     n_ff: cfg.n_ff,
+                    // 🔴 The host must compute the same function as the device or the model's
+                    // output would depend on the host policy, which is a performance knob.
+                    expert_bias: cfg.has_expert_bias,
+                    act: cfg.act,
                 },
                 &host_specs,
                 host_experts::default_threads(),
@@ -1431,47 +1705,71 @@ impl<'c, 'm> Model<'c, 'm> {
                 matvec(ctx, &st.q, &b.attn_q, &st.x)?;
                 matvec(ctx, &st.k, &b.attn_k, &st.x)?;
                 matvec(ctx, &st.v, &b.attn_v, &st.x)?;
+                // 🔴 Before RoPE, and before QK-norm where there is one — `build_qkv` adds the
+                // bias to the projection immediately and everything downstream sees the sum.
+                // `add` writes each index from the same index of both inputs, so aliasing the
+                // destination into the left operand is well defined.
+                if let Some(bias) = &b.attn_q_bias {
+                    ctx.add(&st.q, &st.q, bias, n_embd_q)?;
+                }
+                if let Some(bias) = &b.attn_k_bias {
+                    ctx.add(&st.k, &st.k, bias, n_embd_kv)?;
+                }
+                if let Some(bias) = &b.attn_v_bias {
+                    ctx.add(&st.v, &st.v, bias, n_embd_kv)?;
+                }
             }
 
-            // QK-norm, after the projections and before RoPE.
+            // QK-norm, after the projections and before RoPE — where the architecture has it.
             //
             // 🔴 What one norm covers is architecture-specific, and both spellings are the same
             // kernel with different row counts: `qwen3moe` normalises each head over `head_dim`
             // channels with a `head_dim`-wide weight broadcast across heads, `olmoe` normalises
-            // the whole projection in one row. Neither raises an error on the other's model.
-            {
+            // the whole projection in one row. Neither raises an error on the other's model —
+            // and `gpt-oss` has neither, which is a third silent difference: normalising a
+            // projection that was not trained normalised rescales every head.
+            let (q_src, k_src) = if cfg.has_qk_norm {
                 let _p = profile::scope("attn.qk_norm");
                 let (q_rows, q_cols, k_rows, k_cols) = if cfg.qk_norm_per_head {
                     (cfg.n_head, cfg.head_dim, cfg.n_head_kv, cfg.head_dim)
                 } else {
                     (1, n_embd_q, 1, n_embd_kv)
                 };
-                ctx.rmsnorm(&st.q_normed, &st.q, Some(&b.attn_q_norm), q_rows, q_cols, eps)?;
-                ctx.rmsnorm(&st.k_normed, &st.k, Some(&b.attn_k_norm), k_rows, k_cols, eps)?;
-            }
+                let (qn, kn) = (
+                    b.attn_q_norm.as_ref().expect("has_qk_norm implies the weight was uploaded"),
+                    b.attn_k_norm.as_ref().expect("has_qk_norm implies the weight was uploaded"),
+                );
+                ctx.rmsnorm(&st.q_normed, &st.q, Some(qn), q_rows, q_cols, eps)?;
+                ctx.rmsnorm(&st.k_normed, &st.k, Some(kn), k_rows, k_cols, eps)?;
+                (&st.q_normed, &st.k_normed)
+            } else {
+                (&st.q, &st.k)
+            };
 
             {
                 let _p = profile::scope("attn.rope");
-                ctx.rope(
+                ctx.rope_ext(
                     &st.q_roped,
-                    &st.q_normed,
+                    q_src,
                     &st.pos,
                     1,
                     cfg.n_head,
                     cfg.head_dim,
                     cfg.n_rot,
                     cfg.rope_freq_base,
+                    cfg.rope_scaling,
                     RopeKind::Neox,
                 )?;
-                ctx.rope(
+                ctx.rope_ext(
                     &st.k_roped,
-                    &st.k_normed,
+                    k_src,
                     &st.pos,
                     1,
                     cfg.n_head_kv,
                     cfg.head_dim,
                     cfg.n_rot,
                     cfg.rope_freq_base,
+                    cfg.rope_scaling,
                     RopeKind::Neox,
                 )?;
             }
@@ -1493,12 +1791,13 @@ impl<'c, 'm> Model<'c, 'm> {
             }
             {
                 let _p = profile::scope("attn.attend");
-                ctx.attn_decode(
+                ctx.attn_decode_ext(
                     &st.attn,
                     &st.q_roped,
                     &st.k_pages[bi],
                     &st.v_pages[bi],
                     &st.block_table,
+                    b.attn_sinks.as_ref(),
                     cfg.n_head,
                     cfg.n_head_kv,
                     cfg.head_dim,
@@ -1511,6 +1810,9 @@ impl<'c, 'm> Model<'c, 'm> {
             {
                 let _p = profile::scope("attn.proj");
                 matvec(ctx, &st.proj, &b.attn_output, &st.attn)?;
+                if let Some(bias) = &b.attn_output_bias {
+                    ctx.add(&st.proj, &st.proj, bias, n_embd)?;
+                }
                 // `add` writes each index from the same index of both inputs, so aliasing the
                 // accumulator into the left operand is well defined.
                 ctx.add(&st.h, &st.h, &st.proj, n_embd)?;
@@ -1527,10 +1829,31 @@ impl<'c, 'm> Model<'c, 'm> {
                 matvec(ctx, &st.router, &b.ffn_gate_inp, &st.x)?;
             }
             tap_record(&mut st.tap, format!("ffn_moe_logits-{bi}"), ctx, &st.router, cfg.n_expert)?;
-            // `normalize` is llama.cpp's `norm_w`: false for OLMoE, whose weights stay raw
-            // softmax probabilities that do not sum to one, true for Qwen3, which divides them
-            // by their sum. The kernel clamps that sum up to `6.103515625e-5` exactly as
-            // `build_moe_ffn`'s `ggml_clamp` does.
+            if let Some(bias) = &b.ffn_gate_inp_bias {
+                // 🔴 Before the top-k, not after. `build_moe_ffn` adds `gate_inp_b` to the
+                // logits and *then* selects, so the bias changes which experts run, not only how
+                // much each contributes.
+                let _p = profile::scope("moe.router");
+                ctx.add(&st.router, &st.router, bias, cfg.n_expert)?;
+                // ⚠️ Tapped under llama.cpp's name for it, which is **`ffn_moe_probs`** and not
+                // `ffn_moe_logits_biased`. Both `cb()` calls name the same node — `probs =
+                // logits` under `SOFTMAX_WEIGHT` is an assignment, not an operation — and the
+                // second rename wins, so the earlier name never reaches a dump. This tap is
+                // emitted only where a router bias exists, which is the only case in which
+                // `ffn_moe_probs` means the biased logits rather than a softmax of them.
+                tap_record(
+                    &mut st.tap,
+                    format!("ffn_moe_probs-{bi}"),
+                    ctx,
+                    &st.router,
+                    cfg.n_expert,
+                )?;
+            }
+            // [`Gating`] is llama.cpp's `norm_w` and `gating_op` together: raw softmax
+            // probabilities that do not sum to one for OLMoE, the same divided by their sum for
+            // Qwen3 (clamped up to `6.103515625e-5`, exactly as `ggml_clamp` does), and for
+            // gpt-oss a softmax over the k selected logits taken *after* the top-k. All three
+            // select the same experts and weight them differently.
             {
                 let _p = profile::scope("moe.topk");
                 ctx.topk_router(
@@ -1540,7 +1863,7 @@ impl<'c, 'm> Model<'c, 'm> {
                     1,
                     cfg.n_expert,
                     cfg.n_expert_used,
-                    cfg.normalize_router_weights,
+                    cfg.gating,
                 )?;
             }
             {
@@ -1718,13 +2041,44 @@ impl<'c, 'm> Model<'c, 'm> {
                             b.up.n_cols,
                         )?;
                     }
+                    // 🔴 `ggml_add_id` immediately after each `mul_mat_id`, before the
+                    // activation. `gate_up_bias` holds both banks end to end, so expert `e`'s
+                    // gate row is `e` and its up row is `n_expert + e` — which is what lets one
+                    // call bias a fused launch's two halves and the fusion survive.
+                    if let Some(bias) = &b.gate_up_bias {
+                        let mut bidx = [0u32; MAX_BATCHED_MATS];
+                        for (i, e) in st.gpu_wanted.iter().enumerate() {
+                            bidx[i] = u32::from(e.expert);
+                            if fused {
+                                bidx[k + i] = cfg.n_expert as u32 + u32::from(e.expert);
+                            }
+                        }
+                        if fused {
+                            ctx.add_bias_id(&st.gate, bias, &bidx[..2 * k], b.gate.n_rows)?;
+                        } else {
+                            ctx.add_bias_id(&st.gate, bias, &bidx[..k], b.gate.n_rows)?;
+                            for (i, e) in st.gpu_wanted.iter().enumerate() {
+                                bidx[i] = cfg.n_expert as u32 + u32::from(e.expert);
+                            }
+                            ctx.add_bias_id(&st.up, bias, &bidx[..k], b.up.n_rows)?;
+                        }
+                    }
                 }
                 {
                     let _p = profile::scope("moe.swiglu");
-                    if fused {
-                        ctx.swiglu_halves(&st.act, &st.gate, k * cfg.n_ff)?;
-                    } else {
-                        ctx.swiglu(&st.act, &st.gate, &st.up, k * cfg.n_ff)?;
+                    match cfg.act {
+                        Activation::Swiglu if fused => {
+                            ctx.swiglu_halves(&st.act, &st.gate, k * cfg.n_ff)?;
+                        }
+                        Activation::Swiglu => {
+                            ctx.swiglu(&st.act, &st.gate, &st.up, k * cfg.n_ff)?;
+                        }
+                        Activation::SwigluOai { alpha, limit } if fused => {
+                            ctx.swiglu_oai_halves(&st.act, &st.gate, k * cfg.n_ff, alpha, limit)?;
+                        }
+                        Activation::SwigluOai { alpha, limit } => {
+                            ctx.swiglu_oai(&st.act, &st.gate, &st.up, k * cfg.n_ff, alpha, limit)?;
+                        }
                     }
                 }
                 {
@@ -1739,6 +2093,17 @@ impl<'c, 'm> Model<'c, 'm> {
                         b.down.n_rows,
                         b.down.n_cols,
                     )?;
+                    // 🔴 **Inside** the router's weighting, not outside it. `build_moe_ffn` adds
+                    // this bias to each expert's output and only then multiplies by that
+                    // expert's weight, so folding it into the combined result instead would
+                    // scale it by the sum of the weights rather than by each expert's own.
+                    if let Some(bias) = &b.down_bias {
+                        let mut bidx = [0u32; MAX_BATCHED_MATS];
+                        for (i, e) in st.gpu_wanted.iter().enumerate() {
+                            bidx[i] = u32::from(e.expert);
+                        }
+                        ctx.add_bias_id(&st.expert_out, bias, &bidx[..k], b.down.n_rows)?;
+                    }
                 }
                 {
                     // Writes rather than accumulates, so there is no zeroing pass ahead of it, and

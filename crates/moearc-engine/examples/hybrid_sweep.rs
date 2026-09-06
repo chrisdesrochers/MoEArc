@@ -149,10 +149,10 @@ fn main() -> ExitCode {
 
     println!("prompt {prompt:?}, {n_predict} tokens, {n_ctx} ctx\n");
     println!(
-        "| slots | host | threads | warm tok/s | vs stream | hit | staged MiB | cpu/step | \
-         cpu share | busy ms/tok | wait ms/tok | ids |"
+        "| slots | host | threads | cold tok/s | cold hit | cold staged MiB | warm tok/s | \
+         vs stream | hit | staged MiB | cpu/step | cpu share | busy ms/tok | wait ms/tok | ids |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 
     let mut failures = 0;
     for spec in &residencies {
@@ -190,8 +190,10 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             // The first pass fills the pool; the second is the steady state a served request
-            // meets. Only the second is reported — the cold pass is the same measurement the
-            // residency sweep already makes and it is dominated by staging either way.
+            // meets. **Both** are reported, and on a model many times the card the gap between
+            // them is the finding rather than a warm-up artefact: where the pool cannot hold a
+            // useful fraction of the experts, the second pass is as cold as the first and the
+            // two columns converge. Reporting only the warm number would hide exactly that.
             let cold = match run(&session, &prompt, n_predict) {
                 Ok(r) => r,
                 Err(e) => {
@@ -218,10 +220,13 @@ fn main() -> ExitCode {
                 Some(c) => format!("{:+.1}%", 100.0 * (toks / c - 1.0)),
             };
             println!(
-                "| {} | `{pol}` | {} | {:.2} | {rel} | {:.1}% | {:.0} | {:.2} | {:.1}% | {:.2} \
-                 | {:.2} | {v} |",
+                "| {} | `{pol}` | {} | {:.2} | {:.1}% | {:.0} | {:.2} | {rel} | {:.1}% | {:.0} \
+                 | {:.2} | {:.1}% | {:.2} | {:.2} | {v} |",
                 r0.resident_slots,
                 r0.host_threads,
+                cold.steps as f64 / cold.seconds,
+                100.0 * cold.hit_rate,
+                cold.staged_mib,
                 toks,
                 100.0 * warm.hit_rate,
                 warm.staged_mib,

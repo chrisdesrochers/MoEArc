@@ -130,6 +130,31 @@ unsafe extern "C" {
         gu: *const c_float,
         n: c_ulong,
     ) -> c_int;
+    pub fn moearc_swiglu_oai(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        gate: *const c_float,
+        up: *const c_float,
+        n: c_ulong,
+        alpha: c_float,
+        limit: c_float,
+    ) -> c_int;
+    pub fn moearc_swiglu_oai_halves(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        gu: *const c_float,
+        n: c_ulong,
+        alpha: c_float,
+        limit: c_float,
+    ) -> c_int;
+    pub fn moearc_add_bias_id(
+        c: *mut MoearcCtx,
+        out: *mut c_float,
+        bias: *const c_float,
+        idx: *const c_uint,
+        n_mat: c_uint,
+        n_rows: c_ulong,
+    ) -> c_int;
     pub fn moearc_softmax(
         c: *mut MoearcCtx,
         out: *mut c_float,
@@ -197,6 +222,7 @@ unsafe extern "C" {
         k_pages: *const c_void,
         v_pages: *const c_void,
         block_table: *const c_uint,
+        sinks: *const c_float,
         n_heads: c_ulong,
         n_kv_heads: c_ulong,
         head_dim: c_ulong,
@@ -216,6 +242,11 @@ unsafe extern "C" {
         head_dim: c_ulong,
         n_dims: c_ulong,
         freq_base: c_float,
+        freq_scale: c_float,
+        ext_factor: c_float,
+        attn_factor: c_float,
+        corr_lo: c_float,
+        corr_hi: c_float,
         neox: c_int,
     ) -> c_int;
     pub fn moearc_topk_router(
@@ -226,7 +257,7 @@ unsafe extern "C" {
         n_tokens: c_ulong,
         n_expert: c_ulong,
         k: c_uint,
-        normalize: c_int,
+        gating: c_uint,
     ) -> c_int;
 }
 
