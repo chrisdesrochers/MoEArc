@@ -1,0 +1,17 @@
+===== oss120-threads  2026-09-07T04:11:12+00:00
+model: gpt-oss-120b-MXFP4.gguf
+args:  -ncmoe 36 -t 16,8,12,16,20,24 -p 0 -n 64 -r 3
+GUARD ok after 92s: load1=2.43 busy=1.5%
+               total        used        free      shared  buff/cache   available
+Mem:           93705        8149       23493         302       63274       85555
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:12:47Z","2152827868","2223373","29.728362","0.030701"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","8","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:12:54Z","2810270411","4959466","22.773656","0.040208"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","12","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:13:03Z","2457464607","15924141","26.043828","0.168281"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:13:10Z","2177978629","10515596","29.385500","0.141483"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","20","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:13:17Z","2383142590","187874911","26.962148","2.033078"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","24","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:13:24Z","2355904505","59282279","27.177109","0.674911"
+exit: 0  elapsed: 47s
+post-run: load1=9.88 busy=1.6%
+disk_read_MiB: 70   arc_hits:+354951 arc_misses:+267
+

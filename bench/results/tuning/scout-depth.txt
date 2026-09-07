@@ -1,0 +1,15 @@
+===== scout-depth  2026-09-07T05:01:46+00:00
+model: Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf
+args:  -ncmoe 46 -t 16 -p 0 -n 64 -d 0,0,512,2048 -r 2
+GUARD ok after 112s: load1=2.43 busy=1.9%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       21022       25576         302       48428       72683
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","46","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T05:03:43Z","3401585942","3574894","18.814764","0.019773"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","46","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T05:03:51Z","3330633105","5951286","19.215597","0.034332"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","46","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","512","2026-09-07T05:03:58Z","3482179600","491754","18.379293","0.002558"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","46","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","2048","2026-09-07T05:04:14Z","3896588285","24467","16.424625","0.000103"
+exit: 0  elapsed: 69s
+post-run: load1=5.32 busy=2.3%
+disk_read_MiB: 548   arc_hits:+327738 arc_misses:+506
+

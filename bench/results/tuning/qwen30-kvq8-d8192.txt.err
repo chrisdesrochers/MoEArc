@@ -1,0 +1,17 @@
+level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+Exception caught at file:/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:5742, func:operator()
+SYCL error: CHECK_TRY_ERROR((stream)->wait()): Exception caught in this line of code.
+  in function ggml_backend_sycl_synchronize at /zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp:5742
+/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/../ggml-sycl/common.hpp:141: SYCL error
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(+0x17d48) [0x712d51695d48]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(ggml_print_backtrace+0x285) [0x712d51695d25]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(ggml_abort+0x109) [0x712d51694d99]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-sycl.so.0(+0x2256a8) [0x712d519946a8]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-sycl.so.0(+0x23982d) [0x712d519a882d]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(ggml_backend_sched_synchronize+0x40) [0x712d516bcaa0]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(_ZN13llama_context11synchronizeEv+0x19) [0x712d556c05c9]
+/zfs/swift/projects/llama.cpp/build/bin/libllama-bench-impl.so(+0x1deb6) [0x712d55e11eb6]
+/zfs/swift/projects/llama.cpp/build/bin/libllama-bench-impl.so(_Z11llama_benchiPPc+0x23e6) [0x712d55e0be86]
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x2a601) [0x712d50e2a601]
+/usr/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x88) [0x712d50e2a718]
+/zfs/swift/projects/llama.cpp/build/bin/llama-bench() [0x406425]

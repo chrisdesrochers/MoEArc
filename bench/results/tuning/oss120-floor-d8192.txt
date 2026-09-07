@@ -1,0 +1,25 @@
+===== oss120-floor-d8192  2026-09-07T04:50:48+00:00
+model: gpt-oss-120b-MXFP4.gguf
+args:  -ncmoe 34,34,33,32,31,30 -t 16 -p 0 -n 64 -d 8192 -r 3
+GUARD ok after 72s: load1=2.35 busy=1.3%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       20552       18557         469       55974       73153
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","34","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:52:52Z","2246852386","13156727","28.484941","0.166298"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","34","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:54:47Z","2254928527","15731969","28.383199","0.198762"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","33","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:55:22Z","2427743099","94148779","26.387905","1.004660"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","32","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:55:45Z","2814478816","450464282","23.114199","3.521130"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","31","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:56:10Z","2280445336","7682609","28.064906","0.094383"
+exit: 134  elapsed: 269s
+post-run: load1=6.76 busy=1.6%
+disk_read_MiB: 105518   arc_hits:+50958226 arc_misses:+110598
+--- stderr tail ---
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(_ZN13llama_context14process_ubatchERK12llama_ubatch14llm_graph_typeP22llama_memory_context_iR11ggml_status+0x12b) [0x7f0a19c8292b]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(_ZN13llama_context6decodeERK11llama_batch+0x942) [0x7f0a19c84932]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(llama_decode+0xb) [0x7f0a19c89c3b]
+/zfs/swift/projects/llama.cpp/build/bin/libllama-bench-impl.so(+0x1deaa) [0x7f0a1a3d0eaa]
+/zfs/swift/projects/llama.cpp/build/bin/libllama-bench-impl.so(_Z11llama_benchiPPc+0x23e6) [0x7f0a1a3cae86]
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x2a601) [0x7f0a1542a601]
+/usr/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x88) [0x7f0a1542a718]
+/zfs/swift/projects/llama.cpp/build/bin/llama-bench() [0x406425]
+

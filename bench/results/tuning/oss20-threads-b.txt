@@ -1,0 +1,24 @@
+===== oss20-threads-b  2026-09-07T03:45:53+00:00
+model: gpt-oss-20b-MXFP4.gguf
+args:  -ncmoe 24 -t 16,2,4,8,12,16,20,24 -p 0 -n 64 -r 3
+GUARD load1=7.12 busy=2.3% load average: 7.12, 3.50, 2.46
+REFUSE: load 7.12 > 2.5
+SKIPPED (guard)
+===== oss20-threads-b  2026-09-07T03:50:38+00:00
+model: gpt-oss-20b-MXFP4.gguf
+args:  -ncmoe 24 -t 16,2,4,8,12,16,20,24 -p 0 -n 64 -r 3
+GUARD ok after 92s: load1=2.30 busy=2.3%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       21572       31721         493       41815       72133
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","16","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:11Z","1487463987","18646047","43.030732","0.536072"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","2","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:16Z","5237662485","6392517","12.219203","0.014903"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","4","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:32Z","2920769379","1685945","21.912040","0.012650"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","8","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:41Z","1874235286","5074229","34.147427","0.092439"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","12","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:46Z","1610402476","1896274","39.741655","0.046800"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","16","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:51Z","1435263292","2168144","44.591189","0.067310"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","20","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:52:56Z","1517886183","20730822","42.169178","0.579821"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","24","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:53:00Z","1628218954","56036077","39.337991","1.361764"
+exit: 0  elapsed: 55s
+disk_read_MiB: 74   arc_hits:+28364 arc_misses:+1031
+

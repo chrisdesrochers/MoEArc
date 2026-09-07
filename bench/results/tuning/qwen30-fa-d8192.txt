@@ -1,0 +1,14 @@
+===== qwen30-fa-d8192  2026-09-07T05:18:00+00:00
+model: Qwen3-30B-A3B-Q4_K_M.gguf
+args:  -ncmoe 21 -t 16 -fa on,on,off -p 0 -n 64 -d 8192 -r 3
+GUARD ok after 2s: load1=1.51 busy=1.6%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       20966       23765         302       50186       72739
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","21","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:18:20Z","1204998679","908263","53.112112","0.040048"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","21","layer","0","0","1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:18:44Z","1237007145","5559563","51.738472","0.231995"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","21","layer","0","0","0","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:18:48Z","2096873939","9228029","30.522020","0.134647"
+exit: 0  elapsed: 75s
+post-run: load1=3.68 busy=1.5%
+disk_read_MiB: 18325   arc_hits:+9128263 arc_misses:+18060
+

@@ -1,0 +1,22 @@
+===== olmoe-depth  2026-09-07T03:45:59+00:00
+model: olmoe-1b-7b-0924-instruct-q4_k_m.gguf
+args:  -ncmoe 0 -t 16 -p 0 -n 64 -d 0,0,512,1024,2048,3072 -r 3
+GUARD load1=6.55 busy=1.2% load average: 6.55, 3.44, 2.44
+REFUSE: load 6.55 > 2.5
+SKIPPED (guard)
+===== olmoe-depth  2026-09-07T03:56:11+00:00
+model: olmoe-1b-7b-0924-instruct-q4_k_m.gguf
+args:  -ncmoe 0 -t 16 -p 0 -n 64 -d 0,0,512,1024,2048,3072 -r 3
+GUARD ok after 42s: load1=2.30 busy=1.3%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       21304       29772         494       44032       72400
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:56:55Z","226223351","335073","282.906662","0.418487"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:56:57Z","226304001","394659","282.806003","0.493687"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","512","2026-09-07T03:56:58Z","232073406","335629","275.775195","0.398339"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","1024","2026-09-07T03:57:00Z","243477790","251137","262.857837","0.270763"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","2048","2026-09-07T03:57:01Z","265107524","631613","241.412391","0.573991"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","3072","2026-09-07T03:57:02Z","291964852","30296","219.204468","0.013720"
+exit: 0  elapsed: 12s
+disk_read_MiB: 70   arc_hits:+21402 arc_misses:+15
+

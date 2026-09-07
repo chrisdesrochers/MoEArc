@@ -1,0 +1,20 @@
+===== oss20-endpoints  2026-09-07T03:45:55+00:00
+model: gpt-oss-20b-MXFP4.gguf
+args:  -ncmoe 24,0,24,0 -t 16 -p 0 -n 64 -r 3
+GUARD load1=7.12 busy=1.2% load average: 7.12, 3.50, 2.46
+REFUSE: load 7.12 > 2.5
+SKIPPED (guard)
+===== oss20-endpoints  2026-09-07T03:53:05+00:00
+model: gpt-oss-20b-MXFP4.gguf
+args:  -ncmoe 24,0,24,0 -t 16 -p 0 -n 64 -r 3
+GUARD ok after 92s: load1=2.40 busy=2.9%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       21821       29262         494       44026       71884
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","16","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:54:39Z","1472194403","1585880","43.472553","0.046791"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:54:49Z","1760696921","267055","36.349243","0.005513"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","16","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:54:56Z","1476124443","6805249","43.357392","0.199856"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-20b-MXFP4.gguf","gpt-oss 20B MXFP4 MoE","12096558336","20914757184","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T03:55:06Z","1760393741","220049","36.355503","0.004545"
+exit: 0  elapsed: 34s
+disk_read_MiB: 22   arc_hits:+11686 arc_misses:+81
+

@@ -1,0 +1,15 @@
+===== oss120-warm-d0  2026-09-07T04:56:31+00:00
+model: gpt-oss-120b-MXFP4.gguf
+args:  -ncmoe 36,36,34,31 -t 16 -p 0 -n 64 -r 3
+GUARD ok after 82s: load1=2.46 busy=1.6%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       14103       20491         319       60340       79602
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:57:57Z","2150923138","1879950","29.754681","0.025996"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:58:04Z","2150154598","304922","29.765302","0.004172"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","34","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:58:16Z","2162392571","8564100","29.597155","0.116987"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","31","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:58:30Z","2189164334","280565","29.234900","0.003747"
+exit: 0  elapsed: 45s
+post-run: load1=6.07 busy=1.5%
+disk_read_MiB: 559   arc_hits:+755431 arc_misses:+611
+

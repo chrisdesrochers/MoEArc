@@ -1,0 +1,2 @@
+level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)Exception caught at file:/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:5617
+Error OP MUL_MAT

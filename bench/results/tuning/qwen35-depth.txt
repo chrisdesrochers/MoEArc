@@ -1,0 +1,16 @@
+===== qwen35-depth  2026-09-07T04:46:53+00:00
+model: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+args:  -ncmoe 26 -t 16 -p 0 -n 64 -d 0,0,512,2048,8192 -r 3
+GUARD ok after 62s: load1=2.28 busy=1.2%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       20908       35599         312       38420       72797
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf","qwen35moe 35B.A3B Q4_K - Medium","22123538944","34660610688","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:48:15Z","1246785115","13465767","51.335989","0.551087"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf","qwen35moe 35B.A3B Q4_K - Medium","22123538944","34660610688","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","0","2026-09-07T04:48:20Z","1238769980","950756","51.664172","0.039641"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf","qwen35moe 35B.A3B Q4_K - Medium","22123538944","34660610688","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","512","2026-09-07T04:48:24Z","1196538160","8174511","53.489296","0.363993"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf","qwen35moe 35B.A3B Q4_K - Medium","22123538944","34660610688","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","2048","2026-09-07T04:48:30Z","1215074711","5644745","52.672415","0.244341"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf","qwen35moe 35B.A3B Q4_K - Medium","22123538944","34660610688","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:48:39Z","1250264136","6746483","51.190174","0.275377"
+exit: 0  elapsed: 72s
+post-run: load1=5.64 busy=2.7%
+disk_read_MiB: 18605   arc_hits:+9212116 arc_misses:+18555
+

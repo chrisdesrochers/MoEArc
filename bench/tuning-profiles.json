@@ -1,0 +1,450 @@
+{
+  "schema_version": 1,
+  "generated": "2026-09-07",
+  "source_doc": "bench/tuning-profiles.md",
+  "raw_data": "bench/results/tuning/",
+  "hardware": {
+    "gpu": "Intel(R) Arc(TM) B580 Graphics",
+    "gpu_selector": "level_zero:0",
+    "vram_total_mib": 12216,
+    "vram_free_at_load_mib": 11959,
+    "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+    "cpu_cores": 20,
+    "cpu_p_cores": 8,
+    "cpu_e_cores": 12,
+    "cpu_smt": false,
+    "ram_gib": 91,
+    "zfs_arc_max_gib": 16
+  },
+  "engine": {
+    "name": "llama.cpp",
+    "backend": "SYCL",
+    "build_commit": "e107984bc",
+    "build_number": 10788,
+    "binary": "build/bin/llama-bench"
+  },
+  "method": {
+    "test": "tg64",
+    "warmup": "first cell of every process discarded",
+    "repeats": "3-5 internal, pooled over independent invocations",
+    "noise_floor_pct": 3.0,
+    "decision_rule": "a setting is better only if it beats the alternative by more than the noise floor; ties resolve to the configuration with more VRAM headroom",
+    "load_gate": {
+      "loadavg_1min_max": 2.5,
+      "cpu_busy_pct_max": 12
+    }
+  },
+  "global_rules": [
+    {
+      "flag": "-t",
+      "value": 16,
+      "note": "never nproc (20) on this hybrid CPU; -t 20 lost on 5 of 6 models and was noisier",
+      "worth_max": "2.09x on gpt-oss-120b vs the llama-bench default of 4"
+    },
+    {
+      "flag": "-fa",
+      "value": "auto",
+      "note": "auto resolves to on; -fa off costs 1.72x at d8192 on Qwen3-30B"
+    },
+    {
+      "flag": "--cache-type-k/-v",
+      "value": "f16",
+      "note": "do NOT use q8_0 on Arc: -19% throughput, buys back only one -ncmoe block, and hard-aborts instead of returning OOM"
+    },
+    {
+      "flag": "-ngl",
+      "value": -1,
+      "note": "untested as a lever; -ncmoe does expert placement for MoE"
+    }
+  ],
+  "oom_signature": {
+    "error": "UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY (39)",
+    "sites": [
+      "ggml-sycl.cpp:5617 Error OP MUL_MAT",
+      "ggml-sycl.cpp:5155",
+      "memcpy in ggml_backend_sycl_set_tensor"
+    ],
+    "recovery": "retry with -ncmoe raised by 1"
+  },
+  "models": [
+    {
+      "file": "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+      "arch": "olmoe",
+      "size_gib": 3.92,
+      "blocks": 16,
+      "experts": 64,
+      "experts_active": 8,
+      "quant": "Q4_K_M",
+      "ctx_train": 4096,
+      "recommended": {
+        "n_cpu_moe": 0,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 0,
+        "4096": 0
+      },
+      "throughput_tg64": {
+        "0": 282.9,
+        "512": 275.78,
+        "1024": 262.86,
+        "2048": 241.41,
+        "3072": 219.2
+      },
+      "vram_mib": {
+        "ctx": 256,
+        "model": 3961.35,
+        "kv": 32.0,
+        "compute": 1.6,
+        "total": 3994.95,
+        "free": 7964
+      },
+      "knob_value": {
+        "threads": {
+          "ratio": 1.003,
+          "note": "worth nothing at ncmoe 0 (0.27% across t4-t20); worth 2.53x at ncmoe 16"
+        },
+        "ncmoe": {
+          "note": "strictly harmful: 0 -> 282.90, 2 -> 251.96, 4 -> 217.50, 8 -> 179.47, 16 -> 127.42"
+        }
+      }
+    },
+    {
+      "file": "gpt-oss-20b-MXFP4.gguf",
+      "arch": "gpt-oss",
+      "size_gib": 11.28,
+      "blocks": 24,
+      "experts": 32,
+      "experts_active": 4,
+      "quant": "MXFP4",
+      "ctx_train": 131072,
+      "recommended": {
+        "n_cpu_moe": 24,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 0,
+        "8192": 2
+      },
+      "throughput_tg64": {
+        "0": 44.02,
+        "512": 44.21,
+        "2048": 43.73,
+        "8192": 43.4,
+        "32768": 39.62,
+        "65536": 36.88
+      },
+      "throughput_d0_pooled": {
+        "mean": 44.25,
+        "stddev": 0.36,
+        "n": 4
+      },
+      "vram_mib": {
+        "ctx": 8448,
+        "model": 1242.03,
+        "kv": 216.0,
+        "compute": 404.0,
+        "total": 1862.03,
+        "free": 10097
+      },
+      "knob_value": {
+        "threads": {
+          "ratio": 3.66,
+          "note": "t2 12.16 -> t16 44.55; t4 (default) 21.65 = 2.06x loss"
+        },
+        "ncmoe": {
+          "ratio": 1.19,
+          "note": "OFFLOAD EVERYTHING. A/B/A/B inside one process (-ncmoe 24,0,24,0): ncmoe 0 = 36.36+-0.01, ncmoe 24 = 43.42+-0.08. Full sweep pooled over 2 invocations: 0->36.35, 4->37.60, 8->38.89, 12->39.85, 14->40.38, 16->41.11, 18->42.37, 20->42.58, 22->43.86, 24->43.88. Direction is unambiguous (+21% end to end); adjacent points within ~1% are not separable."
+        }
+      }
+    },
+    {
+      "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "arch": "qwen3moe",
+      "size_gib": 17.28,
+      "blocks": 48,
+      "experts": 128,
+      "experts_active": 8,
+      "quant": "Q4_K_M",
+      "ctx_train": 40960,
+      "recommended": {
+        "n_cpu_moe": 21,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_by_ctx": {
+        "0": 18,
+        "8192": 21,
+        "32768": 28
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 18,
+        "8192": 21,
+        "32768": 28
+      },
+      "throughput_tg64": {
+        "0": 69.23,
+        "512": 68.81,
+        "2048": 63.73,
+        "8192": 52.73
+      },
+      "throughput_d8192_pooled": {
+        "mean": 52.73,
+        "stddev": 0.65,
+        "n": 4
+      },
+      "vram_mib": {
+        "ctx": 8448,
+        "model": 10175.93,
+        "kv": 792.0,
+        "compute": 300.75,
+        "total": 11268.68,
+        "free": 690
+      },
+      "knob_value": {
+        "threads": {
+          "ratio": 1.07,
+          "note": "t8 68.20 -> t16 73.04; t16 vs t12 is 0.9% = not separable"
+        },
+        "ncmoe": {
+          "ratio": 1.26,
+          "note": "MONOTONE DOWNWARD: 30 -> 58.58 ... 18 -> 74.08. Run at the floor."
+        },
+        "flash_attn": {
+          "ratio": 1.72,
+          "note": "on 52.4 vs off 30.52 at d8192"
+        },
+        "kv_q8_0": {
+          "ratio": 0.81,
+          "note": "42.87 vs 52.97 at ncmoe 21/d8192; floor only 21 -> 20; aborts at 19"
+        }
+      }
+    },
+    {
+      "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+      "arch": "qwen3moe",
+      "size_gib": 17.28,
+      "blocks": 48,
+      "experts": 128,
+      "experts_active": 8,
+      "quant": "Q4_K_M",
+      "ctx_train": 262144,
+      "recommended": {
+        "n_cpu_moe": 21,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 18,
+        "8192": 21
+      },
+      "throughput_tg64": {
+        "0": 69.38,
+        "512": 68.62,
+        "2048": 63.56,
+        "8192": 53.47
+      },
+      "vram_mib": {
+        "ctx": 8448,
+        "model": 10175.93,
+        "kv": 792.0,
+        "compute": 300.75,
+        "total": 11268.68,
+        "free": 690
+      },
+      "transfer_check": {
+        "from": "Qwen3-30B-A3B-Q4_K_M.gguf",
+        "verified": true,
+        "note": "independently measured, not assumed: floor identical (18); ncmoe 18 gives 72.77+-0.13 vs 73.04+-0.09 (0.4%); depth curve matches within 0.7% at every point"
+      }
+    },
+    {
+      "file": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "arch": "qwen35moe",
+      "size_gib": 20.61,
+      "blocks": 40,
+      "attention_blocks": 10,
+      "ssm_blocks": 30,
+      "experts": 256,
+      "experts_active": 8,
+      "quant": "Q4_K_M",
+      "ctx_train": 262144,
+      "recommended": {
+        "n_cpu_moe": 22,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 22,
+        "8192": 22
+      },
+      "throughput_tg64": {
+        "0": 54.81,
+        "512": 53.49,
+        "2048": 52.67,
+        "8192": 52.79
+      },
+      "throughput_d0_pooled": {
+        "mean": 54.81,
+        "stddev": 1.09,
+        "n": 2
+      },
+      "vram_mib": {
+        "ctx": 8448,
+        "model": 10375.34,
+        "kv": 165.0,
+        "recurrent_state": 62.81,
+        "compute": 497.0,
+        "total": 11100.15,
+        "free": 859
+      },
+      "knob_value": {
+        "threads": {
+          "ratio": 1.02,
+          "note": "t8 53.18 -> t16 54.04 = not separable"
+        },
+        "ncmoe": {
+          "ratio": 1.09,
+          "note": "MONOTONE DOWNWARD: 28 -> 50.85, 22 -> 55.58. Run at the floor."
+        }
+      },
+      "notes": [
+        "hybrid attention/SSM: only 10 of 40 blocks carry KV, so the ncmoe floor does not move with context and the depth curve is flat (1.01x to 8K)"
+      ]
+    },
+    {
+      "file": "Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf",
+      "arch": "llama4",
+      "size_gib": 45.65,
+      "blocks": 48,
+      "experts": 16,
+      "experts_active": 1,
+      "quant": "Q3_K_XL",
+      "ctx_train": 10485760,
+      "supported": true,
+      "recommended": {
+        "n_cpu_moe": 46,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 44,
+        "8192": 45
+      },
+      "throughput_tg64": {
+        "0": 19.22,
+        "512": 18.38,
+        "2048": 16.42,
+        "8192": 11.68
+      },
+      "throughput_d0_pooled": {
+        "mean": 18.69,
+        "stddev": 0.47,
+        "n": 3
+      },
+      "vram_mib": {
+        "ctx": 8448,
+        "model": 7720.75,
+        "kv": 1584.0,
+        "compute": 687.6,
+        "total": 9992.35,
+        "free": 1967
+      },
+      "knob_value": {
+        "threads": {
+          "ratio": 1.3,
+          "note": "t8 14.27 -> t16 18.52; t20 18.08 = not separable from t16"
+        },
+        "ncmoe": {
+          "note": "at d8192 ncmoe 45-48 are indistinguishable (11.54-11.68); ship 46 not the floor of 45 and take the headroom"
+        }
+      },
+      "warnings": [
+        "192 KiB of KV per token: loses 1.65x by 8K, the worst depth sensitivity in the catalogue"
+      ]
+    },
+    {
+      "file": "gpt-oss-120b-MXFP4.gguf",
+      "arch": "gpt-oss",
+      "size_gib": 59.02,
+      "blocks": 36,
+      "experts": 128,
+      "experts_active": 4,
+      "quant": "MXFP4",
+      "ctx_train": 131072,
+      "recommended": {
+        "n_cpu_moe": 36,
+        "threads": 16,
+        "flash_attn": "auto",
+        "cache_type_k": "f16",
+        "cache_type_v": "f16"
+      },
+      "ncmoe_floor_by_ctx": {
+        "0": 31,
+        "8192": 31
+      },
+      "throughput_tg64": {
+        "0": 29.56,
+        "8192": 28.52,
+        "32768": 26.83
+      },
+      "throughput_d0_pooled": {
+        "mean": 29.56,
+        "stddev": 0.16,
+        "n": 4
+      },
+      "vram_mib": {
+        "ctx": 8448,
+        "model": 1607.61,
+        "kv": 324.0,
+        "compute": 611.15,
+        "total": 2542.76,
+        "free": 9416
+      },
+      "vram_mib_at_ncmoe_31": {
+        "ctx": 8448,
+        "model": 9697.06,
+        "kv": 324.0,
+        "compute": 611.15,
+        "total": 10632.21,
+        "free": 1327
+      },
+      "knob_value": {
+        "threads": {
+          "ratio": 2.09,
+          "note": "t4 (default) 14.11+-0.33 vs t16 29.54+-0.04, arms interleaved"
+        },
+        "ncmoe": {
+          "ratio": 1.02,
+          "note": "FLAT from the floor of 31 up to 36 (29.00 vs 29.56, within the 3% noise floor). Choose 36 for headroom: it frees 8.1 GiB of VRAM for the same speed."
+        }
+      },
+      "notes": [
+        "59.02 GiB model on an 11.7 GiB card at 32K context and 26.83 tok/s",
+        "the previously published -ncmoe 31 sat exactly on the OOM floor for no measurable throughput gain"
+      ]
+    }
+  ],
+  "unmeasured": [
+    "the -t optimum between 14 and 18 on gpt-oss-120b: two attempts, both page-cache-bound, disagreed; withdrawn per PROTOCOL 9",
+    "-ncmoe floors at 32K for gpt-oss-20b, Qwen3-Coder, Qwen3.6, Scout; any floor at 64K/128K",
+    "quantised KV above 8K (it aborts)",
+    "-ngl as a lever",
+    "prompt-processing (pp) throughput and -b/-ub tuning",
+    "why MXFP4 prefers the CPU: measured that it does, did not profile the kernel"
+  ]
+}

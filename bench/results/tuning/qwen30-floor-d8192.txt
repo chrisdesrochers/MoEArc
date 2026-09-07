@@ -1,0 +1,19 @@
+===== qwen30-floor-d8192  2026-09-07T04:25:51+00:00
+model: Qwen3-30B-A3B-Q4_K_M.gguf
+args:  -ncmoe 26,26,24,22,21,20,19,18 -t 16 -p 0 -n 64 -d 8192 -r 3
+GUARD ok after 82s: load1=2.43 busy=2.1%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       21070       17286         346       56785       72635
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:27:18Z","1279677188","3568467","50.012872","0.139586"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","26","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:27:42Z","1311021694","1080189","48.816911","0.040176"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","24","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:27:52Z","1251438906","2794904","51.141300","0.114075"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","22","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:28:02Z","1220726104","2696505","52.427983","0.115663"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Qwen3-30B-A3B-Q4_K_M.gguf","qwen3moe 30B.A3B Q4_K - Medium","18550716416","30532122624","2048","512","16","0x0","0","50","f16","f16","-1","21","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T04:28:11Z","1208133858","1163604","52.974295","0.051006"
+exit: 1  elapsed: 70s
+post-run: load1=5.14 busy=2.2%
+disk_read_MiB: 151   arc_hits:+8800 arc_misses:+41
+--- stderr tail ---
+level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)Exception caught at file:/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:5617
+Error OP MUL_MAT
+

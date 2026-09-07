@@ -1,0 +1,20 @@
+level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
+Exception caught at file:/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:674, func:operator()
+SYCL error: CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()): Exception caught in this line of code.
+  in function ggml_backend_sycl_buffer_set_tensor at /zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp:674
+/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/../ggml-sycl/common.hpp:141: SYCL error
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(+0x17d48) [0x7f0a15c54d48]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(ggml_print_backtrace+0x285) [0x7f0a15c54d25]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(ggml_abort+0x109) [0x7f0a15c53d99]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-sycl.so.0(+0x2256a8) [0x7f0a15f536a8]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-sycl.so.0(+0x232a10) [0x7f0a15f60a10]
+/zfs/swift/projects/llama.cpp/build/bin/libggml-base.so.0(ggml_backend_sched_graph_compute_async+0x65e) [0x7f0a15c7c70e]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(_ZN13llama_context13graph_computeEP11ggml_cgraphb+0xa1) [0x7f0a19c82f81]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(_ZN13llama_context14process_ubatchERK12llama_ubatch14llm_graph_typeP22llama_memory_context_iR11ggml_status+0x12b) [0x7f0a19c8292b]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(_ZN13llama_context6decodeERK11llama_batch+0x942) [0x7f0a19c84932]
+/zfs/swift/projects/llama.cpp/build/bin/libllama.so.0(llama_decode+0xb) [0x7f0a19c89c3b]
+/zfs/swift/projects/llama.cpp/build/bin/libllama-bench-impl.so(+0x1deaa) [0x7f0a1a3d0eaa]
+/zfs/swift/projects/llama.cpp/build/bin/libllama-bench-impl.so(_Z11llama_benchiPPc+0x23e6) [0x7f0a1a3cae86]
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x2a601) [0x7f0a1542a601]
+/usr/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x88) [0x7f0a1542a718]
+/zfs/swift/projects/llama.cpp/build/bin/llama-bench() [0x406425]

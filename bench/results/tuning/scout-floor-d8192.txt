@@ -1,0 +1,19 @@
+===== scout-floor-d8192  2026-09-07T05:21:57+00:00
+model: Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf
+args:  -ncmoe 48,48,47,46,45,44 -t 16 -p 0 -n 64 -d 8192 -r 2
+GUARD ok after 112s: load1=2.31 busy=2.2%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       20995       42788         395       31226       72710
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","48","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:24:36Z","5512983604","16425178","11.609010","0.034587"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","48","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:27:14Z","5547780709","60281909","11.536826","0.125359"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","47","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:27:32Z","5492305557","7305387","11.652676","0.015498"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","46","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:27:48Z","5524482944","361206","11.584795","0.000725"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/Llama-4-Scout-17B-16E-Instruct-UD-Q3_K_XL.gguf","llama4 17Bx16E (Scout) Q3_K - Medium","49005929216","107769861184","2048","512","16","0x0","0","50","f16","f16","-1","45","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:28:04Z","5502907453","25506738","11.630341","0.053908"
+exit: 1  elapsed: 281s
+post-run: load1=8.54 busy=1.9%
+disk_read_MiB: 83743   arc_hits:+41337435 arc_misses:+86181
+--- stderr tail ---
+level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)Exception caught at file:/zfs/swift/projects/llama.cpp/ggml/src/ggml-sycl/ggml-sycl.cpp, line:5617
+Error OP MUL_MAT
+

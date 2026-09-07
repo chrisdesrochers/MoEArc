@@ -1,0 +1,12 @@
+===== olmoe-smoke  2026-09-07T03:40:27+00:00
+model: olmoe-1b-7b-0924-instruct-q4_k_m.gguf
+args:  -ncmoe 0 -t 16 -p 0 -n 32 -r 2
+GUARD load1=0.71 busy=1.7% load average: 0.65, 0.71, 1.62
+               total        used        free      shared  buff/cache   available
+Mem:           93705       20769       48260         486       26072       72936
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf","olmoe A1.7B Q4_K - Medium","4211730432","6919161856","2048","512","16","0x0","0","50","f16","f16","-1","0","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","32","0","2026-09-07T03:40:36Z","112949409","19609","283.312683","0.031594"
+exit: 0  elapsed: 6s
+disk_read_MiB: 8145   arc_hits:+2069657 arc_misses:+4100
+post-load: 0.68
+

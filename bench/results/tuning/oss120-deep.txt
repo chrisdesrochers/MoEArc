@@ -1,0 +1,13 @@
+===== oss120-deep  2026-09-07T05:38:48+00:00
+model: gpt-oss-120b-MXFP4.gguf
+args:  -ncmoe 36 -t 16 -p 0 -n 64 -d 8192,32768 -r 2
+GUARD ok after 102s: load1=2.24 busy=1.4%
+               total        used        free      shared  buff/cache   available
+Mem:           93705       16276       22583         319       56075       77429
+build_commit,build_number,cpu_info,gpu_info,backends,model_filename,model_type,model_size,model_n_params,n_batch,n_ubatch,n_threads,cpu_mask,cpu_strict,poll,type_k,type_v,n_gpu_layers,n_cpu_moe,split_mode,main_gpu,no_kv_offload,flash_attn,devices,tensor_split,tensor_buft_overrides,load_mode,lazy_mode,embeddings,no_op_offload,no_host,fit_target,fit_min_ctx,n_prompt,n_gen,n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","8192","2026-09-07T05:41:08Z","2251196381","41462010","28.434150","0.523693"
+"e107984bc","10788","Intel(R) Core(TM) Ultra 7 265K","Intel(R) Arc(TM) B580 Graphics","SYCL","/zfs/swift/models/gpt-oss-120b-MXFP4.gguf","gpt-oss 120B MXFP4 MoE","63374323968","116829156672","2048","512","16","0x0","0","50","f16","f16","-1","36","layer","0","0","-1","auto","0.00","none","auto","auto","0","0","0","0","0","0","64","32768","2026-09-07T05:43:17Z","2385790641","9507251","26.825702","0.106899"
+exit: 0  elapsed: 516s
+post-run: load1=2.51 busy=2.5%
+disk_read_MiB: 62630   arc_hits:+30380243 arc_misses:+65551
+
