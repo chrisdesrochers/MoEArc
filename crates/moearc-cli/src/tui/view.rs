@@ -22,6 +22,7 @@ use crate::fit::{CONTEXT_LADDER, Columns, Fit, FitOutcome, KvPrecision, ladder_i
 use crate::format;
 use crate::source::{DeviceRow, ModelCard, Verdict};
 use crate::theme;
+use crate::tuning;
 
 /// Label column width. One value for the whole interface, so fields stacked in different
 /// panels still line up when the panels sit side by side.
@@ -253,7 +254,7 @@ fn fit_panel(m: &Model, area: Rect) -> Paragraph<'_> {
     let cols = Columns::of(&m.models);
     let mut rows = Vec::new();
     for (i, (card, fit)) in m.models.iter().zip(&m.fits).enumerate() {
-        rows.push(fit_line(card, fit, m.placements.get(i), cols));
+        rows.push(fit_line(card, fit, m.placements.get(i), m.tunings.get(i), cols));
     }
 
     // What has to survive, in priority order: the model rows, then the controls, then the
@@ -334,6 +335,9 @@ fn fit_panel(m: &Model, area: Rect) -> Paragraph<'_> {
              behind them is provisional, not measured on Arc.",
             Style::new().fg(theme::WARN),
         ));
+        // 🔴 The legend is unconditional. A glyph nobody can decode is worse than no glyph:
+        // it looks like a claim and cannot be checked.
+        lines.push(Line::styled(tuning::schema::Origin::legend(), Style::new().fg(theme::FAINT)));
         if m.fits.iter().any(Fit::context_at_floor) {
             lines.push(Line::styled(
                 "A context at the minimum is not the card's limit — experts took everything \
@@ -471,7 +475,7 @@ fn gauge_spans(fraction: f64, width: usize) -> Vec<Span<'static>> {
 fn fit_header(cols: Columns) -> Line<'static> {
     Line::styled(
         format!(
-            "  {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
+            "   {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
             "model",
             "quant",
             "size",
@@ -520,6 +524,11 @@ fn fit_line<'a>(
     card: &'a ModelCard,
     fit: &Fit,
     placement: Option<&Placement>,
+    // 🔴 A second glyph rather than a second colour on the first one. "Does it fit" and "did
+    // anyone measure the settings" are independent questions with independent answers, and a
+    // single mark carrying both would make a derived plan on a roomy card look like a
+    // benchmarked one.
+    tuned: Option<&tuning::resolve::Resolved>,
     cols: Columns,
 ) -> Line<'a> {
     let runs = fit.fits() && placement.is_none_or(|p| p.tier.runs());
@@ -534,8 +543,10 @@ fn fit_line<'a>(
         // guess would.
         None => ("", theme::subtle()),
     };
+    let tune = tuned.map_or(tuning::schema::Origin::Untuned, |t| t.origin);
     Line::from(vec![
-        Span::styled(format!("{mark} "), style),
+        Span::styled(mark, style),
+        Span::styled(format!("{} ", tune.glyph()), tune_style(tune)),
         Span::styled(format!("{:<w$} ", card.id, w = cols.id), theme::text()),
         Span::styled(format!("{:<w$} ", card.quant, w = cols.quant), theme::subtle()),
         Span::styled(
@@ -617,6 +628,19 @@ fn repo_input(m: &Model) -> Paragraph<'_> {
     Paragraph::new(Line::styled(value, style)).block(block)
 }
 
+/// The colour for a tuning badge.
+///
+/// Restrained on purpose, and *derived is not a warning colour*. A derived setting is a
+/// correct answer computed from the model's own geometry — the honest default state of this
+/// tool — and painting it amber would tell the viewer something is wrong when nothing is.
+fn tune_style(origin: tuning::schema::Origin) -> Style {
+    match origin {
+        tuning::schema::Origin::Measured => Style::new().fg(theme::GOOD),
+        tuning::schema::Origin::Extrapolated => theme::text(),
+        _ => Style::new().fg(theme::FAINT),
+    }
+}
+
 fn model_detail(m: &Model) -> Paragraph<'_> {
     let Some(card) = m.selected_model() else {
         return Paragraph::new(Line::styled("No model selected.", theme::subtle()))
@@ -651,6 +675,21 @@ fn model_detail(m: &Model) -> Paragraph<'_> {
                 Span::styled("measured on Arc", Style::new().fg(theme::GOOD))
             } else {
                 Span::styled("never run on Arc", Style::new().fg(theme::WARN))
+            },
+            LABEL_W,
+        ),
+        // Beside `footprint` on purpose: they are the two provenance questions about this
+        // model, and they have different answers. A footprint read out of a header and a
+        // tuning profile measured on this card are independent facts, and a reader who sees
+        // one of them where they expected the other has been misled.
+        theme::field(
+            "tuning",
+            match m.selected_tuning() {
+                Some(t) => Span::styled(
+                    format!("{} {}", t.origin.glyph(), t.basis.label()),
+                    tune_style(t.origin),
+                ),
+                None => Span::styled("—", theme::subtle()),
             },
             LABEL_W,
         ),
@@ -699,6 +738,51 @@ fn model_detail(m: &Model) -> Paragraph<'_> {
             lines.push(Line::styled(reason.clone(), theme::subtle()));
         }
         None => lines.push(Line::styled("Not yet planned.", theme::subtle())),
+    }
+
+    // The flags themselves, last, because they are the conclusion the blocks above are the
+    // reasoning for.
+    //
+    // 🔴 The *badge* does not wait for this block. This pane has a fold — the planner's
+    // rationale alone runs to six wrapped lines — so the one fact a reader must not have to
+    // scroll for, whether any of this was measured, is repeated as a one-line field beside
+    // `footprint` near the top. Moving the whole block up instead pushed the planned split
+    // off the bottom, which trades one clipped conclusion for another.
+    if let Some(t) = m.selected_tuning() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Tuning", theme::heading()));
+        lines.push(theme::field(
+            "confidence",
+            Span::styled(
+                format!("{} {}", t.origin.glyph(), t.origin.label()),
+                tune_style(t.origin),
+            ),
+            LABEL_W,
+        ));
+        for f in t.flags() {
+            // The provenance sits in the value cell, not in a column of its own: at this
+            // width a column would be the first thing to wrap, and it is the half that must
+            // not be lost.
+            lines.push(theme::field(
+                f.flag,
+                Span::styled(
+                    format!("{}   ({})", f.value, f.origin.label()),
+                    if f.origin.is_measured() { theme::text() } else { theme::subtle() },
+                ),
+                LABEL_W,
+            ));
+        }
+        lines.push(Line::styled(format!("· {}", t.basis.sentence()), theme::subtle()));
+        match &t.baseline {
+            Some(b) => {
+                lines.push(Line::styled(format!("· baseline {}", b.describe()), theme::subtle()))
+            }
+            None => lines.push(Line::styled(
+                "· no baseline for this machine — absolute throughput does not travel between \
+                 boxes",
+                theme::subtle(),
+            )),
+        }
     }
 
     Paragraph::new(lines).wrap(Wrap { trim: true }).block(theme::panel("Detail"))
@@ -1077,6 +1161,120 @@ mod tests {
         m.budget = Some(m.budget.unwrap().set(bytes));
         m.recompute_placements();
         m
+    }
+
+    /// The same machine, with one measured profile visible to it.
+    ///
+    /// Written out here rather than reached for from a fixture file, because the shape of the
+    /// file is the contract with the benchmark half — a test that goes through
+    /// `Store::from_json` fails if either side drifts, and a test that pokes a struct in does
+    /// not.
+    fn measured_with_a_tuning_profile() -> Model {
+        let mut m = measured();
+        let card = m
+            .models
+            .iter()
+            .find(|c| c.id == "gpt-oss-120b")
+            .expect("the measured fixture leads with gpt-oss")
+            .clone();
+        let json = format!(
+            r#"{{"schema":1,"profiles":[{{
+              "id":"arc-b580/{id}/{quant}",
+              "hardware":{{"gpu":"Intel Arc B580 Graphics","gpu_key":"arc-b580",
+                          "vram_bytes":12884901888,"physical_cores":20}},
+              "model":{{"id":"{id}","quant":"{quant}","moe_blocks":{blocks},
+                       "experts_per_block":{per},"active_experts_per_block":{act},
+                       "expert_slots_total":{slots}}},
+              "settings":{{"threads":16,"n_cpu_moe":{blocks},"flash_attn":true}},
+              "score":{{"metric":"decode_tokens_per_second","depth_tokens":0,
+                       "mean":28.5,"stddev":0.2,"runs":5}},
+              "measured_at":"2026-09-06"}}]}}"#,
+            id = card.id,
+            quant = card.quant,
+            blocks = card.moe_blocks,
+            per = card.experts_per_block,
+            act = card.active_experts_per_block,
+            slots = card.expert_slots_total,
+        );
+        m.profiles = crate::tuning::store::Store::from_json(&json, None);
+        assert_eq!(m.profiles.len(), 1, "{:?}", m.profiles.rejected());
+        m.cpu = crate::tuning::resolve::HostCpu {
+            model: Some("fixture".into()),
+            physical_cores: Some(20),
+            logical_cores: Some(20),
+        };
+        m.recompute_fits();
+        m
+    }
+
+    #[test]
+    fn the_catalog_marks_which_rows_anybody_actually_measured() {
+        // 🔴 The badge has to be per row, not per screen. One profile exists here and three
+        // models do not have one, and a viewer must be able to tell which row is which
+        // without reading a footnote.
+        let m = measured_with_a_tuning_profile();
+        // Tall enough for the legend:  drops its prose before its rows when the
+        // panel is short, which is the right priority and makes the legend a height-dependent
+        // line rather than a guaranteed one.
+        let dump = frame(&m, 120, 48);
+        show("moearc — one measured profile among four models", &dump);
+        let row = |id: &str| {
+            dump.lines()
+                .find(|l| l.contains(id))
+                .unwrap_or_else(|| panic!("no row for {id}"))
+                .to_string()
+        };
+        assert!(row("gpt-oss-120b").contains('◆'), "{}", row("gpt-oss-120b"));
+        for other in ["olmoe-1b-7b", "qwen3.6-35b"] {
+            assert!(
+                !row(other).contains('◆'),
+                "a model nobody measured must not wear the measured badge: {}",
+                row(other)
+            );
+            assert!(row(other).contains('·'), "{}", row(other));
+        }
+        assert!(dump.contains("measured on this card"), "the legend decodes the glyph");
+    }
+
+    #[test]
+    fn the_detail_pane_names_every_flag_and_where_it_came_from() {
+        let mut m = measured_with_a_tuning_profile();
+        m.screen = Screen::Models;
+        m.model_row = m.models.iter().position(|c| c.id == "gpt-oss-120b").unwrap();
+        // 🔴 Two heights, and the difference is the point. The badge is asserted at an
+        // ordinary terminal height because it must never be the thing that scrolls; the flag
+        // table is asserted at a tall one because it legitimately sits below the fold.
+        let short = frame(&m, 130, 40);
+        assert!(short.contains("tuning"), "the badge field survives a 40-row terminal");
+        assert!(short.contains('◆'), "{short}");
+
+        let dump = frame(&m, 130, 60);
+        show("moearc — the tuning block in the detail pane", &dump);
+        let tuned = m.selected_tuning().expect("a resolution for the selected row");
+        assert_eq!(tuned.origin, crate::tuning::schema::Origin::Measured);
+        for flag in ["-ncmoe", "-t", "-ngl"] {
+            assert!(dump.contains(flag), "{flag} is on screen");
+        }
+        // 🔴 The word, not only the glyph. A badge nobody can read is a claim nobody can check.
+        assert!(dump.contains("measured"), "the provenance is spelled out");
+        assert!(dump.contains("28.50"), "the baseline it would be climbed from is on screen");
+    }
+
+    #[test]
+    fn a_model_with_no_profile_still_shows_what_it_would_run_and_calls_it_derived() {
+        let mut m = measured_with_a_tuning_profile();
+        m.screen = Screen::Models;
+        m.model_row = m.models.iter().position(|c| c.id != "gpt-oss-120b").unwrap();
+        let dump = frame(&m, 130, 60);
+        show("moearc — a derived tuning answer", &dump);
+        let tuned = m.selected_tuning().unwrap();
+        assert_eq!(tuned.origin, crate::tuning::schema::Origin::Derived);
+        assert!(!tuned.flags().is_empty(), "derived is still a complete answer");
+        assert!(dump.contains("derived"), "and it says so in words");
+        assert!(
+            dump.contains("no baseline for this machine"),
+            "an absent baseline is stated rather than left blank"
+        );
     }
 
     #[test]

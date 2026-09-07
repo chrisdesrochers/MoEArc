@@ -141,6 +141,55 @@ pub fn storage(report: &HostReport) -> Storage {
     Storage { free_bytes: report.models_free_bytes }
 }
 
+/// The CPU, for the one setting that depends on it.
+///
+/// 🔴 Read here rather than in the engine, for the same reason RAM is: `moearc-engine` has no
+/// dependencies and stays testable on any machine. And read from `/proc/cpuinfo` rather than
+/// through `sysinfo`, because the number that matters is **physical cores** — hyperthread
+/// siblings share load/store units, and a memory-bound expert gather does not get faster for
+/// being given two threads on one core.
+///
+/// A machine that will not say returns `None` rather than a guess. `HostCpu::derived_threads`
+/// then falls back to logical parallelism, and if even that is unavailable the tool declines to
+/// suggest a thread count and says why — which is a worse outcome than a number, and a better
+/// one than an invented number.
+pub fn cpu() -> crate::tuning::resolve::HostCpu {
+    let logical = std::thread::available_parallelism().ok().map(|n| n.get() as u32);
+    let (model, physical_cores) = cpuinfo();
+    crate::tuning::resolve::HostCpu { model, physical_cores, logical_cores: logical }
+}
+
+/// `(model name, physical cores)` from `/proc/cpuinfo`.
+///
+/// Physical cores are counted as distinct `(physical id, core id)` pairs, which is correct
+/// across sockets as well as across hyperthread siblings. Anything unreadable — a non-Linux
+/// host, a container with the file masked — yields `None`, never a fallback count that would
+/// be indistinguishable from a measured one.
+fn cpuinfo() -> (Option<String>, Option<u32>) {
+    let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return (None, None);
+    };
+    let mut model: Option<String> = None;
+    let mut cores: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    for block in text.split("\n\n") {
+        let (mut physical, mut core) = (None, None);
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once(':') else { continue };
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "model name" if model.is_none() => model = Some(value.to_string()),
+                "physical id" => physical = value.parse().ok(),
+                "core id" => core = value.parse().ok(),
+                _ => {}
+            }
+        }
+        if let (Some(p), Some(c)) = (physical, core) {
+            cores.insert((p, c));
+        }
+    }
+    (model, (!cores.is_empty()).then_some(cores.len() as u32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

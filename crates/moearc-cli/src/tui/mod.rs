@@ -23,6 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::cli::{Cli, Command};
 use crate::fit;
 use crate::source::Sources;
+use crate::tuning;
 use model::{Action, Model, Msg, Screen, Serving, TICK_MS, update};
 
 /// Puts the terminal back the way it was, including on a panic.
@@ -43,6 +44,12 @@ pub fn run(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
     let mut m =
         Model::new(cli.ctx, cli.host_budget(), sources.stubbed.then_some(sources.stub_parts));
     m.catalog_location = sources.models.location();
+    // 🔴 Loaded here rather than in `Model::new`, and the reason is testability: `Store::load`
+    // searches `bench/tuning-profiles.json` relative to the working directory, so a reducer
+    // that loaded it in its constructor would give different answers under `cargo test` in a
+    // checkout than in CI. The reducer stays a pure function of the state it is handed.
+    m.profiles = tuning::store::Store::load();
+    m.cpu = crate::host::cpu();
     let mut pending = vec![Action::Detect];
 
     // Each subcommand opens on its own screen. That is the other half of the mapping in

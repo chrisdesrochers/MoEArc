@@ -795,3 +795,250 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("experts")), "{lines:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The same arithmetic, spoken in llama.cpp
+// ---------------------------------------------------------------------------------------
+//
+// MoEArc's engine and llama.cpp answer the same question — *which experts live on the card* —
+// and only the vocabulary differs. This planner says "2,304 of 4,608 slots resident";
+// llama.cpp says `-ncmoe 18`. The translation below is exact arithmetic over the model's own
+// block geometry, so the planner keeps its job when llama.cpp is the thing doing the decode.
+//
+// 🔴 Why this matters more than it looks. `-ncmoe` has a model-specific floor: set it one
+// block too low and llama.cpp aborts with `OUT_OF_DEVICE_MEMORY` after loading tens of
+// gigabytes. Nothing in llama.cpp computes that floor, nothing documents it, and users find
+// it by crashing. It is exactly the number this planner already produces — it just produces
+// it in slots.
+//
+// ⚠️ Everything here is *derived*, never measured. It inherits [`Headroom::PROVISIONAL`],
+// which is a stated guess, so the value it returns is a defensible starting point and not a
+// benchmark result. Any caller that renders it must say so.
+
+/// How a model's expert bank is laid out across blocks.
+///
+/// 🔴 Kept separate from [`ModelFootprint`] rather than folded into it, because the footprint
+/// deliberately counts **slots** — one per *(block, expert)* pair — and nothing else in this
+/// module needs to know how those slots are grouped. llama.cpp does: it offloads whole
+/// blocks' expert tensors, never individual experts. [`llama_split`] checks that the two
+/// descriptions agree rather than trusting the caller, because getting this wrong is the
+/// 36×-understatement bug that `moearc-cli`'s `footprint` already carries a warning about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockGeometry {
+    /// Blocks carrying an expert bank. Not necessarily every block in the model.
+    pub moe_blocks: u32,
+    /// Experts in one block's bank.
+    pub experts_per_block: u32,
+}
+
+/// A plan, expressed in the flags llama.cpp takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlamaSplit {
+    /// `-ncmoe` / `--n-cpu-moe`: how many blocks' expert tensors stay in host memory.
+    ///
+    /// 🔴 **This is the floor, not a preference.** It is derived from the largest expert
+    /// residency [`plan`] found affordable, so one less is the first setting past the cliff.
+    /// The margin between it and an actual `OUT_OF_DEVICE_MEMORY` is whatever
+    /// [`Headroom::PROVISIONAL`] happens to be worth on the device — which is a guess, and is
+    /// documented as one. Treat this as the lowest value to *try*, not a value proven safe.
+    pub n_cpu_moe: u32,
+    /// Blocks whose experts are on the card: `moe_blocks - n_cpu_moe`.
+    pub gpu_expert_blocks: u32,
+    /// The model's MoE block count, carried so a renderer can print the fraction.
+    pub moe_blocks: u32,
+    /// `-c` / `--ctx-size`, straight from the allocation.
+    pub context_tokens: u32,
+    /// Slots llama.cpp will actually hold under this `-ncmoe`.
+    pub slots_used: u32,
+    /// Slots [`plan`] found room for, before rounding to whole blocks.
+    pub slots_planned: u32,
+    /// The difference — capacity the card has and llama.cpp cannot address.
+    ///
+    /// Up to `experts_per_block - 1` slots, and it is **free margin against the cliff**
+    /// rather than waste: it is memory the plan budgeted for and the flag does not spend. It
+    /// is reported instead of quietly absorbed so nobody later "recovers" it by rounding up.
+    pub slots_dropped_to_whole_blocks: u32,
+    /// Expert bytes this `-ncmoe` puts on the card.
+    pub expert_bytes_on_gpu: u64,
+}
+
+impl LlamaSplit {
+    /// Whether the card holds no block's experts at all, so every token's experts come from
+    /// the host. A valid configuration, and a slow one; worth naming so a renderer can.
+    pub fn is_cpu_only_experts(&self) -> bool {
+        self.gpu_expert_blocks == 0
+    }
+}
+
+/// Translate an [`Allocation`] into llama.cpp's flags.
+///
+/// The only judgement in here is the direction of the rounding: partial blocks round
+/// **down**, so the flag never claims capacity the plan did not find. Rounding up would
+/// produce the one failure mode this whole function exists to prevent.
+pub fn llama_split(
+    alloc: &Allocation,
+    model: &ModelFootprint,
+    geom: BlockGeometry,
+) -> Result<LlamaSplit, PlanError> {
+    if geom.moe_blocks == 0 {
+        return Err(PlanError::InvalidModel("moe_blocks is zero — not an MoE model"));
+    }
+    if geom.experts_per_block == 0 {
+        return Err(PlanError::InvalidModel("experts_per_block is zero"));
+    }
+    // The guard that earns its keep. A caller that passes the per-block expert count where a
+    // slot count belongs understates the model by the block count, and every number
+    // downstream is then wrong by that factor while still looking entirely reasonable.
+    if geom.moe_blocks as u64 * geom.experts_per_block as u64 != model.total_experts as u64 {
+        return Err(PlanError::InvalidModel(
+            "block geometry does not multiply out to the model's slot count",
+        ));
+    }
+
+    let gpu_expert_blocks = (alloc.resident_experts / geom.experts_per_block).min(geom.moe_blocks);
+    let n_cpu_moe = geom.moe_blocks - gpu_expert_blocks;
+    let slots_used = gpu_expert_blocks * geom.experts_per_block;
+    Ok(LlamaSplit {
+        n_cpu_moe,
+        gpu_expert_blocks,
+        moe_blocks: geom.moe_blocks,
+        context_tokens: alloc.context_tokens,
+        slots_used,
+        slots_planned: alloc.resident_experts,
+        slots_dropped_to_whole_blocks: alloc.resident_experts - slots_used,
+        expert_bytes_on_gpu: model.per_expert_bytes * slots_used as u64,
+    })
+}
+
+/// Plan, and hand back both vocabularies.
+///
+/// The pairing is the point: the [`Allocation`] carries the reasoning a user can read and the
+/// [`LlamaSplit`] carries the flags a user can paste, and they cannot disagree because there
+/// is one calculation behind them.
+pub fn plan_llama(
+    device: DeviceMemory,
+    model: &ModelFootprint,
+    geom: BlockGeometry,
+    policy: &Policy,
+    want: Context,
+) -> Result<(Allocation, LlamaSplit), PlanError> {
+    let alloc = plan(device, model, policy, want)?;
+    let split = llama_split(&alloc, model, geom)?;
+    Ok((alloc, split))
+}
+
+#[cfg(test)]
+mod llama_split_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+
+    /// gpt-oss-120B's shape: 36 MoE blocks × 128 experts, 4 routed per block.
+    fn gpt_oss() -> (ModelFootprint, BlockGeometry) {
+        (
+            ModelFootprint {
+                dense_weights_bytes: 2_400 * MIB,
+                per_expert_bytes: 12_582_912, // 12 MiB
+                total_experts: 4_608,
+                active_experts: 144,
+                kv_bytes_per_token: 72 * 1024,
+            },
+            BlockGeometry { moe_blocks: 36, experts_per_block: 128 },
+        )
+    }
+
+    fn card(free: u64) -> DeviceMemory {
+        DeviceMemory { total_bytes: free, free_bytes: free }
+    }
+
+    #[test]
+    fn a_slot_count_becomes_a_block_count() {
+        let (m, g) = gpt_oss();
+        let (a, s) = plan_llama(card(11_811_160_064), &m, g, &Policy::default(), Context::Largest)
+            .expect("a 59 GiB model plans onto an 11 GiB card — that is the whole premise");
+        assert_eq!(s.moe_blocks, 36);
+        assert_eq!(s.gpu_expert_blocks + s.n_cpu_moe, 36, "the two halves are the whole model");
+        assert_eq!(s.slots_used, s.gpu_expert_blocks * 128);
+        assert_eq!(s.slots_planned, a.resident_experts);
+        assert!(s.slots_used <= s.slots_planned, "rounding is downward, always");
+        assert!(s.slots_dropped_to_whole_blocks < 128, "at most one block short of a block");
+    }
+
+    #[test]
+    fn more_vram_never_pushes_more_experts_onto_the_cpu() {
+        // The monotonicity a user assumes without being told. If it ever broke, a bigger card
+        // would produce a slower recommendation and nothing would say why.
+        let (m, g) = gpt_oss();
+        let p = Policy::default();
+        let mut previous = u32::MAX;
+        for free in [8 * GIB, 11 * GIB, 12 * GIB, 16 * GIB, 24 * GIB, 32 * GIB, 96 * GIB] {
+            let (_, s) = plan_llama(card(free), &m, g, &p, Context::Largest).unwrap();
+            assert!(
+                s.n_cpu_moe <= previous,
+                "{free} bytes wants -ncmoe {} after {previous}",
+                s.n_cpu_moe
+            );
+            previous = s.n_cpu_moe;
+        }
+        assert_eq!(previous, 0, "a card with room for everything offloads nothing");
+    }
+
+    #[test]
+    fn the_flag_never_leaves_the_range_llama_cpp_accepts() {
+        let (m, g) = gpt_oss();
+        let p = Policy::default();
+        for free in [6 * GIB, 8 * GIB, 11 * GIB, 20 * GIB, 48 * GIB, 128 * GIB] {
+            let Ok((_, s)) = plan_llama(card(free), &m, g, &p, Context::Largest) else { continue };
+            assert!(s.n_cpu_moe <= 36, "-ncmoe {} exceeds the block count", s.n_cpu_moe);
+        }
+    }
+
+    #[test]
+    fn a_geometry_that_does_not_multiply_out_is_refused() {
+        // The 36x bug, made unrepresentable. Passing 128 where 4,608 belongs is the mistake
+        // that produces a plan for a thirty-sixth of the memory the model needs.
+        let (m, _) = gpt_oss();
+        let a = plan(card(11 * GIB), &m, &Policy::default(), Context::Largest).unwrap();
+        let wrong = BlockGeometry { moe_blocks: 36, experts_per_block: 4 };
+        assert!(matches!(llama_split(&a, &m, wrong), Err(PlanError::InvalidModel(_))));
+        let zero = BlockGeometry { moe_blocks: 0, experts_per_block: 128 };
+        assert!(matches!(llama_split(&a, &m, zero), Err(PlanError::InvalidModel(_))));
+    }
+
+    #[test]
+    fn a_card_too_small_for_one_block_keeps_every_expert_on_the_host() {
+        // A plan can hold more slots than the model activates and still not hold a whole
+        // block, because llama.cpp offloads blocks. `-ncmoe <all>` is the correct answer
+        // there, not an error -- every expert comes from host memory and the model runs.
+        let m = ModelFootprint {
+            dense_weights_bytes: 512 * MIB,
+            per_expert_bytes: 32 * MIB,
+            total_experts: 256,
+            active_experts: 16,
+            kv_bytes_per_token: 32 * 1024,
+        };
+        let g = BlockGeometry { moe_blocks: 8, experts_per_block: 32 };
+        let policy = Policy { min_context_tokens: 512, ..Policy::default() };
+        // Sized so the plan lands between the residency floor (16 slots) and one block (32).
+        let (a, s) = plan_llama(card(1_400 * MIB), &m, g, &policy, Context::Largest).unwrap();
+        assert!(
+            a.resident_experts >= m.active_experts && a.resident_experts < 32,
+            "the interesting case is {} slots planned against a 32-slot block",
+            a.resident_experts
+        );
+        assert_eq!(s.n_cpu_moe, 8);
+        assert!(s.is_cpu_only_experts());
+        assert_eq!(s.expert_bytes_on_gpu, 0);
+        assert_eq!(s.slots_dropped_to_whole_blocks, a.resident_experts);
+    }
+
+    #[test]
+    fn the_context_is_carried_through_rather_than_recomputed() {
+        let (m, g) = gpt_oss();
+        let (a, s) =
+            plan_llama(card(16 * GIB), &m, g, &Policy::default(), Context::Tokens(8_192)).unwrap();
+        assert_eq!(s.context_tokens, a.context_tokens);
+        assert_eq!(s.context_tokens, 8_192);
+    }
+}

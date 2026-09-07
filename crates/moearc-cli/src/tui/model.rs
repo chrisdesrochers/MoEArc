@@ -139,6 +139,15 @@ pub struct Model {
     /// Where the catalogue looked for models. Shown only when it found none — "no models" is
     /// a symptom, and the directory it searched is the cause.
     pub catalog_location: Option<String>,
+    /// Measured tuning profiles. Empty until [`crate::tui::run`] loads them, and empty for
+    /// good on a machine that has none — which is the ordinary case, not a fault.
+    pub profiles: crate::tuning::store::Store,
+    /// This machine's CPU, for the one setting that depends on it.
+    pub cpu: crate::tuning::resolve::HostCpu,
+    /// Parallel to `models`, like `fits`. Recomputed on the same trigger, because a tuning
+    /// answer is a function of the card, the model and the requested context — the same three
+    /// inputs the fit is.
+    pub tunings: Vec<crate::tuning::resolve::Resolved>,
     pub quit: bool,
 }
 
@@ -170,6 +179,9 @@ impl Model {
             status: None,
             provenance,
             catalog_location: None,
+            profiles: crate::tuning::store::Store::empty(),
+            cpu: crate::tuning::resolve::HostCpu::default(),
+            tunings: Vec::new(),
             quit: false,
         }
     }
@@ -252,9 +264,28 @@ impl Model {
     pub fn recompute_fits(&mut self) {
         let Some(device) = self.report.as_ref().and_then(|r| r.primary()) else {
             self.fits.clear();
+            self.tunings.clear();
             return;
         };
         self.fits = self.models.iter().map(|m| fit::plan(device, m, self.ctx_request)).collect();
+        self.tunings = self
+            .models
+            .iter()
+            .map(|m| {
+                crate::tuning::resolve::resolve(
+                    &self.profiles,
+                    Some(device),
+                    m,
+                    &self.cpu,
+                    self.ctx_request,
+                )
+            })
+            .collect();
+    }
+
+    /// The tuning answer for the highlighted model.
+    pub fn selected_tuning(&self) -> Option<&crate::tuning::resolve::Resolved> {
+        self.tunings.get(self.model_row)
     }
 
     fn move_selection(&mut self, delta: isize) {

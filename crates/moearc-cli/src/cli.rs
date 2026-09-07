@@ -15,6 +15,8 @@
 //! | serving screen              | `moearc serve <model>`                      |
 //! | the split it chose          | `moearc serve <model> --dry-run`            |
 //! | context slider              | `--ctx <tokens>`                            |
+//! | tuning panel                | `moearc info <model>`                       |
+//! | tuning: is a tweak a win?   | `moearc info <model> --candidate <SPEC>`    |
 //! | expert-slot override        | `--moe-cache <slots>`                       |
 //! | host RAM budget             | `--host-budget <SIZE>` / `$MOEARC_HOST_BUDGET` |
 //! | *(none — deliberately)*     | `moearc bench`                              |
@@ -346,6 +348,16 @@ pub struct InfoArgs {
     /// Plan for this context length instead of the largest that fits.
     #[arg(long, value_name = "TOKENS")]
     pub ctx: Option<u32>,
+
+    /// A measurement to test against this model's recorded baseline:
+    /// `<mean>[±<stddev>][/<runs>]`, e.g. `128.4±3.1/5`.
+    ///
+    /// 🔴 The stddev and the run count are optional in the grammar and not in the answer. A
+    /// bare mean gets a verdict of *untrustworthy*, never a confident one: `bench/PROTOCOL.md`
+    /// §5 does not call a single run a measurement, and a loop that compares means alone
+    /// keeps changes that hurt.
+    #[arg(long, value_name = "MEAN[±SD][/RUNS]")]
+    pub candidate: Option<String>,
 }
 
 impl Cli {
@@ -415,6 +427,22 @@ mod tests {
         let cli = Cli::parse_from(["moearc", "serve", "qwen3-30b-a3b", "--json", "-vv"]);
         assert!(cli.global.json);
         assert_eq!(cli.global.verbose, 2);
+    }
+
+    #[test]
+    fn a_candidate_is_optional_and_is_taken_verbatim() {
+        // Not parsed by clap: the grammar lives in `tuning::compare` beside the comparison it
+        // feeds, so one place decides what `128.4±3.1/5` means.
+        assert!(matches!(
+            Cli::parse_from(["moearc", "info", "m"]).command,
+            Some(Command::Info(InfoArgs { candidate: None, .. }))
+        ));
+        let Some(Command::Info(a)) =
+            Cli::parse_from(["moearc", "info", "m", "--candidate", "128.4±3.1/5"]).command
+        else {
+            panic!("expected info");
+        };
+        assert_eq!(a.candidate.as_deref(), Some("128.4±3.1/5"));
     }
 
     #[test]

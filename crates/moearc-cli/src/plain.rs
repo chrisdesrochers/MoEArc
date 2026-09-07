@@ -23,6 +23,7 @@ use crate::cli::{Cli, Command, InfoArgs, LsArgs, PullArgs, ServeArgs};
 use crate::fit::{self, Fit, FitOutcome};
 use crate::format;
 use crate::source::{DeviceRow, HostReport, ModelCard, Sources};
+use crate::tuning;
 
 /// Exit code for a command whose backend does not exist yet.
 ///
@@ -57,6 +58,14 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
     let host = sources.host.probe()?;
     let budget = budget_for(cli, &host);
     let placements = placements_for(&models, &host, budget);
+    // Loaded once for the whole table rather than per row: the file is read from disk, and
+    // four rows must not produce four reads that could disagree with each other mid-render.
+    let profiles = tuning::store::Store::load();
+    let cpu = crate::host::cpu();
+    let tunings: Vec<tuning::resolve::Resolved> = models
+        .iter()
+        .map(|m| tuning::resolve::resolve(&profiles, devices.primary(), m, &cpu, cli.ctx))
+        .collect();
 
     if cli.global.json {
         return emit(json!({
@@ -73,6 +82,8 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
                 .zip(&placements)
                 .map(|(m, p)| placement_json(&m.id, p))
                 .collect::<Vec<_>>(),
+            "tuning": tunings,
+            "tuning_source": profiles.provenance(),
             "unreadable": sources.models.skipped(),
         }));
     }
@@ -115,8 +126,8 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
         });
         let cols = fit::Columns::of(&models);
         print_fit_header(cols);
-        for ((card, f), p) in models.iter().zip(&fits).zip(&placements) {
-            print_fit_row(card, f, Some(p), cols, cli.global.verbose);
+        for (((card, f), p), t) in models.iter().zip(&fits).zip(&placements).zip(&tunings) {
+            print_fit_row(card, f, Some(p), t.origin, cols, cli.global.verbose);
         }
         println!();
         if placements.iter().any(|p| p.tier == Tier::RunsPagesFromDisk) {
@@ -129,6 +140,8 @@ fn report(cli: &Cli, sources: &Sources) -> Result<ExitCode> {
             "  note: residency and context are computed from this card's free VRAM. The \
              headroom behind them is provisional, not measured on Arc."
         );
+        println!("  {}", tuning::schema::Origin::legend());
+        print_tuning_source(&profiles, cli.global.verbose);
         if fits.iter().any(Fit::context_at_floor) {
             println!(
                 "  note: a context at the minimum is not the card's limit — experts took \
@@ -167,7 +180,7 @@ fn no_models(sources: &Sources) {
 /// the cells hold bare numbers, so something has to say what they are.
 fn print_fit_header(cols: fit::Columns) {
     println!(
-        "    {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
+        "      {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
         "model",
         "quant",
         "size",
@@ -187,12 +200,17 @@ fn print_fit_row(
     card: &ModelCard,
     f: &Fit,
     placement: Option<&Placement>,
+    // 🔴 Whether the settings behind this row were measured is a different question from
+    // whether the model fits, so it is a different glyph. Folding them into one mark would
+    // make a derived plan on a card that fits indistinguishable from a measured one.
+    tune: tuning::schema::Origin,
     cols: fit::Columns,
     verbose: u8,
 ) {
     let mark = if f.fits() { "✓" } else { "·" };
+    let badge = tune.glyph();
     println!(
-        "  {mark} {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
+        "  {mark} {badge} {:<id$} {:<quant$} {:>size$}  {:<tier$}  {:<res$} {:>ctx$}",
         card.id,
         card.quant,
         format::bytes(card.file_bytes),
@@ -471,6 +489,9 @@ fn info(cli: &Cli, sources: &Sources, args: &InfoArgs) -> Result<ExitCode> {
     let host = sources.host.probe()?;
     let budget = budget_for(cli, &host);
     let placement = placements_for(std::slice::from_ref(&card), &host, budget).remove(0);
+    let profiles = tuning::store::Store::load();
+    let cpu = crate::host::cpu();
+    let tuned = tuning::resolve::resolve(&profiles, devices.primary(), &card, &cpu, args.ctx);
 
     if cli.global.json {
         return emit(json!({
@@ -478,8 +499,23 @@ fn info(cli: &Cli, sources: &Sources, args: &InfoArgs) -> Result<ExitCode> {
             "model": card,
             "requested_ctx": args.ctx,
             "host": host_json(&host, budget),
+            "cpu": cpu,
             "placement": placement_json(&card.id, &placement),
             "plan": plan,
+            "tuning": tuned,
+            "tuning_profile": tuned.basis.profile_id(),
+            "tuning_source": profiles.provenance(),
+            "tuning_command": tuned.command("llama-server", card.file.as_deref()),
+            "candidate": args.candidate.as_ref().and_then(|spec| {
+                let baseline = tuned.baseline.as_ref()?;
+                let c = tuning::compare::parse_candidate(
+                    spec,
+                    &baseline.metric,
+                    baseline.depth_tokens,
+                )
+                .ok()?;
+                serde_json::to_value(tuning::compare::compare(baseline, &c)).ok()
+            }),
         }));
     }
 
@@ -531,8 +567,13 @@ fn info(cli: &Cli, sources: &Sources, args: &InfoArgs) -> Result<ExitCode> {
         (Some(p), Some(d)) => print_plan(p, d, cli.global.verbose),
         _ => println!("  no device to plan against — {}", devices.verdict.headline()),
     }
+    print_tuning(&tuned, &card, &profiles, cli.global.verbose);
+    let code = match &args.candidate {
+        Some(spec) => print_candidate(&tuned, spec),
+        None => ExitCode::SUCCESS,
+    };
     print_provenance(sources);
-    Ok(ExitCode::SUCCESS)
+    Ok(code)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -688,4 +729,189 @@ fn print_provenance(sources: &Sources) {
         println!();
         println!("  note: {}.", sources.stub_note);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Tuning
+// ---------------------------------------------------------------------------------------
+
+/// "Here is what we will run, and why."
+///
+/// 🔴 The confidence line comes **first**, before the command. A user who reads only one line
+/// of this block must read the one that says whether anything here was measured — putting the
+/// pasteable command above it would let the interesting half scroll past.
+fn print_tuning(
+    r: &tuning::resolve::Resolved,
+    card: &ModelCard,
+    store: &tuning::store::Store,
+    verbose: u8,
+) {
+    section("Tuning");
+    println!(
+        "  {:<18}{} {}",
+        "confidence",
+        r.origin.glyph(),
+        // The basis word, not the origin word: they differ only where it matters, when there
+        // is no device or no plan and the honest answer is "none" rather than "untuned".
+        r.basis.label().to_uppercase()
+    );
+    println!("  {:<18}{}", "", r.basis.sentence());
+
+    let flags = r.flags();
+    if flags.is_empty() {
+        println!();
+        println!("  No settings to suggest.");
+        print_tuning_source(store, verbose);
+        return;
+    }
+
+    println!();
+    println!("  What we will run");
+    println!("    {}", r.command("llama-server", card.file.as_deref()));
+    println!();
+    // 16 wide because `--cache-type-k` is 14 characters. A flag that runs into its own
+    // value reads as a rendering fault, and this table exists to be trusted.
+    println!("  {:<16}{:<10}{:<14}what it does", "flag", "value", "provenance");
+    for f in &flags {
+        println!("  {:<16}{:<10}{:<14}{}", f.flag, f.value, f.origin.label(), f.purpose);
+    }
+    // 🔴 Restated in words under the table. The column above is a label; this is the claim,
+    // and a reader who skims a table and acts on it must not be able to miss the claim.
+    let weakest = r.weakest_field_origin();
+    if !weakest.is_measured() {
+        println!();
+        println!(
+            "  🔴 not every setting above was measured — the weakest is {}. Treat this as a \
+             starting point and measure from it.",
+            weakest.label()
+        );
+    }
+
+    if let Some(fraction) = r.bank_resident {
+        println!();
+        println!(
+            "  {:<18}{:.1}% of the expert bank stays on the card",
+            "residency",
+            fraction * 100.0
+        );
+        if let Some(c) = r.coverage {
+            println!(
+                "  {:<18}{:.0}% of expert touches on prose, {:.0}% on code — so up to {:.0}% \
+                 of touches stage across the bus",
+                "coverage",
+                c.prose * 100.0,
+                c.code * 100.0,
+                c.worst_case_miss * 100.0
+            );
+            println!(
+                "  {:<18}measured on this model's own routing trace. It predicts staged \
+                 bytes, not tok/s — this project has no validated model between the two.",
+                ""
+            );
+        }
+    }
+
+    match &r.baseline {
+        Some(b) => {
+            println!();
+            println!("  {:<18}{}", "baseline", b.describe());
+            // The baseline against itself: the floor a candidate measured to the same
+            // precision would have to clear. Anything below it is not a result.
+            let floor = tuning::compare::compare(b, b).minimum_detectable_pct();
+            println!(
+                "  {:<18}a change smaller than {:.1}% would be invisible against this \
+                 baseline's own error bar",
+                "noise floor", floor
+            );
+            println!("  {:<18}moearc info {} --candidate <mean±sd/runs>", "compare", r.model);
+        }
+        None => {
+            println!();
+            println!(
+                "  {:<18}none for this machine. Absolute throughput is an artefact of one \
+                 box (PROTOCOL §0), so there is nothing here to climb from until you measure \
+                 it yourself.",
+                "baseline"
+            );
+        }
+    }
+
+    if !r.caveats.is_empty() {
+        println!();
+        println!("  Read this before you trust it");
+        for c in &r.caveats {
+            println!("  · {c}");
+        }
+    }
+    print_tuning_source(store, verbose);
+}
+
+fn print_tuning_source(store: &tuning::store::Store, verbose: u8) {
+    println!();
+    println!("  note: {}", store.provenance());
+    if store.is_empty() && store.load_error().is_none() {
+        println!(
+            "  note: measured profiles ship with the benchmark data as \
+             bench/tuning-profiles.json; point $MOEARC_PROFILES at your own to override them."
+        );
+    }
+    // A profile the producer wrote and this build refused. Named individually, always — a
+    // silently dropped row looks exactly like a row nobody measured.
+    for bad in store.rejected() {
+        println!("  note: profile rejected — {bad}");
+    }
+    if verbose >= 1
+        && let Some(p) = store.source()
+    {
+        println!("  note: profiles read from {}", p.display());
+    }
+}
+
+/// `--candidate`: is this tweak a win, or is it inside the noise?
+///
+/// 🔴 The refusal cases are the point. A candidate with no error bar, a baseline that is not a
+/// measurement, and a comparison across two prompt depths all produce *no verdict* rather than
+/// a plausible one. A loop run on means alone keeps changes that hurt.
+fn print_candidate(r: &tuning::resolve::Resolved, spec: &str) -> ExitCode {
+    section("Candidate");
+    let Some(baseline) = &r.baseline else {
+        println!(
+            "  There is no measured baseline for this card and model, so a candidate has \
+             nothing to be compared against."
+        );
+        println!("  · {}", r.basis.sentence());
+        println!(
+            "  Measure the configuration above first — `moearc bench` — and the comparison \
+             becomes available."
+        );
+        return ExitCode::from(EXIT_NOT_WIRED);
+    };
+    let candidate =
+        match tuning::compare::parse_candidate(spec, &baseline.metric, baseline.depth_tokens) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("moearc: --candidate {spec}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let c = tuning::compare::compare(baseline, &candidate);
+    println!("  {:<18}{}", "baseline", c.baseline.describe());
+    println!("  {:<18}{}", "candidate", c.candidate.describe());
+    println!(
+        "  {:<18}±{:.2} {} ({:.1}% of the baseline) at k={:.1}",
+        "noise floor",
+        c.noise_floor,
+        tuning::schema::unit_of(&c.baseline.metric),
+        c.noise_floor_pct,
+        c.confidence_k
+    );
+    println!("  {:<18}{}", "verdict", c.verdict.label());
+    println!();
+    println!("  {}", c.summary());
+    if c.verdict.is_win() {
+        println!("  Keep it, and record it as the new baseline.");
+    } else if c.verdict.is_actionable() {
+        println!("  Back it out.");
+    }
+    ExitCode::SUCCESS
 }

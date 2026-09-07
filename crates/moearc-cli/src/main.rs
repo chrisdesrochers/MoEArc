@@ -28,6 +28,7 @@ mod plain;
 mod source;
 mod theme;
 mod tui;
+mod tuning;
 
 use std::process::ExitCode;
 
