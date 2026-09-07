@@ -56,18 +56,59 @@ pub struct HostCpu {
     pub logical_cores: Option<u32>,
 }
 
+/// The share of a machine's cores the fallback claims when no profile measured `-t` on this
+/// CPU.
+///
+/// 🔴 **One named constant, so changing the fallback for every unmeasured machine on earth is
+/// one edit.** It is a policy, not a measurement, and [`HostCpu::derived_threads`] documents
+/// what it costs on the one CPU this project has actually benchmarked.
+pub const FALLBACK_THREAD_FRACTION: f64 = 0.50;
+
+/// [`FALLBACK_THREAD_FRACTION`] of `cores`, never below one thread.
+pub fn fallback_threads(cores: u32) -> u32 {
+    ((cores as f64 * FALLBACK_THREAD_FRACTION).round() as u32).max(1)
+}
+
 impl HostCpu {
-    /// The thread count to derive from this machine.
+    /// The thread count to suggest on a CPU no profile has measured.
     ///
-    /// 🔴 **Physical cores, and the reason is measured even though the value is not.**
-    /// `llama-bench` defaults to **4** threads; on this project's 20-core box that default cost
-    /// **2.1×** — 13.6 tok/s against 28.5 on a 59 GiB model. So *not choosing* is the expensive
-    /// option, and one physical core per thread is the conventional starting point for a
-    /// memory-bound workload where hyperthread siblings contend for the same load/store units.
-    /// **The value is a convention, not a benchmark result**, and it is labelled
-    /// [`Origin::Derived`] wherever it appears.
+    /// # Why there is a fallback at all
+    ///
+    /// 🔴 **Not choosing is measurably the worst option.** llama.cpp does not scale `-t` to the
+    /// machine: `common_cpu_get_num_math()` mis-reads Arrow Lake's hybrid topology and settles
+    /// on **4 threads** on a 20-core part. On this project's own box that default cost
+    /// **2.09×** on gpt-oss-120B — **14.11 ± 0.33 tok/s against 29.54 ± 0.04 at `-t 16`**, with
+    /// the two arms interleaved (`-t 16,4,16,4,16`) so page-cache state is a common-mode error
+    /// rather than the result. `bench/tuning-profiles.md`, *"`-t` — the most valuable flag"*.
+    ///
+    /// # What we ship, and what it costs
+    ///
+    /// ⚠️ **We ship half the cores. The measured optimum on the one CPU we have tested is
+    /// ~80% of them — 16 of 20 — and half costs roughly a fifth of the throughput `-t 16`
+    /// reaches on that machine.** The in-tree `-t 8` readings bracket it: Llama-4-Scout
+    /// 14.27 → 18.52 (**−23%**), Qwen3-30B 68.20 → 73.04 (−6.6%), Qwen3.6-35B 53.18 → 54.04
+    /// (−1.6%). The cost depends entirely on how much work is host-side, which is `-ncmoe`'s
+    /// business, not this constant's.
+    ///
+    /// **50% is deliberately conservative for silicon nobody has benchmarked, and is not
+    /// claimed to be optimal.** 16-of-20 is one measurement on one hybrid Intel part; half the
+    /// cores leaves the other half of an unknown machine alone, the loss is bounded, and a user
+    /// who measures moves it up. Every screen labels the value [`Origin::Derived`], never
+    /// measured.
+    ///
+    /// # Never `nproc`
+    ///
+    /// 🔴 `-t 20` on this 20-core box **lost on five of the six models where threads matter at
+    /// all** — gpt-oss-120B −8.3%, gpt-oss-20B −10.8%, olmoe at full offload −10.8%,
+    /// Qwen3.6-35B −7.3%, Qwen3-30B −5.6%, with only Llama-4-Scout a tie — and its cells were
+    /// three to four times noisier besides (stddev 1.0–2.2 against 0.0–0.5 below it). **8
+    /// P-cores and 12 E-cores are not 20 equal cores**, and a thread pool that assumes they are
+    /// runs at the pace of its slowest member. Physical cores are the base for the fraction for
+    /// the same reason hyperthread siblings are not counted: they share load/store units, and a
+    /// memory-bound expert gather does not get faster for being given two threads on one core.
     pub fn derived_threads(&self) -> Option<u32> {
-        self.physical_cores.or(self.logical_cores).filter(|n| *n > 0)
+        let cores = self.physical_cores.or(self.logical_cores).filter(|n| *n > 0)?;
+        Some(fallback_threads(cores))
     }
 
     /// Whether a profile was measured on a machine with the same core count.
@@ -263,10 +304,18 @@ impl Resolved {
             "KV cache width",
             self.kv_cache_type.as_ref().map(|s| (s.value.clone(), s.origin)),
         );
+        // 🔴 `-fa` takes a value in this engine — `common_arg({"-fa", "--flash-attn"},
+        // "[on|off|auto]", ...)`. A bare `-fa` does not mean "on": it swallows whatever token
+        // follows it and then refuses it, or runs off the end of the command line. The value
+        // is always printed, and `off` is printed too when a profile measured it that way,
+        // because a pasteable command that omits a measured setting is not the command that
+        // was measured.
         push(
             "-fa",
             "flash attention",
-            self.flash_attn.as_ref().filter(|s| s.value).map(|s| ("on".to_string(), s.origin)),
+            self.flash_attn
+                .as_ref()
+                .map(|s| ((if s.value { "on" } else { "off" }).to_string(), s.origin)),
         );
         out
     }
@@ -280,9 +329,7 @@ impl Resolved {
         }
         for f in self.flags() {
             parts.push(f.flag.to_string());
-            if f.flag != "-fa" {
-                parts.push(f.value);
-            }
+            parts.push(f.value);
         }
         parts.extend(self.extra_args.iter().cloned());
         parts.join(" ")
@@ -399,7 +446,7 @@ pub fn resolve(
         }
     };
 
-    match (exact, other_quant, other_card, sibling) {
+    let mut resolved = match (exact, other_quant, other_card, sibling) {
         (Some(p), ..) => from_exact(p, card, device, cpu, ctx, split),
         (None, Some(p), ..) => from_nearby(
             p,
@@ -427,10 +474,147 @@ pub fn resolve(
             Basis::SiblingModel { profile: p.id.clone(), model: p.model.id.clone() },
         ),
         _ => from_derived(card, cpu, split),
+    };
+    annotate(&mut resolved, card, cpu);
+    resolved
+}
+
+/// The sentences that belong beside a setting, decided from what actually reached the flags.
+///
+/// 🔴 Kept out of [`from_derived`] deliberately. It is the base case every other rung is built
+/// on, and an exact match overwrites some of these fields with measured values — a paragraph
+/// explaining a derivation that no longer applies is worse than no paragraph. Each note below
+/// is emitted only while the field it explains is still ours.
+fn annotate(r: &mut Resolved, card: &ModelCard, cpu: &HostCpu) {
+    if r.flags().is_empty() {
+        return; // No settings were produced at all; `basis.sentence()` has already said why.
+    }
+    if r.n_cpu_moe.as_ref().is_some_and(|s| !s.origin.is_measured()) {
+        r.caveats.push(quant_note(card));
+    }
+    if let (Some(n), Some(c)) = (&r.n_cpu_moe, &r.ctx_size) {
+        r.caveats.push(context_coupling_note(n.value, c.value));
+    }
+    if let Some(t) = r.threads.as_ref().filter(|s| s.origin == Origin::Derived)
+        && let Some(cores) = cpu.physical_cores.or(cpu.logical_cores)
+    {
+        r.caveats.push(threads_note(cores, t.value));
+    }
+    let fa_is_ours = r.flash_attn.as_ref().is_some_and(|s| !s.origin.is_measured());
+    let kv_is_ours = r.kv_cache_type.as_ref().is_some_and(|s| !s.origin.is_measured());
+    if fa_is_ours || kv_is_ours {
+        r.caveats.push(FA_AND_KV_NOTE.to_string());
     }
 }
 
-/// The engine's own answer for this card and model.
+/// Why `-ncmoe` points the way it does for *this* quantisation.
+fn quant_note(card: &ModelCard) -> String {
+    if experts_belong_on_the_host(&card.quant) {
+        format!(
+            "🔴 `-ncmoe {}` puts **every** block's experts in host RAM, and for {} that is the \
+             measured direction rather than a shortage of VRAM. A/B/A/B inside one process on \
+             gpt-oss-20b: all experts on the CPU 43.42 ± 0.08 tok/s against 36.36 ± 0.01 with all \
+             of them on the card — 1.19× on a model that fits entirely in this card's VRAM \
+             (bench/tuning-profiles.md). Q4_K and Q3_K go the other way, so this is a \
+             per-quantisation rule and not a global one. ⚠️ It was measured on Arc + SYCL with two \
+             gpt-oss models and nothing here was run on *this* pairing; why it happens was never \
+             profiled.",
+            card.moe_blocks, card.quant
+        )
+    } else {
+        format!(
+            "`-ncmoe` above is the lowest this planner will stand behind, and for {} lower is \
+             faster: Qwen3-30B measures 74.08 tok/s at `-ncmoe 18` against 58.58 at 30, monotone \
+             across the range (bench/tuning-profiles.md). ⚠️ The headroom behind our floor is a \
+             stated guess rather than a measurement, so the true floor may be a block or two below \
+             it — llama.cpp answers one block too few with a clean OUT_OF_DEVICE_MEMORY, after \
+             loading the whole model.",
+            card.quant
+        )
+    }
+}
+
+/// The one thing a user must not do with a split: raise `-c` and leave `-ncmoe` alone.
+fn context_coupling_note(n_cpu_moe: u32, ctx: u32) -> String {
+    format!(
+        "🔴 `-ncmoe {n_cpu_moe}` is the floor for the `-c {}` printed beside it, not for this \
+         model. Context and expert slots come out of the same pool and the floor moves with depth \
+         — Qwen3-30B measured 18 blocks offloaded at depth 0, 21 at 8K and 28 at 32K \
+         (bench/tuning-profiles.md). Raising `-c` by hand without raising `-ncmoe` is how a run \
+         dies with OUT_OF_DEVICE_MEMORY *after* loading tens of gigabytes; ask for the context you \
+         want with `--ctx` and the split is recomputed for it.",
+        crate::format::count(ctx as i64)
+    )
+}
+
+/// What the fallback thread count is, and what it is not.
+fn threads_note(cores: u32, threads: u32) -> String {
+    format!(
+        "`-t {threads}` is {:.0}% of this machine's {cores} cores — a deliberately conservative \
+         fallback for a CPU nobody has benchmarked, not an optimum. 🔴 What it protects against is \
+         llama.cpp's own default of **4 threads whatever your core count**, which cost 2.09× here \
+         (14.11 against 29.54 tok/s on gpt-oss-120b). ⚠️ On the one CPU this project has measured \
+         the optimum is 16 of 20 — about 80% — and half the cores gives up roughly a fifth of it \
+         (Llama-4-Scout 14.27 → 18.52 tok/s between `-t 8` and `-t 16`). Raise it if you measure, \
+         but never to `nproc`: `-t 20` on that 20-core hybrid part lost on five of six models and \
+         was three to four times noisier as well.",
+        FALLBACK_THREAD_FRACTION * 100.0
+    )
+}
+
+/// The KV width every plan in this project is computed at, and the only one it recommends on
+/// Arc. Named so the planner's assumption and the emitted flag cannot drift apart.
+const KV_CACHE_TYPE: &str = "f16";
+
+const FA_AND_KV_NOTE: &str = "`-fa on` and an f16 KV cache are stated rather than inherited. Flash attention is worth \
+      1.72× at 8K (Qwen3-30B, 52.4 tok/s against 30.52 with `-fa off`) and llama.cpp's `auto` \
+      already resolves to on — it is written out because `-fa off` is advice users copy from other \
+      backends. 🔴 Quantised KV is the trap: `q8_0` measured **−19%** on this card (42.87 against \
+      52.97), bought back exactly **one** `-ncmoe` block, and one block below that it hard-aborts \
+      inside the SYCL backend instead of returning an OOM a tool can catch. f16 is also the width \
+      the split above was planned at.";
+
+/// Whether this quantisation's experts are measurably faster **on the host** than on the card.
+///
+/// 🔴 **The direction of `-ncmoe` flips with the quantisation, and a single derivation rule
+/// would be wrong for half the catalogue.** Both halves are measured, on this Arc B580 with the
+/// SYCL backend — `bench/tuning-profiles.md`, *"`-ncmoe` — the direction depends on the
+/// quantisation, not the model size"*:
+///
+/// * **MXFP4 — put *every* expert on the CPU.** The cleanest evidence is an A/B/A/B inside a
+///   single process on gpt-oss-20B (`-ncmoe 24,0,24,0`, which controls for drift and read only
+///   22 MiB from disk): every expert on the **CPU** measured **43.42 ± 0.08 tok/s** against
+///   **36.36 ± 0.01** with every expert on the **GPU**. **1.19×, on a model whose 11.28 GiB
+///   fits entirely inside this card's VRAM.** The 10-point sweep between the two ends is
+///   monotone in the same direction (+21%) and the conclusion survives at depth.
+/// * **Q4_K / Q3_K — offload as little as VRAM allows.** Qwen3-30B is monotone the other way:
+///   **74.08 tok/s at `-ncmoe 18` against 58.58 at 30**, a 1.26× spread. Qwen3.6-35B agrees
+///   (55.58 at 22 against 50.85 at 28).
+///
+/// ⚠️ **What is measured is *that* it happens, not *why*.** The plausible reading is that the
+/// SYCL MXFP4 matmul path is weak relative to this CPU's, but the kernel was never profiled, so
+/// that is a hypothesis. The rule is therefore carried as a property of **this backend at this
+/// quantisation**, and everything it produces is still [`Origin::Derived`]: a measurement of
+/// gpt-oss on a B580 is not a measurement of the pairing in front of us.
+fn experts_belong_on_the_host(quant: &str) -> bool {
+    // ggml's own spelling, which `moearc-model` lowercases before it reaches a `ModelCard`.
+    // Matched by prefix so a future `mxfp4_*` variant lands here too, and nothing else does.
+    quant.to_ascii_lowercase().starts_with("mxfp4")
+}
+
+/// The engine's own answer for this card and model — the whole of the fallback's arithmetic.
+///
+/// [`plan_llama`] takes the model's geometry and the VRAM free *right now*, refuses in
+/// arithmetic a plan it cannot stand behind, and returns `-ncmoe` and `-c` from **one**
+/// calculation, so the two flags cannot contradict each other.
+///
+/// 🔴 **The context is part of the answer, not a detail beside it.** The `-ncmoe` floor moves
+/// with depth — Qwen3-30B measured 18 blocks at depth 0, **21 at 8K and 28 at 32K** — so a
+/// split is only the floor for the `-c` it was planned with. A caller who asks for a context
+/// gets a split planned for that context; a caller who asks for nothing gets
+/// [`Context::Largest`], deliberately, because `fit.rs` already refuses to invent a default
+/// context and two modules quietly assuming different ones would put two contradictory numbers
+/// on one screen.
 fn derive(
     device: &DeviceRow,
     card: &ModelCard,
@@ -448,9 +632,63 @@ fn derive(
     let geometry =
         BlockGeometry { moe_blocks: card.moe_blocks, experts_per_block: card.experts_per_block };
     let want = ctx.map_or(Context::Largest, Context::Tokens);
-    plan_llama(memory, &footprint, geometry, policy, want)
-        .map(|(_, s)| s)
-        .map_err(|e| e.to_string())
+    let (_, split) =
+        plan_llama(memory, &footprint, geometry, policy, want).map_err(|e| e.to_string())?;
+
+    // 🔴 Applied *after* the plan succeeded, never instead of it. The plan that succeeded put
+    // MORE on the card than this does, so moving every block's experts to the host spends
+    // strictly less VRAM than the arithmetic already found room for: it cannot turn a feasible
+    // plan into an OUT_OF_DEVICE_MEMORY.
+    if experts_belong_on_the_host(&card.quant) {
+        return Ok(LlamaSplit::all_experts_on_host(
+            geometry,
+            host_expert_context(
+                memory,
+                &footprint,
+                geometry,
+                policy,
+                card,
+                want,
+                split.context_tokens,
+            ),
+        ));
+    }
+    Ok(split)
+}
+
+/// The context to pair with an all-experts-on-the-host split.
+///
+/// 🔴 Without this the recommendation would be self-defeating. `plan` fills expert slots
+/// greedily, so the split it returns spends the card on residency and lands the context on the
+/// policy floor — and then the MXFP4 rule takes every one of those slots away again, leaving
+/// gigabytes of VRAM committed to nothing while `-c` still reads 2,048. The bytes the experts
+/// were going to occupy are exactly what buys the context this configuration is worth: the
+/// measured gpt-oss-20B recommendation reaches **65K tokens at 36.88 tok/s** precisely because
+/// `-ncmoe 24` leaves 10,097 MiB free.
+///
+/// So it is re-planned with the bank held at its floor. Two things make the answer conservative
+/// rather than optimistic, which is the direction to be wrong in:
+///
+/// * The floor is `active_experts`, not zero — [`Policy::max_resident_experts`] cannot go below
+///   the slots one token touches. Those slots are budgeted here and then not placed, so the
+///   card has *more* free than this context was planned against.
+/// * It is capped at the context the model was trained for. A KV cache longer than the model
+///   can attend over is memory spent on nothing.
+///
+/// A caller who asked for a specific context is answered with it, not with this.
+fn host_expert_context(
+    memory: DeviceMemory,
+    footprint: &ModelFootprint,
+    geometry: BlockGeometry,
+    policy: &Policy,
+    card: &ModelCard,
+    want: Context,
+    fallback: u32,
+) -> u32 {
+    let floor_only = Policy { max_resident_experts: Some(0), ..*policy };
+    plan_llama(memory, footprint, geometry, &floor_only, want)
+        .map_or(fallback, |(a, _)| a.context_tokens)
+        .min(card.trained_context_tokens.max(1))
 }
 
 fn empty(card: &ModelCard, basis: Basis) -> Resolved {
@@ -483,7 +721,10 @@ fn from_derived(card: &ModelCard, cpu: &HostCpu, split: LlamaSplit) -> Resolved 
     r.ctx_size = Some(Setting::derived(split.context_tokens));
     // The width the plan was computed at, so it is a consequence of the arithmetic rather
     // than a preference. `crate::fit::KvPrecision` is the other half of this statement.
-    r.kv_cache_type = Some(Setting::derived("f16".to_string()));
+    r.kv_cache_type = Some(Setting::derived(KV_CACHE_TYPE.to_string()));
+    // 🔴 Stated, not left to `auto`. `auto` does resolve to on, so this changes nothing about
+    // what runs — it changes what a user can be talked out of. See [`FA_AND_KV_NOTE`].
+    r.flash_attn = Some(Setting::derived(true));
     r.threads = cpu.derived_threads().map(Setting::derived);
     r.bank_resident = bank_resident(card, split.n_cpu_moe);
     r.caveats.push(NGL_NOTE.to_string());
@@ -814,7 +1055,10 @@ mod tests {
         let n = r.n_cpu_moe.as_ref().expect("a derived -ncmoe is still an -ncmoe");
         assert_eq!(n.origin, Origin::Derived);
         assert!(n.value <= card.moe_blocks);
-        assert_eq!(r.threads.as_ref().unwrap().value, 20);
+        // Half of 20, from `FALLBACK_THREAD_FRACTION`. Deliberately not 20: `-t 20` lost on
+        // five of six models on this very CPU, and deliberately not the measured 16 either,
+        // because nothing was measured on *this* machine. See `HostCpu::derived_threads`.
+        assert_eq!(r.threads.as_ref().unwrap().value, 10);
         assert_eq!(r.threads.as_ref().unwrap().origin, Origin::Derived);
         assert!(r.baseline.is_none(), "nothing was measured, so there is nothing to beat");
         assert!(r.command("llama-server", None).contains("-ncmoe"));
@@ -913,7 +1157,7 @@ mod tests {
             logical_cores: Some(16),
         };
         let r = resolve(&store, Some(&b580()), &card, &small, None);
-        assert_eq!(r.threads.as_ref().unwrap().value, 8, "this machine's cores, not theirs");
+        assert_eq!(r.threads.as_ref().unwrap().value, 4, "this machine's cores, not theirs");
         assert_eq!(r.threads.as_ref().unwrap().origin, Origin::Derived);
         assert!(r.caveats.iter().any(|c| c.contains("20-core host")), "{:?}", r.caveats);
     }
@@ -1025,6 +1269,166 @@ mod tests {
                 assert!(!f.purpose.is_empty(), "{} explains itself", f.flag);
                 assert_ne!(f.origin, Origin::Untuned, "an untuned setting is not emitted");
             }
+        }
+    }
+    #[test]
+    fn the_fallback_thread_count_is_half_the_cores_and_never_nproc() {
+        // 🔴 The constant, asserted at the boundary rather than through a resolution, so the
+        // one edit that changes it is visible as a failing test rather than as a silent
+        // behaviour change on every unmeasured machine on earth.
+        assert_eq!(FALLBACK_THREAD_FRACTION, 0.50);
+        assert_eq!(fallback_threads(20), 10);
+        assert_eq!(fallback_threads(8), 4);
+        assert_eq!(fallback_threads(1), 1, "a single-core box still gets a thread");
+        assert_eq!(fallback_threads(3), 2, "odd core counts round rather than truncate to zero");
+        for cores in [1u32, 2, 4, 6, 8, 12, 16, 20, 24, 64, 128, 192] {
+            let t = fallback_threads(cores);
+            assert!(t >= 1, "{cores} cores produced {t} threads");
+            assert!(t < cores.max(2), "{cores} cores must never derive nproc: {t}");
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_measured_profile_derives_every_flag_it_emits() {
+        // The fallback, end to end. Nothing is measured, so nothing may render as measured --
+        // and the answer still has to be runnable rather than absent.
+        let card = find("qwen3-30b-a3b");
+        let r = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), None);
+        assert_eq!(r.origin, Origin::Derived);
+        assert_eq!(r.weakest_field_origin(), Origin::Derived);
+        for f in r.flags() {
+            assert_eq!(f.origin, Origin::Derived, "{} is not derived", f.flag);
+        }
+        let cmd = r.command("llama-server", None);
+        for expected in ["-ngl 99", "-ncmoe", "-t 10", "-c ", "--cache-type-k f16", "-fa on"] {
+            assert!(cmd.contains(expected), "{expected} missing from {cmd}");
+        }
+    }
+
+    #[test]
+    fn flash_attention_is_on_and_the_flag_carries_its_value() {
+        // 🔴 `-fa` takes `[on|off|auto]` in this engine. A bare `-fa` swallows the next token
+        // as its argument, so a command line that ends in one is not a command line.
+        let card = find("gpt-oss-120b");
+        let r = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), None);
+        assert_eq!(r.flash_attn, Some(Setting::derived(true)));
+        let cmd = r.command("llama-server", Some("/m.gguf"));
+        assert!(cmd.contains("-fa on"), "{cmd}");
+        assert!(!cmd.ends_with("-fa"), "a bare -fa is not a value: {cmd}");
+        assert!(
+            r.caveats.iter().any(|c| c.contains("1.72×")),
+            "what -fa is worth is stated: {:?}",
+            r.caveats
+        );
+    }
+
+    #[test]
+    fn the_kv_cache_is_f16_and_q8_0_is_never_offered() {
+        // Measured -19% on this card, buying back exactly one -ncmoe block and then aborting
+        // rather than returning an OOM. It is not a default, and it is not an option here.
+        for id in ["gpt-oss-120b", "qwen3-30b-a3b", "olmoe-1b-7b-0924-instruct"] {
+            let card = find(id);
+            let r = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), None);
+            assert_eq!(r.kv_cache_type, Some(Setting::derived("f16".to_string())), "{id}");
+            assert!(!r.command("llama-server", None).contains("q8_0"), "{id}");
+        }
+    }
+
+    #[test]
+    fn mxfp4_puts_every_expert_on_the_host_and_q4_k_does_the_opposite() {
+        // 🔴 The measurement that makes a single derivation rule wrong for half the catalogue.
+        // gpt-oss fits far better on this card than Qwen3 does, and gets *more* offloaded.
+        let mxfp4 = find("gpt-oss-120b");
+        let r = resolve(&Store::empty(), Some(&b580()), &mxfp4, &cpu(), None);
+        assert_eq!(
+            r.n_cpu_moe.as_ref().unwrap().value,
+            mxfp4.moe_blocks,
+            "every block's experts belong in host RAM at MXFP4"
+        );
+        assert_eq!(r.n_cpu_moe.as_ref().unwrap().origin, Origin::Derived, "measured, elsewhere");
+        assert_eq!(r.bank_resident, Some(0.0));
+        assert!(r.caveats.iter().any(|c| c.contains("1.19×")), "{:?}", r.caveats);
+        // 🔴 And the VRAM the experts vacated has to reach the context, or the recommendation
+        // frees gigabytes and then spends them on nothing. The measured gpt-oss-20B config is
+        // worth 65K tokens precisely because -ncmoe 24 leaves 10,097 MiB free.
+        let ctx = r.ctx_size.as_ref().unwrap();
+        assert!(ctx.value > 2_048, "the freed card has to buy context: {}", ctx.value);
+        assert!(
+            ctx.value <= mxfp4.trained_context_tokens,
+            "and never past what the model was trained for: {} > {}",
+            ctx.value,
+            mxfp4.trained_context_tokens
+        );
+        // A context the caller asked for is still the callers, not the planners.
+        let asked = resolve(&Store::empty(), Some(&b580()), &mxfp4, &cpu(), Some(4_096));
+        assert_eq!(asked.ctx_size.as_ref().unwrap().value, 4_096);
+        assert_eq!(asked.n_cpu_moe.as_ref().unwrap().value, mxfp4.moe_blocks);
+
+        let q4 = find("qwen3-30b-a3b");
+        let r = resolve(&Store::empty(), Some(&b580()), &q4, &cpu(), None);
+        let n = r.n_cpu_moe.as_ref().unwrap().value;
+        assert!(n < q4.moe_blocks, "Q4_K keeps what it can on the card: {n}");
+        assert!(r.bank_resident.unwrap() > 0.0);
+        assert!(r.caveats.iter().any(|c| c.contains("74.08")), "{:?}", r.caveats);
+    }
+
+    #[test]
+    fn the_split_names_the_context_it_is_the_floor_for() {
+        // The measured trap: Qwen3-30B needs 18 blocks offloaded at depth 0 and 28 at 32K. A
+        // user who takes the -ncmoe and raises -c by hand OOMs after loading the whole model.
+        let card = find("qwen3-30b-a3b");
+        let shallow = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), None);
+        let deep = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), Some(32_768));
+        assert!(
+            deep.n_cpu_moe.as_ref().unwrap().value > shallow.n_cpu_moe.as_ref().unwrap().value,
+            "a deeper context has to cost expert blocks: {:?} then {:?}",
+            shallow.n_cpu_moe,
+            deep.n_cpu_moe
+        );
+        for r in [&shallow, &deep] {
+            assert!(
+                r.caveats.iter().any(|c| c.contains("floor for the `-c")),
+                "the coupling is named: {:?}",
+                r.caveats
+            );
+        }
+    }
+
+    #[test]
+    fn no_fallback_value_can_ever_render_as_measured() {
+        // 🔴 The invariant, from the fallback's side: with nothing measured anywhere, no field
+        // and no rendered flag may come back `measured` for any model or any context.
+        for id in
+            ["gpt-oss-120b", "qwen3-30b-a3b", "qwen3.6-35b-a3b-ud", "olmoe-1b-7b-0924-instruct"]
+        {
+            let card = find(id);
+            for ctx in [None, Some(2_048), Some(4_096)] {
+                let r = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), ctx);
+                assert!(!r.origin.is_measured(), "{id} at {ctx:?}");
+                assert!(!r.weakest_field_origin().is_measured(), "{id} at {ctx:?}");
+                assert!(r.baseline.is_none(), "{id}: nothing was run, so nothing may be climbed");
+                for f in r.flags() {
+                    assert!(!f.origin.is_measured(), "{id} at {ctx:?}: {} is measured", f.flag);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_built_in_measurements_reach_the_models_on_this_machine() {
+        // The other half of the ladder, against the file that actually ships. Every model
+        // `bench/tuning-profiles.md` measured must resolve to a measured basis with the
+        // measured thread count, on a host with the same core count it was measured on.
+        let store = Store::from_json(
+            crate::tuning::store::BUILTIN.expect("the built-in set is compiled in"),
+            None,
+        );
+        for (id, threads) in [("gpt-oss-120b", 16u32), ("qwen3-30b-a3b", 16)] {
+            let card = find(id);
+            let r = resolve(&store, Some(&b580()), &card, &cpu(), None);
+            assert_eq!(r.origin, Origin::Measured, "{id}: {:?}", r.basis);
+            assert_eq!(r.threads, Some(Setting::measured(threads)), "{id}");
+            assert!(r.basis.profile_id().unwrap().starts_with("arc-b580/"), "{id}");
         }
     }
 }

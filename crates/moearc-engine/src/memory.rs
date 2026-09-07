@@ -868,6 +868,36 @@ impl LlamaSplit {
     pub fn is_cpu_only_experts(&self) -> bool {
         self.gpu_expert_blocks == 0
     }
+
+    /// The split that keeps **every** block's experts in host RAM.
+    ///
+    /// 🔴 **Not a degraded plan, and not a shortage of VRAM.** `bench/tuning-profiles.md`
+    /// measures MXFP4 experts running **1.19× faster on the CPU than on the card** — A/B/A/B
+    /// inside one process, on a model whose 11.28 GiB fits entirely in that card's VRAM. For
+    /// that quantisation this is the *fastest* configuration rather than the last resort. The
+    /// caller decides when it applies; this constructor exists so the resulting split is
+    /// expressible without lying about the arithmetic behind it.
+    ///
+    /// `context_tokens` is expected to come from a [`plan`] that succeeded with **more** on the
+    /// card than this holds, which is what makes the pairing safe: zero resident slots spends
+    /// strictly less VRAM than the allocation that context was planned inside, so a feasible
+    /// plan cannot become an `OUT_OF_DEVICE_MEMORY`.
+    ///
+    /// The slot counters are zero rather than the plan's, deliberately: reporting slots the
+    /// plan found room for would make a renderer say *"N slots' worth of card goes unused"*
+    /// beside a flag that never asked for them.
+    pub fn all_experts_on_host(geom: BlockGeometry, context_tokens: u32) -> Self {
+        Self {
+            n_cpu_moe: geom.moe_blocks,
+            gpu_expert_blocks: 0,
+            moe_blocks: geom.moe_blocks,
+            context_tokens,
+            slots_used: 0,
+            slots_planned: 0,
+            slots_dropped_to_whole_blocks: 0,
+            expert_bytes_on_gpu: 0,
+        }
+    }
 }
 
 /// Translate an [`Allocation`] into llama.cpp's flags.
@@ -950,6 +980,34 @@ mod llama_split_tests {
 
     fn card(free: u64) -> DeviceMemory {
         DeviceMemory { total_bytes: free, free_bytes: free }
+    }
+
+    #[test]
+    fn every_expert_on_the_host_is_a_representable_split_and_spends_no_vram() {
+        // The MXFP4 recommendation: measured 1.19x faster than putting the same experts on the
+        // card, on a card they fit on. It has to be expressible, and it has to be a *valid*
+        // llama.cpp flag rather than a special case a renderer has to know about.
+        let (_, g) = gpt_oss();
+        let s = LlamaSplit::all_experts_on_host(g, 8_192);
+        assert_eq!(s.n_cpu_moe, g.moe_blocks, "-ncmoe is the whole block count");
+        assert!(s.n_cpu_moe <= g.moe_blocks, "and still a value llama.cpp accepts");
+        assert!(s.is_cpu_only_experts());
+        assert_eq!(s.expert_bytes_on_gpu, 0, "it spends no VRAM on experts at all");
+        assert_eq!(s.slots_dropped_to_whole_blocks, 0, "nothing was rounded away");
+        assert_eq!(s.context_tokens, 8_192, "the context it was paired with survives");
+    }
+
+    #[test]
+    fn all_experts_on_the_host_spends_less_than_the_plan_it_replaces() {
+        // The safety argument, as arithmetic rather than as a comment: the plan that succeeded
+        // put experts on the card, and this puts fewer there -- none. A feasible plan cannot
+        // become an OUT_OF_DEVICE_MEMORY by taking bytes off the device.
+        let (m, g) = gpt_oss();
+        let (_, planned) =
+            plan_llama(card(11_811_160_064), &m, g, &Policy::default(), Context::Largest).unwrap();
+        let host = LlamaSplit::all_experts_on_host(g, planned.context_tokens);
+        assert!(host.expert_bytes_on_gpu <= planned.expert_bytes_on_gpu);
+        assert!(host.n_cpu_moe >= planned.n_cpu_moe, "more offloaded, never less");
     }
 
     #[test]

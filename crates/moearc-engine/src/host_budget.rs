@@ -106,6 +106,27 @@ impl Reserve {
     /// someone's machine a local inference tool should feel entitled to. A fifth is defensible
     /// and is stated on screen; a user who disagrees moves the budget down, and a user who
     /// wants it higher is the one case we refuse, on purpose.
+    ///
+    /// # 🔴 Why this is a reserve and not a cap on the model — settled, do not re-litigate
+    ///
+    /// A **fraction-of-RAM cap on the model itself** was proposed (50%) and refused. It is the
+    /// obvious-looking safety feature and it is wrong twice over:
+    ///
+    /// 1. **It would refuse this project's own headline result.** Half of the 91 GiB box every
+    ///    number in `bench/` was taken on is 45.5 GiB. **gpt-oss-120B is 59.0 GiB** and runs
+    ///    there at a measured 29.56 ± 0.16 tok/s, with 32K of context. A cap that declines the
+    ///    model the tool exists to demonstrate is not a safety feature.
+    /// 2. **It would not protect anything, because the weights are `mmap`ped.** They live in
+    ///    the page cache, which the kernel reclaims the instant something else wants it — the
+    ///    machine is already protected, by the kernel, whatever number we write down. The cap
+    ///    would have no effect on memory pressure at all. Its only effect would be to decline
+    ///    models that demonstrably work.
+    ///
+    /// So the protection lives here, in a reserve subtracted from `MemAvailable` to form a
+    /// **ceiling no budget can exceed**, and a model larger than the budget is *classified*
+    /// rather than *refused* — [`Tier::RunsPagesFromDisk`], which says slower and does not say
+    /// failure. `a_fifty_nine_gib_model_is_never_refused_on_a_ninety_one_gib_box` is the
+    /// regression guard.
     pub const DEFAULT: Self = Self::Fraction(0.20);
 
     fn take_from(self, available: u64) -> u64 {
@@ -708,6 +729,26 @@ mod tests {
         assert!(p.tier.runs());
         assert!(p.ram_fraction() > 0.0 && p.ram_fraction() < 0.2);
         assert!(p.reason.to_string().contains("It runs"), "{}", p.reason);
+    }
+
+    #[test]
+    fn a_fifty_nine_gib_model_is_never_refused_on_a_ninety_one_gib_box() {
+        // 🔴 The regression guard for the cap that was proposed and refused; see
+        // `Reserve::DEFAULT`. The machine is this project's own: 91 GiB fitted, ~80 GiB
+        // reported available. A 50%-of-RAM cap on the model would put the ceiling at 45.5 GiB
+        // and decline gpt-oss-120b -- a model measured on this exact box at 29.56 tok/s.
+        let box_91 = HostMemory { total_bytes: 98_247_000_000, available_bytes: 86_000_000_000 };
+        let b = HostBudget::default_for(box_91, &BudgetPolicy::default());
+        let p = place(here(63_387_346_208), b, disk(3_000 * GIB));
+        assert_eq!(p.tier, Tier::RunsFromRam, "{}", p.reason);
+        assert!(b.bytes() > 45_500_000_000, "the ceiling is not half of RAM: {}", b.bytes());
+
+        // And even at a budget that *is* half the machine, the verdict is a tier, never a
+        // refusal: the excess pages from disk and the model still answers.
+        let halved = b.set(45_500_000_000);
+        let p = place(here(63_387_346_208), halved, disk(3_000 * GIB));
+        assert_eq!(p.tier, Tier::RunsPagesFromDisk);
+        assert!(p.tier.runs(), "a model past the budget is slower, not refused");
     }
 
     #[test]

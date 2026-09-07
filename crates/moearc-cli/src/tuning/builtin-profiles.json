@@ -1,0 +1,251 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-07",
+  "profiles": [
+    {
+      "id": "arc-b580/gpt-oss-120b/mxfp4",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "gpt-oss-120b",
+        "quant": "mxfp4",
+        "file_bytes": 63387346208,
+        "moe_blocks": 36,
+        "experts_per_block": 128,
+        "active_experts_per_block": 4,
+        "expert_slots_total": 4608,
+        "parameters": 116829156672
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 36,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "score": {
+        "metric": "decode_tokens_per_second",
+        "depth_tokens": 0,
+        "mean": 29.56,
+        "stddev": 0.16,
+        "runs": 4
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "A 59.02 GiB model on an 11.7 GiB card: 29.56 tok/s at depth 0, 28.52 at 8K, 26.83 at 32K. -ncmoe is flat from its OOM floor of 31 up to 36 (29.00 against 29.56, inside the 3% noise floor), so 36 is shipped for headroom -- it frees 8.1 GiB of VRAM for no measurable throughput, and that VRAM is what makes 32K context reachable. The previously published -ncmoe 31 sat exactly on the floor for nothing."
+    },
+    {
+      "id": "arc-b580/gpt-oss-20b/mxfp4",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "gpt-oss-20b",
+        "quant": "mxfp4",
+        "file_bytes": 12109566624,
+        "moe_blocks": 24,
+        "experts_per_block": 32,
+        "active_experts_per_block": 4,
+        "expert_slots_total": 768,
+        "parameters": 20914757184
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 24,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "score": {
+        "metric": "decode_tokens_per_second",
+        "depth_tokens": 0,
+        "mean": 44.25,
+        "stddev": 0.36,
+        "runs": 4
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "The MXFP4 inversion in its cleanest form: every expert on the CPU (-ncmoe 24) measured 43.42 +- 0.08 against 36.36 +- 0.01 with every expert on the GPU, A/B/A/B inside one process -- 1.19x on a model that fits entirely in this card's VRAM. Uses 1862 MiB, leaving 10097 MiB, which is what takes it to 65K context at 36.88 tok/s. Highest -t sensitivity in the set (3.66x)."
+    },
+    {
+      "id": "arc-b580/qwen3-30b-a3b/q4_K",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "qwen3-30b-a3b",
+        "quant": "q4_K",
+        "file_bytes": 18556686912,
+        "moe_blocks": 48,
+        "experts_per_block": 128,
+        "active_experts_per_block": 8,
+        "expert_slots_total": 6144,
+        "parameters": 30532122624
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 21,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "score": {
+        "metric": "decode_tokens_per_second",
+        "depth_tokens": 8192,
+        "mean": 52.73,
+        "stddev": 0.65,
+        "runs": 4
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "The Q4_K direction, and the model that proves the floor moves with context: 18 blocks offloaded at depth 0, 21 at 8K, 28 at 32K. -ncmoe 21 is the 8K floor; raise it to 28 for 32K. Throughput is monotone downward in -ncmoe (74.08 at 18 against 58.58 at 30). -fa off costs 1.72x here and q8_0 KV costs 19%."
+    },
+    {
+      "id": "arc-b580/qwen3-coder-30b-a3b-instruct/q4_K",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "qwen3-coder-30b-a3b-instruct",
+        "quant": "q4_K",
+        "file_bytes": 18556689568,
+        "moe_blocks": 48,
+        "experts_per_block": 128,
+        "active_experts_per_block": 8,
+        "expert_slots_total": 6144,
+        "parameters": 30532122624
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 21,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "Independently measured rather than transferred from qwen3-30b-a3b (PROTOCOL 9): identical floor of 18, 72.77 +- 0.13 against 73.04 +- 0.09 at -ncmoe 18, and a depth curve matching at every point within 0.7%. No pooled score is recorded here because the transfer check was the measurement; the settings still tune."
+    },
+    {
+      "id": "arc-b580/qwen3.6-35b-a3b-ud/q4_K",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "qwen3.6-35b-a3b-ud",
+        "quant": "q4_K",
+        "file_bytes": 22134528992,
+        "moe_blocks": 40,
+        "experts_per_block": 256,
+        "active_experts_per_block": 8,
+        "expert_slots_total": 10240,
+        "parameters": 34660610688
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 22,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "score": {
+        "metric": "decode_tokens_per_second",
+        "depth_tokens": 0,
+        "mean": 54.81,
+        "stddev": 1.09,
+        "runs": 2
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "Hybrid attention/SSM: only 10 of its 40 blocks carry KV, so its -ncmoe floor does not move with context at all and its depth curve is flat (1.01x to 8K). 165 MiB of KV at 8K where a same-size dense-attention MoE needs 792 MiB. -t is worth 1.6% here -- not separable -- so this is the one model where a mistuned thread count is cheap."
+    },
+    {
+      "id": "arc-b580/llama-4-scout-17b-16e-instruct-ud/q3_K",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "llama-4-scout-17b-16e-instruct-ud",
+        "quant": "q3_K",
+        "file_bytes": 49019031040,
+        "moe_blocks": 48,
+        "experts_per_block": 16,
+        "active_experts_per_block": 1,
+        "expert_slots_total": 768,
+        "parameters": 107769861184
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 46,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "score": {
+        "metric": "decode_tokens_per_second",
+        "depth_tokens": 0,
+        "mean": 18.69,
+        "stddev": 0.47,
+        "runs": 3
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "arch llama4 loads, generates and benchmarks cleanly on SYCL. 46 rather than the 8K floor of 45: -ncmoe 45-48 are indistinguishable there (11.54-11.68), so the extra block is free headroom. The most depth-sensitive model in the set -- 192 KiB of KV per token costs it 1.65x by 8K."
+    },
+    {
+      "id": "arc-b580/olmoe-1b-7b-0924-instruct/q4_K",
+      "hardware": {
+        "gpu": "Intel(R) Arc(TM) B580 Graphics",
+        "gpu_key": "arc-b580",
+        "vram_bytes": 12809404416,
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "physical_cores": 20
+      },
+      "model": {
+        "id": "olmoe-1b-7b-0924-instruct",
+        "quant": "q4_K",
+        "file_bytes": 4213512672,
+        "moe_blocks": 16,
+        "experts_per_block": 64,
+        "active_experts_per_block": 8,
+        "expert_slots_total": 1024,
+        "parameters": 6919161856
+      },
+      "engine": { "name": "llama.cpp", "version": "e107984bc (build 10788)", "backend": "SYCL" },
+      "settings": {
+        "threads": 16,
+        "n_cpu_moe": 0,
+        "kv_cache_type": "f16",
+        "flash_attn": true
+      },
+      "measured_at": "2026-09-07",
+      "protocol": "bench/PROTOCOL.md",
+      "notes": "The control. Whole model on the card with 7964 MiB spare, 282.9 tok/s at depth 0, and -t is worth NOTHING at this setting -- 0.27% across t4 to t20 -- which is what confirms the thread effect on every other model really is host-side expert compute. 16 is shipped because it costs nothing here and is right everywhere else. Offloading is strictly harmful: -ncmoe 2 costs 11%, -ncmoe 16 costs 55% (and there -t is worth 2.53x again). No pooled score: the depth sweep is single-invocation."
+    }
+  ]
+}

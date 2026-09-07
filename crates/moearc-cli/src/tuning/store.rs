@@ -24,16 +24,32 @@ pub const PROFILES_ENV: &str = "MOEARC_PROFILES";
 /// The file's name wherever it is looked for.
 pub const PROFILES_FILE: &str = "tuning-profiles.json";
 
-/// Profiles compiled into this binary.
-///
-/// 🔴 `None` today because `bench/tuning-profiles.json` does not exist yet, and a build that
-/// `include_str!`s a missing file does not compile. When the benchmark harness commits it this
-/// becomes one line —
-/// `Some(include_str!("../../../../bench/tuning-profiles.json"))` — and a shipped binary then
-/// carries its measurements without needing the repository beside it. The search order below
-/// keeps working either way: a file on disk always wins over the built-in, so a user can
+/// Profiles compiled into this binary, so a shipped `moearc` carries its measurements without
+/// needing the repository beside it. A file on disk always wins over this, so a user can
 /// replace our measurements with their own.
-const BUILTIN: Option<&str> = None;
+///
+/// # 🔴 Why this is not `include_str!("../../../../bench/tuning-profiles.json")`
+///
+/// That was the plan, and it does not work: **`bench/tuning-profiles.json` is not written to
+/// the schema `docs/tuning.md` specifies.** It is a report — one top-level `hardware` block, a
+/// `models` array keyed by GGUF filename, `recommended` settings, `ncmoe_floor_by_ctx`,
+/// `knob_value` — where this half expects `schema`, `profiles[]`, and a `model.id` matching
+/// what `moearc ls` prints. `serde` refuses it at the first field, so `include_str!`ing it
+/// would compile and then load nothing.
+///
+/// The file beside this one is a transcription of the same measurements into the documented
+/// shape. Every number in it comes from `bench/tuning-profiles.md` (settings, scores, notes) or
+/// from `moearc ls --json` run against the same GGUF files (ids, quantisations, geometry,
+/// parameter and byte counts) — nothing was measured, inferred or rounded here. It is a
+/// **transcription and it will drift**; the fix is for the producer to emit the contract shape,
+/// after which this becomes the one-line `include_str!` it was meant to be.
+///
+/// ⚠️ Until then, note that `bench/tuning-profiles.json` still sits on the search path below and
+/// is found first in a repository checkout — where it produces a parse error and suppresses
+/// this set, exactly as `from_json` promises for a file it cannot read. That is a producer bug
+/// and is deliberately not papered over here: `validate`'s own comment is the rule, and it
+/// applies to files as well as to profiles.
+pub(crate) const BUILTIN: Option<&str> = Some(include_str!("builtin-profiles.json"));
 
 /// Every profile this machine can see, and where they came from.
 #[derive(Debug, Clone, Default)]
@@ -351,6 +367,40 @@ mod tests {
         // The second profile has no score. That is legal and it still tunes.
         assert!(s.profiles()[1].score.is_none());
         assert_eq!(s.profiles()[1].settings.n_cpu_moe, Some(22));
+    }
+
+    #[test]
+    fn the_built_in_set_loads_whole_and_every_profile_in_it_is_usable() {
+        // 🔴 A built-in file that fails `validate` is worse than no built-in file: it ships a
+        // silent hole in the tuning that only shows up as a `derived` badge on a model the
+        // project claims to have measured. Asserted here so a bad transcription cannot be
+        // committed.
+        let text = BUILTIN.expect("the built-in set is compiled in");
+        let s = Store::from_json(text, None);
+        assert!(s.load_error().is_none(), "{:?}", s.load_error());
+        assert!(s.rejected().is_empty(), "{:?}", s.rejected());
+        assert_eq!(s.len(), 7, "the seven models bench/tuning-profiles.md measured");
+        assert!(s.provenance().contains("built in"), "{}", s.provenance());
+
+        for p in s.profiles() {
+            assert!(p.settings.threads.is_some(), "{}: -t is the whole point", p.id);
+            assert!(p.settings.n_cpu_moe.is_some(), "{}: -ncmoe is the other half", p.id);
+            assert_eq!(p.hardware.physical_cores, Some(20), "{}: -t must be transferable", p.id);
+            assert_eq!(p.settings.kv_cache_type.as_deref(), Some("f16"), "{}", p.id);
+            assert_eq!(p.settings.flash_attn, Some(true), "{}", p.id);
+            // A score is optional, but one that is present has to survive PROTOCOL 5 --
+            // otherwise it is in the file as a number nobody may climb from, and that is a
+            // transcription mistake rather than a retraction.
+            if let Some(score) = &p.score {
+                assert!(score.is_trustworthy(), "{}: {}", p.id, score.describe());
+            }
+            // 🔴 `-ngl` and `-c` are absent on purpose: bench left `-ngl` at -1 and never
+            // tuned it, and llama-bench's context is not the context a server runs at.
+            // Writing a default into a field nobody measured is the one thing the file
+            // contract forbids.
+            assert!(p.settings.n_gpu_layers.is_none(), "{}: -ngl was never a measured lever", p.id);
+            assert!(p.settings.ctx_size.is_none(), "{}: no context was measured", p.id);
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ Every value that reaches a screen is one of four things, and every renderer prin
 | --- | :---: | --- |
 | **measured** | ◆ | benchmarked on **this** GPU with **this** model at **this** quantisation, under `bench/PROTOCOL.md` |
 | **extrapolated** | ◇ | carried from a profile measured on different hardware or a different model, with the differences reasoned about. **A starting point, not a measurement** |
-| **derived** | · | computed by `moearc_engine::memory` from the model's geometry and this card's free VRAM. Real arithmetic; nothing was ever run |
+| **derived** | · | computed by `moearc_engine::memory` from the model's geometry and this card's free VRAM, plus the two **directional** rules in `bench/tuning-profiles.md` that hold across the whole catalogue. Real arithmetic and a measured direction; nothing was ever run **on this pairing** — see [the fallback](#the-fallback-what-happens-with-no-profile) |
 | **untuned** | *(blank)* | not tuned at all. llama.cpp's own default stands and we make no claim about it. Never emitted as a flag |
 
 A profile's badge is its **basis**; each flag also carries its own origin, and they can differ —
@@ -108,6 +108,123 @@ its measured span clamps to the nearest measured point and says so.
 
 ⚠️ Coverage predicts **staged bytes**, not tok/s. This project has no validated model between
 them and publishes none.
+
+---
+
+## The fallback: what happens with no profile
+
+Most machines will never have a profile. The fallback is what they get, and 🔴 **every value it
+produces renders as `derived`, never `measured`** — `no_fallback_value_can_ever_render_as_measured`
+asserts it over four models and three contexts, alongside the
+`only_an_exact_match_can_produce_a_measured_field` invariant above.
+
+The rule that shapes all of it: **a fallback exists because *not choosing* is measurably the
+expensive option.** llama.cpp's own defaults are not neutral — one of them costs 2.09× — so
+declining to answer is not the humble choice, it is the wrong one. What we owe the user is a
+defensible answer with its provenance attached, not silence.
+
+### `-t` — half the cores, and we say what that costs
+
+`FALLBACK_THREAD_FRACTION = 0.50`, in `tuning::resolve`. One named constant, so changing the
+fallback for every unmeasured machine is one edit. Physical cores are the base; hyperthread
+siblings share load/store units and a memory-bound expert gather gets nothing from a second thread
+on one core.
+
+| | |
+|---|---|
+| **What llama.cpp does** | **4 threads**, whatever the machine is. `common_cpu_get_num_math()` mis-reads Arrow Lake's hybrid topology; `llama-server` prints `n_threads = 4` on a 20-core part |
+| **What that costs** | **2.09×** on gpt-oss-120B — 14.11 ± 0.33 tok/s against 29.54 ± 0.04 at `-t 16`, arms interleaved so page-cache state is common-mode |
+| **What we ship** | 50% of physical cores. On the measured box that is **10** |
+| ⚠️ **What we know is better** | **16 of 20 — about 80%.** `-t 16` wins on every model in the catalogue where threads matter |
+| ⚠️ **What 50% costs** | roughly **a fifth** of what `-t 16` reaches, on the models that care. The in-tree `-t 8` readings bracket it: Llama-4-Scout 14.27 → 18.52 (−23%), Qwen3-30B 68.20 → 73.04 (−6.6%), Qwen3.6-35B 53.18 → 54.04 (−1.6%) |
+| 🔴 **Never `nproc`** | `-t 20` lost on **five of six** models — gpt-oss-120B −8.3%, gpt-oss-20B −10.8%, olmoe at full offload −10.8%, Qwen3.6 −7.3%, Qwen3-30B −5.6%, Scout a tie — and its cells were 3–4× noisier. 8 P-cores and 12 E-cores are not 20 equal cores |
+
+**50% is deliberately conservative for silicon nobody has benchmarked, and is not claimed to be
+optimal.** 16-of-20 is one measurement on one hybrid Intel part. Half the cores leaves the other
+half of an unknown machine alone, the loss is bounded, the screen says the value is derived, and a
+user who measures moves it up. `threads_note` prints all of the above beside the flag.
+
+### `-ncmoe` — the direction flips with the quantisation
+
+🔴 **A single derivation rule would be wrong for half the catalogue.** `experts_belong_on_the_host`
+branches on the quantisation, and both halves are measured on Arc B580 + SYCL:
+
+- **MXFP4 → `-ncmoe` = every block.** A/B/A/B inside one process on gpt-oss-20B
+  (`-ncmoe 24,0,24,0`, so drift is common-mode): every expert on the **CPU** measured
+  **43.42 ± 0.08** against **36.36 ± 0.01** with every expert on the **GPU**. **1.19×, on a model
+  whose 11.28 GiB fits entirely in the card's VRAM.** The sweep between the ends is monotone
+  (+21%) and it survives at depth.
+- **Q4_K / Q3_K → the planner's floor.** Qwen3-30B is monotone the other way: **74.08 tok/s at
+  `-ncmoe 18` against 58.58 at 30**, 1.26×.
+
+⚠️ What is measured is *that* it happens, not *why* — the SYCL MXFP4 matmul path was never
+profiled — so the rule is carried as a property of **this backend at this quantisation**, and
+everything it produces stays `derived`.
+
+**The MXFP4 branch is applied after the plan succeeds, never instead of it.** The plan that
+succeeded put *more* on the card, so taking every expert off spends strictly less VRAM: a feasible
+plan cannot become an `OUT_OF_DEVICE_MEMORY`. The freed bytes are then re-planned into context by
+`host_expert_context` — without that step the recommendation would free gigabytes and spend them
+on nothing, and gpt-oss-20B's measured 65K-token configuration is worth what it is *because*
+`-ncmoe 24` leaves 10,097 MiB free. That re-plan holds the bank at `active_experts` (the floor
+`Policy::max_resident_experts` cannot go below) and caps at the trained context, so it is
+conservative in both directions.
+
+⚠️ **Consequence worth knowing:** for an MXFP4 model the `Tuning` block's `-c` and the *What will
+fit* block's context now differ, because they are answers to two different questions — MoEArc's own
+expert cache against llama.cpp's flags. The residency figures already differed for the same reason.
+
+### The context tier — `-ncmoe` is a floor *for a context*
+
+🔴 **The `-ncmoe` floor is a function of context, not of the model alone.** Measured on Qwen3-30B:
+**18** blocks offloaded at depth 0, **21** at 8K, **28** at 32K — ten blocks consumed by KV growth.
+A single-number floor OOMs a long-context user *after* they have loaded tens of gigabytes.
+
+The planner already honours this, because `-ncmoe` and `-c` come out of **one** call to
+`plan_llama` and therefore cannot contradict each other. What the fallback adds is
+`context_coupling_note`, which states on screen that the `-ncmoe` printed is the floor **for the
+`-c` printed beside it**, names the measured 18 → 21 → 28 movement, and points at `--ctx`.
+
+⚠️ **No default context constant, on purpose.** `fit.rs` already refuses to invent one — *"a tool
+that silently assumes 8k and reports success has answered a question the user did not ask"* — and a
+second module quietly assuming a different one would put two contradictory context numbers on one
+screen.
+
+### `-fa` and the KV width
+
+| flag | value | why it is stated rather than inherited |
+|---|---|---|
+| `-fa` | **on** | `-fa off` costs **1.72×** at 8K (Qwen3-30B, 52.4 against 30.52). llama.cpp's `auto` already resolves to on, so this changes nothing about what runs — it changes what a user can be talked out of, because `-fa off` is advice they copy from other backends |
+| `--cache-type-k/-v` | **f16** | 🔴 `q8_0` measured **−19%** on this card (42.87 against 52.97), bought back exactly **one** `-ncmoe` block, and one block below that **hard-aborts** inside `ggml_backend_sycl_synchronize` instead of returning an OOM a tool can catch. It is not offered. f16 is also the width every plan here is computed at |
+
+🔴 **`-fa` carries its value.** In this engine the option is
+`common_arg({"-fa", "--flash-attn"}, "[on|off|auto]", …)` — a bare `-fa` swallows the next token as
+its argument, so a command line ending in one is not a command line. `flags()` always prints the
+value.
+
+### Host memory — a reserve, not a cap
+
+🔴 **A fraction-of-RAM cap on the model was proposed (50%) and refused. Do not re-litigate it; the
+reasoning is recorded on `Reserve::DEFAULT` and guarded by
+`a_fifty_nine_gib_model_is_never_refused_on_a_ninety_one_gib_box`.**
+
+1. **It would refuse this project's own headline result.** Half of the 91 GiB box every number in
+   `bench/` was taken on is 45.5 GiB. **gpt-oss-120B is 59.0 GiB** and runs there at a measured
+   29.56 ± 0.16 tok/s with 32K of context.
+2. **It would not protect anything, because the weights are `mmap`ped.** They live in the page
+   cache, which the kernel reclaims the instant something else wants it. The cap would have no
+   effect on memory pressure at all — its only effect would be to decline models that
+   demonstrably work.
+
+What stands is the existing ceiling — **`MemAvailable` less a 20% reserve**, which no budget may
+exceed — and the existing three-state classification, in which a model past the budget is
+*classified* rather than *refused*:
+
+| tier | means |
+|---|---|
+| `RunsFromRam` | every cache miss is a copy from RAM |
+| `RunsPagesFromDisk` | the excess is read from the drive on demand. **Slower, and not a failure** — `mmap` degrades, it does not fail |
+| `WillNotFit` | not on this machine, and no room to fetch it. The only refusal, and it is about the drive |
 
 ---
 
@@ -302,9 +419,29 @@ First hit wins, so a user's own file beats ours:
 5. `$XDG_DATA_HOME/moearc/tuning-profiles.json`, else `~/.local/share/moearc/…`
 6. the built-in set
 
-**The built-in set is `None` today** — a build that `include_str!`s a missing file does not
-compile. When the harness commits `bench/tuning-profiles.json`, `store.rs`'s `BUILTIN` becomes
-one line and a shipped binary carries its measurements without needing the repository beside it.
+**The built-in set is live** — `store.rs`'s `BUILTIN` carries the seven models
+`bench/tuning-profiles.md` measured, so a shipped binary tunes without the repository beside it.
+
+🔴 **It is not `include_str!("../../../../bench/tuning-profiles.json")`, and that is a producer
+bug rather than a design choice.** The file the harness committed **is not written to the schema
+above**: it is a report — one top-level `hardware` block, a `models` array keyed by GGUF filename,
+`recommended` settings, `ncmoe_floor_by_ctx`, `knob_value` — where this half expects `schema`,
+`profiles[]`, and a `model.id` matching what `moearc ls` prints. `serde` refuses it at the first
+field.
+
+Two consequences, and neither is papered over here:
+
+- `crates/moearc-cli/src/tuning/builtin-profiles.json` is a **transcription** of the same
+  measurements into the documented shape. Settings, scores and notes come from
+  `bench/tuning-profiles.md`; ids, quantisations, geometry, parameter and byte counts come from
+  `moearc ls --json` run against the same GGUF files. Nothing was measured or inferred to write
+  it — but **it will drift**, and the fix is for the producer to emit the contract shape, after
+  which `BUILTIN` becomes the one-liner it was meant to be.
+- `bench/tuning-profiles.json` is still **first on the search path** and is found in a repository
+  checkout, where it produces a parse error and suppresses the built-in set. That is `from_json`
+  keeping its promise about a file it cannot read. It is deliberately not special-cased:
+  `validate`'s own rule — *silently "fixing" it would hide a producer bug behind a consumer
+  patch* — applies to files as well as to profiles.
 
 **Absence is silent and normal.** A machine with no file resolves everything to *derived* and
 says so. A **malformed** file is never silent: nothing is loaded from it and the parse error is
@@ -361,3 +498,14 @@ merely unlikely.
 - **No throughput is predicted from coverage.** There is no validated model between staged bytes
   and tok/s in this project.
 - **The comparison's `k` is a normal approximation**, optimistic at n = 3.
+- **A derived `-c` can exceed any context that was benchmarked.** It is the planner's arithmetic
+  against free VRAM, and llama.cpp's compute buffers grow with context in a way nothing here
+  models — that growth is what `Headroom::PROVISIONAL` is holding back, and 12% is a stated guess.
+  gpt-oss-20B derives `-c 131072` where `bench/` measured 65,536. A context that does not fit
+  fails as a clean `OUT_OF_DEVICE_MEMORY` at load, which is detectable; it is still a claim made
+  by arithmetic rather than by a run, and the badge says so.
+- **The MXFP4 rule is read off two models on one backend.** `experts_belong_on_the_host` matches
+  the quantisation string, so a *third* MXFP4 model — or the same one on a different backend —
+  inherits a direction nobody measured for it. It stays `derived` for exactly that reason.
+- **The transcribed built-in set will drift** from `bench/tuning-profiles.md` until the harness
+  emits the schema this document specifies. See *Where the file is looked for*.
