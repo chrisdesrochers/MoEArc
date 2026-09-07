@@ -298,7 +298,9 @@ nothing on this box.
 
 ## The file contract
 
-**`bench/tuning-profiles.json` is produced by the benchmark harness. This half only consumes
+**`bench/tuning-report.json` is the benchmark harness's own report and is NOT this contract —
+different shape, and it was renamed on 2026-09-07 precisely so it can no longer shadow the search
+path below. The contract file is what this half consumes
 it.**
 
 ### The one rule the producer must know
@@ -413,7 +415,8 @@ A silently dropped row looks exactly like a row nobody measured.
 First hit wins, so a user's own file beats ours:
 
 1. `$MOEARC_PROFILES` — a file, or a directory containing `tuning-profiles.json`
-2. `./bench/tuning-profiles.json` (a repository checkout, run from its root)
+2. `./bench/tuning-profiles.json` (a repository checkout, run from its root — absent by default;
+   the harness's own output lives at `bench/tuning-report.json` in a different shape)
 3. `<exe dir>/tuning-profiles.json`
 4. `<prefix>/share/moearc/tuning-profiles.json`
 5. `$XDG_DATA_HOME/moearc/tuning-profiles.json`, else `~/.local/share/moearc/…`
@@ -437,11 +440,11 @@ Two consequences, and neither is papered over here:
   `moearc ls --json` run against the same GGUF files. Nothing was measured or inferred to write
   it — but **it will drift**, and the fix is for the producer to emit the contract shape, after
   which `BUILTIN` becomes the one-liner it was meant to be.
-- `bench/tuning-profiles.json` is still **first on the search path** and is found in a repository
-  checkout, where it produces a parse error and suppresses the built-in set. That is `from_json`
-  keeping its promise about a file it cannot read. It is deliberately not special-cased:
-  `validate`'s own rule — *silently "fixing" it would hide a producer bug behind a consumer
-  patch* — applies to files as well as to profiles.
+- ✅ **Resolved 2026-09-07.** The harness's report was renamed to `bench/tuning-report.json`,
+  so it no longer sits on the search path and no longer suppresses the built-in set in a
+  repository checkout. A checkout now behaves exactly like a shipped binary: one source of
+  truth, compiled in. The producer emitting the contract shape directly remains the tidier
+  end state, and is still open.
 
 **Absence is silent and normal.** A machine with no file resolves everything to *derived* and
 says so. A **malformed** file is never silent: nothing is loaded from it and the parse error is

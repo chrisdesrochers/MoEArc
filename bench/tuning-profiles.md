@@ -368,7 +368,9 @@ would be strictly better and is worth building into `moearc bench`.
 
 Raw CSV, guard readings, disk and ARC counters: `bench/results/tuning/`.
 Harness: `bench/tuning/harness.sh`. Drivers: `bench/tuning/d1.sh` … `d10.sh`.
-Machine-readable profiles: `bench/tuning-profiles.json`.
+Machine-readable report: `bench/tuning-report.json` (the sweeps as run). The consumer-facing
+contract file is `crates/moearc-cli/src/tuning/builtin-profiles.json` -- different shape, see
+`docs/tuning.md`.
 
 Absolute throughput is an artefact of this machine (PROTOCOL §0). What should reproduce on another
 Arc box is the **shape**: the MXFP4-vs-Q4_K inversion in `-ncmoe`; the collapse of `-t`'s value as
