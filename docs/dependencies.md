@@ -93,14 +93,35 @@ an Intel-first engine. Read it for design, build our own.
 
 Actively maintained (1,812 commits) with an explicit goal of tracking llama.cpp closely.
 
-**Not for the engine** — building on it would make MoEArc a llama.cpp wrapper, which is not the
-project. **Useful for the benchmark harness**: comparison (1) in `bench/README.md` is MoEArc
-against llama.cpp SYCL on the same card, and driving that in-process from Rust gives cleaner
-measurement than shelling out to `llama-bench` and parsing tables.
+~~**Not for the engine** — building on it would make MoEArc a llama.cpp wrapper, which is not the
+project.~~ 🔴 **This ruling was overturned on 2026-09-06.** MoEArc is pivoting to exactly that
+shape: Rust on the outside (installer, detection, catalog, TUI, server, tuning), llama.cpp+SYCL
+as the engine. The reasoning above is preserved because it was the position for months, not
+because it still holds. See [`llama-integration.md`](llama-integration.md).
 
-⬜ **Unverified**: only `cuda` and `metal` cargo features are documented. llama.cpp's SYCL
-backend is a CMake option, so it may be reachable through the same build path — but that is an
-assumption, not a finding, and must be tested before the harness depends on it.
+**But the pivot did *not* adopt this crate**, and the reason is the line below, which was an
+open question and is now answered.
+
+✅ **Verified 2026-09-06 — and the assumption was wrong.** The unverified note read: *"only
+`cuda` and `metal` cargo features are documented. llama.cpp's SYCL backend is a CMake option,
+so it may be reachable through the same build path."* It is not reachable. The full feature
+list of `llama-cpp-sys-2` is `common, cuda, cuda-no-vmm, metal, dynamic-link, vulkan, opencl,
+mkl, openmp, static-openmp, rocm, static-stdcxx, shared-stdcxx, system-ggml, system-ggml-static,
+mtmd, dynamic-backends` — **no `sycl`, no `oneapi`, no `intel`** (`mkl` is host BLAS, not GPU
+offload). Its `build.rs` has no branch that sets `GGML_SYCL=ON` and never arranges the
+`icpx`/`setvars.sh` toolchain that llama.cpp's SYCL CMake requires. Its issue tracker has zero
+hits for "SYCL" and zero for "oneAPI"; the single "Intel Arc" hit is about the **Vulkan**
+backend, which is 4.8× slower on this box.
+
+🔴 **A second disqualifier, independent of the first**: it always builds a vendored git
+submodule (pinned at `e79e4bf66`, 2026-08-13) and offers no way to link a pre-built llama.cpp.
+MoEArc's benchmark protocol requires the engine and the baseline to be the *identical commit*
+(`llama.cpp-COMMIT`, currently `e107984bc`), so a dependency that guarantees two differently
+pinned llama.cpps in one tree is unusable here — for the harness as much as for the engine.
+
+📌 The **benchmark-harness** use above is therefore also withdrawn: driving this crate
+in-process would benchmark a *different* llama.cpp than the one we compare against, which is the
+precise error that caused every published comparison to be retracted.
 
 ### `gpu-probe` — cross-platform VRAM detection · Apache-2.0 · **no**
 

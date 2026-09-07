@@ -7,6 +7,7 @@ members = [
     "crates/moearc-cli",
     "crates/moearc-kernels",
     "crates/moearc-server",
+    "crates/moearc-llama",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ authors = ["Superabundant LLC"]
 moearc-engine = { path = "crates/moearc-engine" }
 moearc-device = { path = "crates/moearc-device" }
 moearc-model = { path = "crates/moearc-model" }
+moearc-llama = { path = "crates/moearc-llama" }
 
 anyhow = "1"
 thiserror = "2"

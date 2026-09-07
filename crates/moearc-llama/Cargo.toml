@@ -1,0 +1,28 @@
+[package]
+name = "moearc-llama"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MoEArc's binding to llama.cpp + SYCL: the engine seam."
+
+[features]
+# Default is pure Rust: the tuning parameter model and its tests, with no
+# llama.cpp, no oneAPI and no GPU. This keeps `cargo test --workspace` runnable
+# on any machine.
+default = []
+
+# Compile the C shim and link a pre-built llama.cpp. Requires a checkout whose
+# build/ was produced by build-llamacpp-sycl.sh; point MOEARC_LLAMA_CPP_DIR at it.
+runtime = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[[example]]
+name = "generate"
+# Gated so that `cargo test --workspace` on default features does not try to
+# build an example that needs llama.cpp linked.
+required-features = ["runtime"]
