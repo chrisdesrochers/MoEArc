@@ -1,3 +1,17 @@
+> # 🔴 SUPERSEDED — do not quote the comparisons in this file
+>
+> **Every MoEArc-versus-llama.cpp figure below is withdrawn.** They were produced with
+> `llama-bench` at its **4-thread default on a 20-core box** while MoEArc's host pool used 19
+> threads — so they measure an unfair configuration, not the two engines. No corrected
+> head-to-head is published: two re-measurement attempts disagree by 2× *and about which engine
+> wins*. See [`bench/PROTOCOL.md`](../PROTOCOL.md) §1.
+>
+> **MoEArc no longer has an engine to compare.** It now uses llama.cpp+SYCL and ships measured
+> *tuning* — see [`docs/strategy.md`](../../docs/strategy.md).
+>
+> This file is kept because a retraction is a claim like any other, and because its
+> non-comparative measurements (kernel timings, cache counters, traces) remain valid.
+
 | model                          |       size |     params | backend    | ngl |  n_cpu_moe | n_ubatch | type_k | type_v |  fa |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | ---------: | -------: | -----: | -----: | --: | --------------: | -------------------: |
 | qwen35moe 35B.A3B Q4_K - Medium |  20.60 GiB |    34.66 B | SYCL       | 999 |         22 |     1024 |   q8_0 |   q8_0 |   1 |          pp4096 |        584.98 ± 0.89 |

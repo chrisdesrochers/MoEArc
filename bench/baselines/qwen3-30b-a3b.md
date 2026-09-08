@@ -1,3 +1,17 @@
+> # 🔴 SUPERSEDED — do not quote the comparisons in this file
+>
+> **Every MoEArc-versus-llama.cpp figure below is withdrawn.** They were produced with
+> `llama-bench` at its **4-thread default on a 20-core box** while MoEArc's host pool used 19
+> threads — so they measure an unfair configuration, not the two engines. No corrected
+> head-to-head is published: two re-measurement attempts disagree by 2× *and about which engine
+> wins*. See [`bench/PROTOCOL.md`](../PROTOCOL.md) §1.
+>
+> **MoEArc no longer has an engine to compare.** It now uses llama.cpp+SYCL and ships measured
+> *tuning* — see [`docs/strategy.md`](../../docs/strategy.md).
+>
+> This file is kept because a retraction is a claim like any other, and because its
+> non-comparative measurements (kernel timings, cache counters, traces) remain valid.
+
 # Baseline: Qwen3-30B-A3B Q4_K_M — the model that does not fit
 
 **17.28 GiB of weights against 11.33 GiB of VRAM.** This is the regime MoEArc exists for, and
