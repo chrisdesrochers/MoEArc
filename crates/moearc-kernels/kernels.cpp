@@ -1853,7 +1853,7 @@ int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_
     try {
         const unsigned long group = n_heads / n_kv_heads;
         const unsigned long kv_row = n_kv_heads * head_dim;
-        c->q.parallel_for(
+        const event e = c->q.parallel_for(
                nd_range<1>{range<1>{n_heads * head_dim}, range<1>{head_dim}},
                [=](nd_item<1> it) {
                    const size_t h = it.get_group(0);
@@ -1902,6 +1902,18 @@ int moearc_attn_decode(moearc_ctx *c, float *out, const float *q, const void *k_
 
                    out[h * head_dim + d] = acc / l;
                });
+        // 🔴 The key carries the **launch geometry** (`n_heads` groups of `head_dim` lanes) and
+        // deliberately **not** the key span, which is the one number in this call that actually
+        // drives its cost. That is not an oversight, it is the only workable choice: `n_kv`
+        // advances by one every token, so keying on it would mint a distinct key per token —
+        // 8,192 of them in a single depth-8192 prefill — and `moearc_flush_events` resolves a key
+        // by linear scan over `totals`, so folding the events would go quadratic in the prompt.
+        // It would also fragment the very quantity the depth question needs.
+        //
+        // So the SWA blocks (`kv_begin > 0`, capped span) and the full-causal blocks share one
+        // key on purpose: gpt-oss alternates 18 of each, and what a decode step costs is their
+        // **sum**. One key, summed over the step, is the measurement — per-block detail is not.
+        moearc_track(c, "attn_decode", n_heads, (unsigned int) head_dim, e);
         return OK;
     } catch (...) { return ERR; }
 }
