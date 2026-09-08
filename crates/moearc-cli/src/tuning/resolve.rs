@@ -632,7 +632,7 @@ fn derive(
     let geometry =
         BlockGeometry { moe_blocks: card.moe_blocks, experts_per_block: card.experts_per_block };
     let want = ctx.map_or(Context::Largest, Context::Tokens);
-    let (_, split) =
+    let (_, mut split) =
         plan_llama(memory, &footprint, geometry, policy, want).map_err(|e| e.to_string())?;
 
     // 🔴 Applied *after* the plan succeeded, never instead of it. The plan that succeeded put
@@ -652,6 +652,30 @@ fn derive(
                 split.context_tokens,
             ),
         ));
+    }
+
+    // 🔴 The trained-context cap applies to EVERY path, not just the MXFP4 one.
+    //
+    // `Context::Largest` asks the planner for the most KV the card can hold, and it answers
+    // honestly — but a KV cache longer than the model was trained for allocates pages whose
+    // answers do not mean anything. Before this, `moearc info olmoe-1b-7b-0924-instruct`
+    // printed `-c 47360` for a 4,096-token model, directly beside its own "Planned split"
+    // saying 4,096: the same screen contradicting itself.
+    //
+    // Re-planning (rather than clamping the number) is what keeps `-c` and `-ncmoe` agreeing.
+    // They come out of one pool, and a `-c` clamped after the fact would leave `-ncmoe` sized
+    // for a context we are no longer asking for. If the re-plan fails we clamp instead, which
+    // is safe in the one direction that matters: the surviving `-ncmoe` puts MORE on the host
+    // than the shorter context needs, so it spends strictly less VRAM than the arithmetic
+    // already found room for and cannot turn a feasible plan into an OUT_OF_DEVICE_MEMORY.
+    let trained = card.trained_context_tokens.max(1);
+    if split.context_tokens > trained {
+        if let Ok((_, replanned)) =
+            plan_llama(memory, &footprint, geometry, policy, Context::Tokens(trained))
+        {
+            return Ok(replanned);
+        }
+        split.context_tokens = trained;
     }
     Ok(split)
 }
@@ -1370,6 +1394,27 @@ mod tests {
         assert!(n < q4.moe_blocks, "Q4_K keeps what it can on the card: {n}");
         assert!(r.bank_resident.unwrap() > 0.0);
         assert!(r.caveats.iter().any(|c| c.contains("74.08")), "{:?}", r.caveats);
+    }
+
+    /// 🔴 A derived `-c` must never exceed the model's trained context on ANY path.
+    ///
+    /// Regression: the cap lived inside the MXFP4 branch only, so a non-MXFP4 model took
+    /// `Context::Largest`'s answer verbatim. `moearc info olmoe-1b-7b-0924-instruct` printed
+    /// `-c 47360` for a 4,096-token model, on the same screen as its own "Planned split"
+    /// saying 4,096 — one panel contradicting the other.
+    #[test]
+    fn a_derived_context_never_exceeds_what_the_model_was_trained_for() {
+        for id in ["olmoe-1b-7b-0924-instruct", "qwen3-30b-a3b", "gpt-oss-120b"] {
+            let card = find(id);
+            let r = resolve(&Store::empty(), Some(&b580()), &card, &cpu(), None);
+            let ctx = r.ctx_size.as_ref().expect("a derived plan always names a context");
+            assert!(
+                ctx.value <= card.trained_context_tokens,
+                "{id} derived -c {} past a trained context of {}",
+                ctx.value,
+                card.trained_context_tokens
+            );
+        }
     }
 
     #[test]
