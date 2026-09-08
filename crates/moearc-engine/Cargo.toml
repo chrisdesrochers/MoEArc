@@ -29,10 +29,6 @@ name = "probe"
 required-features = ["gpu"]
 
 [[example]]
-name = "olmoe_generate"
-required-features = ["gpu"]
-
-[[example]]
 name = "residency_sweep"
 required-features = ["gpu"]
 

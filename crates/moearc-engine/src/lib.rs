@@ -12,7 +12,6 @@ pub mod kv;
 pub mod memory;
 pub mod profile;
 pub mod residency;
-pub mod runtime;
 
 // The forward pass. Behind a feature because it is the one part of this crate that is not
 // device-independent: `moearc-kernels` compiles SYCL with Intel's DPC++ at build time, so
