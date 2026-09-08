@@ -35,3 +35,9 @@ throbber-widgets-tui = "0.11"
 # through `hf-xet` -> `xet-runtime` -- so naming it here adds a line to a manifest and nothing
 # to the build. Only the two feature sets we read are enabled.
 sysinfo = { version = "0.38", default-features = false, features = ["system", "disk"] }
+# One syscall: PR_SET_PDEATHSIG on the supervised llama-server, so it cannot outlive this
+# process. Measured on the reference box: without it, SIGTERM to `moearc` reparented the engine
+# to init and left the model resident in VRAM with the port still bound. Already in this
+# binary's dependency graph through sysinfo, so this adds a manifest line and nothing to the
+# build. See `crate::serve::Supervisor::spawn`.
+libc = "0.2"

@@ -64,11 +64,13 @@ dynamic version is to be reintroduced above llama.cpp.
 Believed to survive; **confirmed, with one correction**: `src/bench/` does not
 wholly survive — `bench/timed.rs` is engine-coupled.
 
-📌 Also: **`moearc serve` was never wired to the engine.** `plain.rs:400` prints
+📌 Also: **`moearc serve` was never wired to the engine.** `plain.rs:400` printed
 *"not wired yet: the inference server arrives with the engine. Nothing is
-listening."* and the function returns `EXIT_NOT_WIRED` (2); the TUI's
-`Action::Serve` builds a view model from a stub. There is no coupling to unwind —
-there is a hole to fill. (`plain.rs:343` is the same pattern for the *download*
+listening."* and returned `EXIT_NOT_WIRED` (2); the TUI's `Action::Serve` built a view
+model from a stub. There was no coupling to unwind — there was a hole to fill.
+✅ **Filled 2026-09-08** in a new `src/serve.rs`; `plain.rs::serve` is now four lines
+handing over to it. ⬜ The TUI's `Action::Serve` and the `ServeStats` fixture are
+**unchanged** — the wired path is the subcommand. (`plain.rs:343` is the same pattern for the *download*
 path, which `moearc-model::pull` can now fill.)
 
 | file | lines | verdict | reason |
@@ -80,7 +82,8 @@ path, which `moearc-model::pull` can now fill.)
 | `src/fit.rs` | 793 | **RE-PURPOSE** | `Fit`, `plan()`, `CONTEXT_LADDER`. Calls `moearc_engine::memory::plan`. The translation layer survives; its output vocabulary must become llama.cpp's params instead of "resident expert slots". |
 | `src/host.rs` | 198 | **KEEP** (light rewire) | `RealHost`, `parse_size`, `free_space_for`. Only the import path moves if `host_budget` moves crates. |
 | `src/source.rs` | 932 | **KEEP** | The whole seam: `DeviceRow`, `ModelCard`, `TransferPlan`, `ServeSample`, the four source traits, `Stub*` fixtures and the `stubbed`/`stub_note` provenance fields. This is what makes the TUI snapshot-testable. `ServeStats` and `TransferSource` are the two implementations `moearc-llama` now owes. |
-| `src/plain.rs` | 691 | **RE-PURPOSE** | `--json`/plain renderers at parity with the TUI. Keeps entirely *except* `serve()`. |
+| `src/plain.rs` | 691 | **RE-PURPOSE** | `--json`/plain renderers at parity with the TUI. Keeps entirely *except* `serve()`. ✅ Done: `serve()` delegates to `src/serve.rs`; `print_plan` became `pub(crate)` so the two share one renderer. |
+| `src/serve.rs` | 🆕 | **KEEP** | The supervised `llama-server`: profile → argv, the `-dev` pin against the iGPU trap, `/health`, `PR_SET_PDEATHSIG`, and the crash diagnosis. See [`serve.md`](serve.md). |
 | `src/format.rs` | 92 | **KEEP** | `bytes`/`rate`/`count`/`duration`/`percent`. Zero coupling. |
 | `src/theme.rs` | 73 | **KEEP** | Palette + `panel()`/`field()`. |
 | `src/tui/mod.rs` | 184 | **KEEP** | `TerminalGuard`, `run()`, `perform()` — calls only trait objects. |
@@ -349,7 +352,18 @@ But it assumes **one** object with **one** pathological property.
 Five gaps, all small relative to what is being deleted:
 
 1. `moearc-server/src/engine.rs` — 115 lines, `Session` → `moearc_llama::Context`.
-2. `moearc-cli`'s `serve` path — the never-wired hole, now wireable for the first time.
+2. ~~`moearc-cli`'s `serve` path — the never-wired hole, now wireable for the first
+   time.~~ ✅ **Done 2026-09-08** — `crates/moearc-cli/src/serve.rs`. It **supervises
+   `llama-server`** rather than embedding a server, so gap 1 below is *not* on its
+   critical path and the tokenizer/sampler question at the foot of this document stays
+   open on purpose. Verified end to end on the B580, including a 59.0 GiB gpt-oss-120b.
+   Reasoning and proof: [`serve.md`](serve.md).
+   🔴 It found two things this document should carry:
+   **(a)** `tuning::resolve::derive` applies the trained-context cap only on its MXFP4
+   path, so `moearc info olmoe-1b-7b-0924-instruct` prints `-c 47360` for a 4,096-token
+   model — `serve` re-plans around it, `info` is still wrong (`serve.md` §3.4).
+   **(b)** a supervised child needs `PR_SET_PDEATHSIG`; `Drop` and terminal `Ctrl-C`
+   together are not sufficient (`serve.md` §4.4).
 3. `bench/timed.rs` — swap the inner call, keep the process-spawning design.
 4. `moearc-cli/src/fit.rs` — re-express `memory::plan`'s output as llama.cpp params.
 5. `source.rs`'s two fixture traits: `TransferSource` (pure wiring — `pull` exists)

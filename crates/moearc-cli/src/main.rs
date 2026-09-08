@@ -25,6 +25,7 @@ mod fit;
 mod format;
 mod host;
 mod plain;
+mod serve;
 mod source;
 mod theme;
 mod tui;

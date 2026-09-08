@@ -350,62 +350,15 @@ fn pull(cli: &Cli, sources: &Sources, args: &PullArgs) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------------------
 
 fn serve(cli: &Cli, sources: &Sources, args: &ServeArgs) -> Result<ExitCode> {
-    let card = sources.models.resolve(&args.model)?;
-    let devices = sources.devices.detect()?;
-    let Some(device) = devices.primary() else {
-        anyhow::bail!("{}", devices.verdict.headline());
-    };
-    let plan = match args.moe_cache {
-        Some(slots) => fit::plan_with_slot_override(device, &card, args.ctx, slots),
-        None => fit::plan(device, &card, args.ctx),
-    };
-
-    if cli.global.json {
-        let code = if plan.fits() && !args.dry_run {
-            ExitCode::from(EXIT_NOT_WIRED)
-        } else {
-            ExitCode::SUCCESS
-        };
-        emit(json!({
-            "source": provenance(sources),
-            "model": card,
-            "device": device,
-            "host": args.host,
-            "port": args.port,
-            "plan": plan,
-            "started": false,
-        }))?;
-        return Ok(code);
-    }
-
-    section("Serve");
-    println!("  {:<18}{}", "model", card.id);
-    println!("  {:<18}{}", "device", device.name);
-    println!("  {:<18}http://{}:{}/v1", "endpoint", args.host, args.port);
-    println!("  {:<18}{}", "requested ctx", requested(args.ctx));
-    println!();
-    print_plan(&plan, device, cli.global.verbose);
-
-    if !plan.fits() {
-        return Ok(ExitCode::from(EXIT_NOT_WIRED));
-    }
-    if args.dry_run {
-        println!();
-        println!("  --dry-run: nothing was started.");
-        print_provenance(sources);
-        return Ok(ExitCode::SUCCESS);
-    }
-    println!();
-    println!(
-        "  not wired yet: the inference server arrives with the engine. Nothing is listening."
-    );
-    print_provenance(sources);
-    Ok(ExitCode::from(EXIT_NOT_WIRED))
+    // The whole command lives in `crate::serve`, which owns the supervised llama.cpp child and
+    // the provenance vocabulary an override needs. It is kept out of this file because this
+    // one is a renderer: `serve` is the only subcommand that outlives its own output.
+    crate::serve::run(cli, sources, args)
 }
 
 /// The "what it decided" block. `docs/ux.md`: startup prints its reasoning, so a user can see
 /// it without turning on debug logging.
-fn print_plan(plan: &Fit, device: &DeviceRow, verbose: u8) {
+pub(crate) fn print_plan(plan: &Fit, device: &DeviceRow, verbose: u8) {
     match &plan.outcome {
         FitOutcome::Fits {
             resident_experts,

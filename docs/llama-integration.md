@@ -401,7 +401,41 @@ place to look — is the open architectural question, not a settled one.
 
 ---
 
-## 6. The subprocess fallback, kept open
+## 6. The subprocess path — ⚠️ no longer a fallback, and now what `moearc serve` does
+
+⚠️ **Corrected 2026-09-08.** This section used to read *"the subprocess fallback, kept
+open"*, and described driving `llama-server` as a retreat that had not been taken. It has
+been taken, deliberately, for one command: **`moearc serve` supervises `llama-server` as a
+child.** The full argument is in [`serve.md`](serve.md) §0; the short form is that
+`moearc info` already prints a `llama-server` command line, and serving by running *that
+exact argv* means there is one description of a configuration rather than two that can
+drift.
+
+🔴 **This does not replace the seam.** The choice is per-command, and the table in §0
+still stands for everything else:
+
+| | drives llama.cpp by |
+| --- | --- |
+| `moearc serve` | **`llama-server` as a supervised child** — see [`serve.md`](serve.md) |
+| `bench`, tuning sweeps, anything timed | **the C shim + FFI in this document** |
+
+The reasons below are why the shim exists and why `bench` keeps it. They are reasons
+about *measurement*, and none of them is a reason about *serving* — which is exactly why
+the two commands answer differently. `llama_perf_context` has no per-request equivalent a
+supervisor needs (llama-server returns a `timings` object per response); thread counts are
+not changed on a live context while serving; and load progress reaches the user through
+the child's own log, which `serve` reads and asserts against.
+
+⚠️ One thing §6 got right and should be kept in view: the subprocess path
+*"adds a process to supervise, a port to allocate and a startup race to poll"*. All three
+turned out to be real. The startup race is polled on `/health`; the port is the user's;
+and the process is supervised with `PR_SET_PDEATHSIG` after a measured failure —
+`kill -TERM` on `moearc serve` left the engine reparented to init, holding the model in
+VRAM and the port bound. See [`serve.md`](serve.md) §4.4.
+
+---
+
+### 6.1 The original argument, for the record
 
 Driving `llama-server` as a child process remains viable and is not foreclosed by
 anything here. It was not chosen because three things are awkward or impossible
