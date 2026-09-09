@@ -106,27 +106,48 @@ cmp /tmp/r1/moearc-0.1.0-linux-x86_64.tar.gz /tmp/r2/moearc-0.1.0-linux-x86_64.t
 ```
 
 ⚠️ **That is repeatability, not reproducibility across machines.** Nobody has built this on a
-second host and compared, so a different rustc, a different `icpx`, or a different absolute
-build path may well produce different bytes. The claim to make in release notes is the honest
+second host and compared, so a different rustc or a different absolute build path may well
+produce different bytes. (`icpx` used to be on that list and is not any more: nothing in the
+payload is compiled by it.) The claim to make in release notes is the honest
 one: *these bytes came from this commit with the toolchain recorded in `BUILD-INFO.txt`*, and
 the sha256 lets anyone check they got what was published. It is auditable, not
 bit-for-bit reproducible from source by a third party.
 
 ## 4 — 🔴 Verify in a clean room. This is the gate.
 
+🔴 **This gate got weaker and it is now TWO steps, because one of them can no longer be done
+in the container.** `verify-clean.sh` used to take a model and run a real forward pass against
+stored token ids. That ran `moearc-bench`, which left the payload with the retired SYCL engine
+along with `moearc-selftest` and `moearc-server`. The container can still prove the hard part
+of packaging — that the card is found on a machine that has never had oneAPI — and it can no
+longer prove that a model computes. `docs/packaging.md` measured that those are different
+questions: a driver stack can pass detection and then fail inference, each layer failing one
+step later than the one above it, everything before the failure looking healthy.
+
+**4a — the clean room, for detection.**
+
 ```sh
-MOEARC_VERIFY_MODEL=/path/to/olmoe-1b-7b-0924-instruct-q4_k_m.gguf \
-MOEARC_VERIFY_MODEL_IDS="510 5347 273 6181 310" \
-MOEARC_VERIFY_MODEL_REF=/opt/m/bench/references/olmoe-1b-7b.capital.ids \
 MOEARC_RUNTIME_CACHE=/tmp/moearc-runtime-cache \
   packaging/verify-clean.sh dist/moearc-0.1.0-linux-x86_64.tar.gz
 ```
 
-It must print **`clean-environment verification PASSED`**. Anything else is not a release.
+It must print **`clean-environment verification PASSED`**. Anything else is not a release. It
+will also print a `NOT PROVEN` line; that is expected, and 4b is what covers it.
 
-**Give it a model.** Without one it stops at "SYCL found the card", and `docs/packaging.md`
-records a driver stack that passes that and then cannot load a model — each layer fails one
-step later than the one above it, and everything before the failure looks healthy.
+**4b — a real model, on a machine with llama.cpp.** Not a clean room — the point is the
+inference, not the environment — so run it from the unpacked tarball on a box with an Arc card
+and a llama.cpp build:
+
+```sh
+/tmp/unpacked/moearc serve olmoe-1b-7b-0924-instruct --no-tui --port 8099 &
+curl -s localhost:8099/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"olmoe","messages":[{"role":"user","content":"Capital of France?"}],
+       "max_tokens":16,"temperature":0}'
+```
+
+The completion has to be text, from the discrete card, with the device line in the startup
+banner naming the Arc and not the iGPU. ⬜ This step returns to 4a the day llama.cpp is
+bundled; until then a release is gated on a human running it and reading the output.
 
 ## 5 — Tag
 

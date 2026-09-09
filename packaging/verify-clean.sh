@@ -10,6 +10,20 @@
 #
 #   packaging/verify-clean.sh dist/moearc-*.tar.gz
 #
+# 🔴 WHAT THIS NO LONGER PROVES, AND IT USED TO
+#
+# Three of the four gates below ran binaries that left the payload with the retired SYCL
+# engine: `moearc-selftest` (SYCL reaches the card from an empty environment), `moearc-server`
+# (the server binary starts), and `moearc-bench` (a real forward pass, checked against stored
+# token ids). All three are gone from the tarball -- see packaging/bundle.sh -- so this script
+# can no longer prove that a model loads and produces correct tokens on a clean machine.
+#
+# That is a REDUCTION IN COVERAGE and it is stated here rather than quietly absorbed. What is
+# left still tests the thing this file was written for: that MoEArc finds the Arc card on a
+# machine that has never had oneAPI. What is missing moved to llama.cpp, which the tarball
+# does not carry yet; when it does, the forward-pass gate comes back and the verdict below
+# stops printing NOT PROVEN.
+#
 # 🔴 It passes the *render node*, not all of /dev/dri. Handing a container the card* nodes as
 # well makes Intel's compute runtime abort at teardown --
 # "Abort was called at 433 line in file: ./shared/source/os_interface/linux/drm_neo.cpp" --
@@ -27,15 +41,11 @@ image=${MOEARC_CLEAN_IMAGE:-moearc-clean:noble}
 driver=${MOEARC_CLEAN_DRIVER:-intel-repo}
 base=${MOEARC_CLEAN_BASE:-docker.io/library/ubuntu:24.04}
 runtime_cache=${MOEARC_RUNTIME_CACHE:-}
-# 🔴 Optional but strongly recommended, and the reason is measured: a driver stack can pass
-# every check below and still be unable to load a model. See docs/packaging.md, "The GPU driver
-# floor is higher for inference than for detection". Point this at a small MoE gguf.
-verify_model=${MOEARC_VERIFY_MODEL:-}
-verify_model_args=${MOEARC_VERIFY_MODEL_ARGS:-16 512 256 off}
-verify_model_ids=${MOEARC_VERIFY_MODEL_IDS:-}
-# A reference token-id file *inside the bundle*, e.g. bench/references/olmoe-1b-7b.capital.ids.
-# Without one the forward pass proves it ran; with one it proves it ran correctly.
-verify_model_ref=${MOEARC_VERIFY_MODEL_REF:--}
+# ⬜ MOEARC_VERIFY_MODEL and its three companions are gone with the binary that consumed them.
+# The finding they existed for is not: a driver stack can pass every check below and STILL be
+# unable to load a model -- docs/packaging.md, "The GPU driver floor is higher for inference
+# than for detection". That gap is now unguarded here, which is why the verdict says so out
+# loud instead of printing a clean PASS that covers less than it used to.
 
 if [ -z "$tarball" ]; then
     tarball=$(ls -t "$repo"/dist/moearc-*.tar.gz 2>/dev/null | head -1 || true)
@@ -71,9 +81,6 @@ if ! "$engine" image exists "$image" 2>/dev/null; then
 fi
 
 mounts=(-v "$tarball:/dist/moearc.tar.gz:ro")
-if [ -n "$verify_model" ]; then
-    mounts+=(-v "$(readlink -f "$verify_model"):/model.gguf:ro")
-fi
 if [ -n "$runtime_cache" ]; then
     mkdir -p "$runtime_cache"
     mounts+=(-v "$runtime_cache:/rtcache")
@@ -98,20 +105,11 @@ mkdir -p /opt/m && tar -C /opt/m --strip-components=1 -xzf /dist/moearc.tar.gz
 echo "---- 1. device report, with no SYCL runtime installed at all ----"
 /opt/m/moearc --no-tui
 echo
-echo "---- 2. the SYCL path, from a completely empty environment ----"
-env -i ${MOEARC_RUNTIME_DIR:+MOEARC_RUNTIME_DIR=$MOEARC_RUNTIME_DIR} /opt/m/moearc-selftest
-echo
-echo "---- 3. the server binary starts ----"
-env -i ${MOEARC_RUNTIME_DIR:+MOEARC_RUNTIME_DIR=$MOEARC_RUNTIME_DIR} /opt/m/moearc-server --help >/dev/null \
-  && echo "moearc-server --help: ok"
-if [ -f /model.gguf ]; then
-  echo
-  echo "---- 4. a real forward pass, which is a strictly harder test than 2 ----"
-  env -i ${MOEARC_RUNTIME_DIR:+MOEARC_RUNTIME_DIR=$MOEARC_RUNTIME_DIR} \
-    /opt/m/moearc-bench /model.gguf '"$verify_model_args"' \
-    '"$verify_model_ref"' '"$verify_model_ids"' \
-    && echo "forward pass: completed"
-fi
+echo "---- 2. the same, from a completely empty environment ----"
+# The point of env -i is that LD_LIBRARY_PATH, ONEAPI_ROOT and PATH are all unset, so anything
+# that resolves does so through the launcher and the bundle, not through the shell that ran it.
+env -i ${MOEARC_RUNTIME_DIR:+MOEARC_RUNTIME_DIR=$MOEARC_RUNTIME_DIR} /opt/m/moearc --no-tui \
+  && echo "empty-environment device report: ok"
 ' 2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
 set -e
@@ -138,27 +136,23 @@ refute() {
 
 check 'oneAPI: +ABSENT' 'the test machine genuinely has no oneAPI'
 check 'Intel\(R\) Arc' 'moearc names an Intel Arc device'
-check 'moearc-kernels-smoke: ok device=Intel\(R\) Arc' 'SYCL finds the Arc card from an empty environment'
-refute 'device=<none' 'SYCL did not fall back to "no usable GPU"'
+check 'empty-environment device report: ok' 'the card is still found with the environment emptied'
+refute 'no usable GPU|<none>' 'detection did not fall back to "no usable GPU"'
 refute 'cannot open shared object file' 'nothing failed in the dynamic loader'
-check 'moearc-server --help: ok' 'the server binary starts'
-if [ -n "$verify_model" ]; then
-    refute 'LOAD FAILED|Abort was called|Segmentation fault' \
-        'a real model loaded and ran (this is what a stale GPU driver fails)'
-    check 'forward pass: completed' 'the forward pass finished'
-    if [ "$verify_model_ref" != "-" ]; then
-        check 'ref [0-9]+/[0-9]+' 'the token ids matched the stored llama.cpp reference'
-    fi
-fi
 
 if [ "$status" != 0 ]; then
     echo "  FAIL  container exited $status"
     fail=1
 fi
 
+echo "  ----  NOT PROVEN: a model loading, a forward pass, or correct token ids."
+echo "        Those gates ran moearc-selftest, moearc-server and moearc-bench, and all three"
+echo "        left the payload with the retired SYCL engine. They come back when llama.cpp is"
+echo "        bundled. Until then a PASS here means the CARD IS FOUND, not that it computes."
+
 echo
 if [ "$fail" = 0 ]; then
-    echo "clean-environment verification PASSED"
+    echo "clean-environment verification PASSED (detection only -- see NOT PROVEN above)"
 else
     echo "clean-environment verification FAILED"
 fi

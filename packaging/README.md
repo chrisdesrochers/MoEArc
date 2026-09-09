@@ -20,16 +20,14 @@ checksums, and the clean-room gate, in the order they have to happen.
 `verify-clean.sh` is not optional before publishing a tarball. It is the only step that
 actually answers the question the artefact exists to answer.
 
-🔴 **Give it a model.** Without one it stops at "SYCL found the card", and a driver stack can
-pass that and still be unable to load a model — measured, see `docs/packaging.md`. With one it
-also runs a real forward pass and checks the output against a stored llama.cpp reference:
-
-```sh
-MOEARC_VERIFY_MODEL=/models/olmoe-1b-7b-0924-instruct-q4_k_m.gguf \
-MOEARC_VERIFY_MODEL_IDS="510 5347 273 6181 310" \
-MOEARC_VERIFY_MODEL_REF=/opt/m/bench/references/olmoe-1b-7b.capital.ids \
-  packaging/verify-clean.sh
-```
+🔴 **It proves less than it used to, and the gap is the important part.** It used to take a
+model — `MOEARC_VERIFY_MODEL` — and run a real forward pass in the container, checking the
+output against stored token ids. That gate ran `moearc-bench`, which left the payload with the
+retired SYCL engine, along with `moearc-selftest` and `moearc-server`. What survives proves the
+Arc card is found on a machine that has never had oneAPI. It does **not** prove a model loads,
+and `docs/packaging.md` measured that those are different questions: a driver stack can pass
+detection and still fail inference. The script prints `NOT PROVEN` for exactly that, and the
+gate returns when llama.cpp is bundled.
 
 `MOEARC_CLEAN_BASE` picks the distro to test against; `MOEARC_RUNTIME_CACHE` points at a
 directory to reuse between runs so the 230 MB fetch happens once.
@@ -39,8 +37,8 @@ directory to reuse between runs so the 230 MB fetch happens once.
 | | |
 | --- | --- |
 | `bundle.sh` | assembles `dist/moearc-<version>-linux-x86_64.tar.gz`. `--build` runs cargo first; `--with-runtime` vendors Intel's runtime instead of fetching it (read `THIRD-PARTY.md` before you do). |
-| `elf-relocatable.py` | rewrites the kernel object's `DT_SONAME` and the matching `DT_NEEDED` from this build tree's absolute path down to a bare name. Without it the tarball is a development build that only runs on the machine that produced it. |
-| `launcher.sh` | installed under four names; sets `LD_LIBRARY_PATH` and execs the real binary in `libexec/`. This is what closes the dlopen gap. |
+| `elf-relocatable.py` | rewrites an absolute `DT_SONAME` and the matching `DT_NEEDED` down to a bare name. ⬜ **Not run today** — the only object that ever had one was the retired kernel build's. Kept because bundling llama.cpp's shared objects will need it again. `bundle.sh` still asserts the property it existed for: no `DT_NEEDED` in any staged binary may contain a slash. |
+| `launcher.sh` | sets `LD_LIBRARY_PATH` and execs the real binary in `libexec/`. This is what closes the dlopen gap. Installed under one name now, having been installed under four. |
 | `fetch-runtime.py` | downloads Intel's published SYCL runtime, verified against pinned digests. Standard library only; no `pip`. |
 | `runtime.lock.json` | the pins. Versions, SHA-256, per-package file allowlist, licences. |
 | `install.sh` | the `curl \| sh` entry point: download, unpack, fetch the runtime, link onto `PATH`. Publishes nothing itself — it expects the assets `RELEASE.md` names, and says exactly that when they are not there. |
@@ -53,10 +51,9 @@ directory to reuse between runs so the 230 MB fetch happens once.
 
 ```
 moearc-<version>-linux-x86_64/
-  moearc  moearc-server  moearc-bench  moearc-selftest   <- four copies of launcher.sh
+  moearc                <- launcher.sh
   libexec/
-    moearc  moearc-server  moearc-bench  moearc-selftest <- the real ELF binaries
-    libmoearc_kernels.so                                 <- our SYCL kernels
+    moearc              <- the real ELF binary
     fetch-runtime.py
   runtime/            <- Intel's SYCL runtime: fetched at install, or vendored with --with-runtime
   share/moearc/       <- runtime.lock.json, BUILD-INFO.txt
@@ -69,10 +66,16 @@ works and the bundle stays one directory.
 
 ## Two things that will look like bugs and are not
 
-**`moearc` needs no SYCL runtime; everything else does.** The device report talks to Level Zero
-directly, which is deliberate — the first thing a new user runs has to work before anything has
-been downloaded, and it has to be able to explain a machine where the GPU stack is broken. So
-`moearc` runs immediately after unpacking and `moearc-server` triggers the runtime fetch.
+**`moearc` needs no SYCL runtime, and it is now the only binary in the tarball.** The device
+report talks to Level Zero directly, which is deliberate — the first thing a new user runs has
+to work before anything has been downloaded, and it has to be able to explain a machine where
+the GPU stack is broken. So `moearc` runs immediately after unpacking.
+
+⬜ **Which leaves `runtime/` with no consumer inside the bundle today.** It was fetched for
+`libmoearc_kernels.so`, which is retired. `install.sh` still fetches it, and a user's own
+llama.cpp SYCL build can resolve against it through the launcher, but that is a side effect
+rather than a design. This resolves either way once llama.cpp is bundled — decide it then,
+not by deleting the machinery now.
 
 **Passing a container all of `/dev/dri` makes Intel's driver abort at teardown.** The workload
 succeeds, prints its result, and *then* dies with

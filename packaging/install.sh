@@ -21,8 +21,9 @@ PREFIX=${MOEARC_PREFIX:-$HOME/.local/share/moearc}
 BINDIR=${MOEARC_BINDIR:-$HOME/.local/bin}
 TARBALL=${MOEARC_TARBALL:-}
 VERSION=${MOEARC_VERSION:-latest}
-# The smallest tarball this project has ever produced is 4.8 MB. Anything under a megabyte is
-# an error page, a redirect stub or a truncated transfer, none of which should reach `tar`.
+# Anything under a megabyte is an error page, a redirect stub or a truncated transfer, none of
+# which should reach `tar`. Kept at 1 MB rather than tracking the real size, which has only
+# gone down -- 5.0 MB before the pivot, and smaller now that the payload is one binary.
 MIN_BYTES=1048576
 
 say() { printf 'moearc: %s\n' "$*" >&2; }
@@ -196,7 +197,10 @@ else
 fi
 
 mkdir -p "$BINDIR"
-for cmd in moearc moearc-server moearc-bench moearc-selftest; do
+# One command. `moearc-server`, `moearc-bench` and `moearc-selftest` left the payload with
+# the SYCL engine -- see packaging/bundle.sh. Linking a name with nothing behind it leaves a
+# dangling symlink on PATH, which fails later and somewhere else.
+for cmd in moearc; do
     ln -sf "$PREFIX/$cmd" "$BINDIR/$cmd"
 done
 

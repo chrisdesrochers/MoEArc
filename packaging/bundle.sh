@@ -74,23 +74,37 @@ if [ "$do_build" = 1 ]; then
     # benchmark harnesses. `moearc` is the product; it reaches Level Zero through
     # moearc-device's dlopen and links no SYCL at all, which is the property that lets the
     # tarball work on first unpack.
-    echo "==> cargo build --release -p moearc-cli -p moearc-server"
+    echo "==> cargo build --release -p moearc-cli"
     ( cd "$repo" && CARGO_TARGET_DIR=$target_dir cargo build --release \
-        -p moearc-cli -p moearc-server --bins )
+        -p moearc-cli --bins )
 fi
 
 rel=$target_dir/release
 
 # name in the bundle : path in the build tree
 #
-# ⬜ `moearc-bench` (the retired engine's `hybrid_sweep`) and `moearc-selftest` (the kernel
-# object's dlopen smoke test) were both staged here and are both gone -- each existed only to
-# exercise the SYCL engine. `bench/reproduce.sh` is still installed below and still looks for
-# `./moearc-bench`; it will now report that it cannot find it, which is correct and loud. It
-# needs re-pointing at `moearc bench`, and that file is the benchmark owner's.
+# 🔴 THREE BINARIES LEFT THIS LIST AND EACH FOR A DIFFERENT REASON. Written out because a
+# payload that silently shrinks is how a release ships something nobody meant to ship.
+#
+#   * `moearc-bench` (the retired engine's `hybrid_sweep`) and `moearc-selftest` (the kernel
+#     object's dlopen smoke test) existed ONLY to exercise the SYCL engine. Keeping either
+#     means putting that engine back in the payload. `bench/reproduce.sh` is still installed
+#     below and still looks for `./moearc-bench`; it will now report that it cannot find it,
+#     which is correct and loud. It needs re-pointing at `moearc bench`.
+#   * `moearc-server` is dropped because WITHOUT llama.cpp LINKED IN IT IS A STUB -- an echo
+#     server that answers OpenAI-format requests with the prompt read back, and does so over
+#     the real routing, templating and SSE path. That stub is the right thing to have in the
+#     tree (it is what let the whole serving layer be written and tested before an engine
+#     existed) and the wrong thing to have in a tarball, where its output is indistinguishable
+#     from a model's to anyone not reading /health. Building it non-stub means linking
+#     llama.cpp, which means shipping llama.cpp's shared objects, which is the licence work
+#     noted in the header. It comes back the same day that lands.
+#
+# `moearc serve` -- the documented way to run a server -- does not use `moearc-server` at all.
+# It supervises llama.cpp's own `llama-server` as a child process. Nothing is lost here that a
+# user of this tarball had.
 declare -a payload=(
     "moearc:$rel/moearc"
-    "moearc-server:$rel/moearc-server"
 )
 
 for entry in "${payload[@]}"; do
@@ -188,7 +202,6 @@ source_date_epoch=${SOURCE_DATE_EPOCH:-$(cd "$repo" && git log -1 --format=%ct 2
     # for a compiler that touched none of these bytes is provenance that describes the wrong
     # machine. The engine's provenance is llama.cpp's, and llama.cpp is not in this tarball.
     echo "engine:      llama.cpp, supervised as a child process -- NOT BUNDLED (see the header)"
-    echo "moearc-server: stub unless rebuilt with --features engine against a linked llama.cpp"
     echo
     echo "minimum target glibc (max GLIBC_ symbol version required by the shipped binaries):"
     for f in "$root"/libexec/moearc*; do
@@ -218,6 +231,9 @@ echo "      needs one. ⬜ Bundling llama.cpp's binaries is tracked in docs/pivo
 echo "      and needs packaging/THIRD-PARTY.md written first."
 echo "    * no libmoearc_kernels.so, no moearc-bench, no moearc-selftest -- all three belong to"
 echo "      the retired SYCL engine, and the check above fails the build if one comes back."
+echo "    * no moearc-server. Built without a linked llama.cpp it is an ECHO STUB, and a"
+echo "      stub that speaks fluent OpenAI does not belong in a release. \`moearc serve\`"
+echo "      is the server, and it does not use that binary."
 echo "    * bench/reproduce.sh is installed but has no bench binary to run until it is"
 echo "      re-pointed at \`moearc bench\`."
 

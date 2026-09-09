@@ -1,6 +1,9 @@
 #!/bin/sh
-# MoEArc launcher. Installed at the bundle root under three names -- `moearc`,
-# `moearc-server`, `moearc-bench` -- and dispatches on which one it was invoked as.
+# MoEArc launcher. Installed at the bundle root and dispatches on which name it was invoked
+# as. That is one name today -- `moearc` -- having been four; `moearc-server`, `moearc-bench`
+# and `moearc-selftest` left the payload with the retired SYCL engine (packaging/bundle.sh
+# says why). The dispatch is kept rather than collapsed to a single case, because bundling
+# llama.cpp's binaries will add names back to this list.
 #
 # Its whole job is `docs/packaging.md`'s open gap #2: libsycl dlopens its Unified Runtime
 # adapters, and those adapters need libumf and libhwloc from directories that no rpath of

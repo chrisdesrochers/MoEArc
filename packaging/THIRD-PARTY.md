@@ -10,14 +10,25 @@ Everything under `libexec/` is MoEArc's own work, Apache-2.0:
 
 | file | what |
 | --- | --- |
-| `moearc`, `moearc-server`, `moearc-bench`, `moearc-selftest` | Rust binaries |
-| `libmoearc_kernels.so` | our SYCL kernels, compiled with Intel DPC++ on the build machine |
+| `moearc` | one Rust binary |
 
-`libmoearc_kernels.so` is compiled *by* Intel's compiler and links its runtime, but it contains
-no Intel source. The Rust dependency tree is Apache-2.0/MIT throughout; `cargo tree` is the
-authority and `NOTICE` carries the attributions.
+The Rust dependency tree is Apache-2.0/MIT throughout; `cargo tree` is the authority and
+`NOTICE` carries the attributions.
 
 **No third-party binary ships in the default tarball.**
+
+⬜ **That is the sentence that has to be revisited before llama.cpp is bundled.** MoEArc's
+engine is llama.cpp, which is MIT — compatible, and redistributable with its copyright notice
+and licence text carried alongside. Shipping `llama-server`, `libllama.so.0` and the
+`libggml*.so.0` family means adding that attribution here and in `NOTICE`, and it also means
+those objects link Intel's SYCL runtime, so the redistribution question below stops being
+hypothetical for the default tarball rather than only for `--with-runtime`. Until that is
+written, the tarball carries no engine and `moearc serve` expects a llama.cpp on the machine.
+
+⬜ Three binaries left this table with the retired SYCL engine: `moearc-server`,
+`moearc-bench`, `moearc-selftest`, and `libmoearc_kernels.so` with them. The licence position
+is unchanged by their departure — all four were MoEArc's own Apache-2.0 work — but the row is
+corrected because a manifest that lists files a tarball does not contain is not a manifest.
 
 ## What is fetched at install time, and why it is fetched rather than shipped
 
