@@ -31,8 +31,8 @@
 //!
 //! # 🔴 Where the engine plugs in
 //!
-//! This crate does **not** depend on `moearc-engine`, `moearc-kernels` or `moearc-model`, and
-//! must not start to. The entire coupling is [`generate::Generator`], a synchronous trait over
+//! This crate does **not** depend on `moearc-model`, and it names an engine in exactly one
+//! file. The entire coupling is [`generate::Generator`], a synchronous trait over
 //! `&[u32] -> tokens`. Everything else here — routing, templating, sampling, SSE, stop
 //! sequences, usage accounting — is written and tested against
 //! [`generate::EchoGenerator`], a stub that echoes the prompt at `temperature = 0`.
@@ -42,11 +42,11 @@
 //! ```ignore
 //! // today
 //! let generator: SharedGenerator = Arc::new(EchoGenerator::new(tokenizer.vocab_size()));
-//! // tomorrow
-//! let generator: SharedGenerator = Arc::new(moearc_engine::Session::load(&model_path)?);
+//! // with --features engine
+//! let generator: SharedGenerator = moearc_server::engine::EngineGenerator::shared(&model_path)?;
 //! ```
 //!
-//! plus one `impl Generator` on the engine side and one line in this crate's `Cargo.toml`.
+//! plus one `impl Generator` in `src/engine.rs` and one line in this crate's `Cargo.toml`.
 //! No handler, template, encoder or test names a concrete generator type. The contract the
 //! implementation must honour — blocking, ordered, cancellable — is documented on the trait.
 //!
@@ -57,8 +57,9 @@
 //! real network.
 
 pub mod chat;
-/// The bridge to the real inference engine. Behind the `engine` feature because it
-/// transitively needs Intel's DPC++ to build; without it this crate still serves.
+/// The bridge to the real inference engine — llama.cpp, through `moearc-llama`. Behind the
+/// `engine` feature because it has to link a built llama.cpp; without it this crate still
+/// builds and serves the stub anywhere.
 #[cfg(feature = "engine")]
 pub mod engine;
 pub mod error;

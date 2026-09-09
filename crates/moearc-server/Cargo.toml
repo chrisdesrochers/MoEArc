@@ -14,12 +14,12 @@ path = "src/bin/moearc-server.rs"
 
 [features]
 default = []
-# Wires the real engine in. Pulls moearc-engine/gpu, which needs Intel DPC++
-# at build time -- hence opt-in, so the serving path stays buildable anywhere.
-engine = ["dep:moearc-engine", "moearc-engine/gpu"]
+# Wires the real engine in. Pulls moearc-llama/runtime, which links a pre-built
+# llama.cpp -- hence opt-in, so the serving path stays buildable anywhere.
+engine = ["dep:moearc-llama", "moearc-llama/runtime"]
 
 [dependencies]
-moearc-engine = { workspace = true, optional = true }
+moearc-llama = { workspace = true, optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

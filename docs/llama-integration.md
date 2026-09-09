@@ -449,3 +449,38 @@ If the FFI proves brittle across llama.cpp pin moves, this is the retreat, and t
 `params` module is deliberately independent of the FFI so it would survive the
 switch unchanged: the same `ModelParams`/`ContextParams` can render a command line
 instead of filling a struct.
+
+---
+
+## 7. `moearc-server` — the in-process path, wired 2026-09-09
+
+§6 chose the subprocess for `moearc serve` and left the in-process path open. It is now also
+built, in `crates/moearc-server/src/engine.rs`, and the two coexist on purpose: `moearc serve`
+supervises `llama-server` because the tuning is the product, while `moearc-server` is the
+OpenAI-compatible layer this repo owns end to end — its own tokenizer, its own sampler, its own
+SSE. Which of the two is authoritative is still the open question at the foot of
+`pivot-inventory.md`, and nothing here answers it.
+
+What the rewire needed from this crate was **one accessor**: `Context::logits(idx)`, over a new
+`mla_get_logits_ith` in the shim. The server's contract says sampling is a caller-supplied
+closure, so it needs the raw logit row, not a token — `Sampler` cannot serve it. The row is
+borrowed out of llama.cpp's own output buffer rather than copied, and the borrow checker is the
+thing that keeps it valid: `logits` takes `&self`, `decode` takes `&mut self`, so a slice cannot
+outlive the decode that overwrites it. For a 201k vocabulary that is 800 KB per token not
+copied.
+
+### 7.1 A `llama_context` is not `Send`, and the server needs `&self`
+
+`Generator::generate` takes `&self` and one generator is shared across every in-flight request.
+A `Mutex<Context>` would be the short answer and it was not taken: under a mutex, consecutive
+decodes of one sequence run on whichever blocking thread wins the lock, and neither llama.cpp
+nor ggml documents that as supported — llama.cpp's own server keeps a context on one thread.
+Asserting `unsafe impl Send` to save a file would be a claim about someone else's threading
+model, made without evidence, and it buys a failure that shows up as wrong tokens rather than
+as a crash.
+
+So the model and the context are created on a dedicated thread, live there, and never leave it;
+requests reach them over a channel. It also disposes of the self-referential problem in
+`Context<'m>` borrowing its `Model`, with no `Box::leak` and no transmute: the model outlives
+the context because it is declared before it on the same stack frame. The cost is one `Vec<f32>` of logits
+per token crossing a channel, which is the same trade the retired `Session` made.

@@ -1625,6 +1625,31 @@ is merged; and for anything under `moearc-server`'s reach, `src/engine.rs` is re
 Legend: ✅ harvested, safe to delete · ⚠️ harvested but **gated** on something else moving first ·
 🔴 do **not** delete.
 
+### 🔴 How the verdicts below were checked — 2026-09-09
+
+**This list has been wrong twice.** It marked `session.rs` do-not-delete while marking three of
+its own imports safe, and it marked `hybrid_sweep.rs` deletable while `packaging/bundle.sh` was
+staging that exact binary into every release tarball as `moearc-bench`. Both errors have the
+same cause: the verdicts were reached by reading the tree.
+
+So they were re-derived by **deleting the candidates and compiling**. The whole set below was
+removed from a working copy, the module declarations and `[features]` entries that named them
+were removed with them, and `cargo check --workspace --all-targets` was run on the result. The
+tree was then restored from a backup taken before the experiment; nothing was committed.
+
+**Result: the workspace compiles with all of it gone**, on default features, with one
+pre-existing error in `crates/moearc-cli/src/bench/guard.rs` that is unrelated in-flight work by
+another author, and **nine warnings, all of one kind** — `unexpected cfg condition value: gpu`,
+at five sites in `bench/probe.rs` and four in `bench/timed.rs`. Those nine are the complete
+remaining surface. Everything else in the workspace is already independent of the retired
+engine.
+
+⚠️ **What the experiment did not prove.** It ran with `moearc-cli`'s `gpu` feature *removed*,
+which is what cfg's out `bench/timed.rs`'s `measure()` GPU arm — the last caller of `Session`,
+`SessionOptions`, `StopConditions`, `moe::Residency`, `host_experts::HostPolicy` and `profile`.
+Deleting these files without that feature also going is a compile error, not a clean removal.
+That file belongs to the benchmark work and is not touched here.
+
 ### `crates/moearc-engine/src/`
 
 | file | lines | harvested as | verdict |
@@ -1634,14 +1659,14 @@ Legend: ✅ harvested, safe to delete · ⚠️ harvested but **gated** on somet
 | `cache.rs` | 381 | S13, S14, the same-step pinning invariant | ⚠️ **One loss is real:** `cache.rs` and `residency::simulate` are two independent LRU implementations whose agreement on miss count was a genuine cross-check. Deleting this deletes the check. Note it, then delete. |
 | `runtime.rs` | 411 | S11, plus §8·X4 | ✅ |
 | `kv.rs` | 353 | The paged-vs-contiguous rationale; `KvUsage` reporting *"token slots allocated but not yet written"* so the waste-bounding claim stays honest; take-the-page-before-mutating so an exhausted pool leaves the sequence unchanged | ⚠️ **Gated.** `KvUsage::utilisation()` feeds `ServeSample::kv_utilisation` in the TUI and **has no llama.cpp source** (inventory, *"five gaps"*). Delete only after that dial is re-sourced or deliberately removed. |
-| `session.rs` | 599 | B3(a), B4, C10, `DEFAULT_N_CTX`'s rationale (§7), the error-string unwrapping that stops *"unsupported model: unsupported model: …"* | 🔴 **Gated, and copy the contract verbatim first:** blocking · takes `&self` · `on_token` called **once per accepted token, in order** · `false` stops promptly and returns stats so far · **stop tokens** enforced engine-side and **not** emitted through `on_token`, **stop strings** are the caller's · sampling is a caller-supplied closure · a token that was never emitted must not reach the KV cache. `moearc-server`'s `Generator` was written against exactly this shape. |
+| `session.rs` | 599 | B3(a), B4, C10, `DEFAULT_N_CTX`'s rationale (§7), the error-string unwrapping that stops *"unsupported model: unsupported model: …"* | ✅ **UNBLOCKED 2026-09-09.** The contract below was not copied into a comment — it was copied into **`moearc_server::generate::drive`**, the one token loop both the stub and the llama.cpp generator are written against, with six tests that run on default features. The one that matters asserts the last clause directly: a scripted model records every token it is fed, and a stop token, a cancelled token and a budget-exhausting token are each shown to be absent from that record. `moearc-server/src/engine.rs` now drives `moearc_llama::Context` and names nothing in this crate. **The contract, verbatim:** blocking · takes `&self` · `on_token` called **once per accepted token, in order** · `false` stops promptly and returns stats so far · **stop tokens** enforced engine-side and **not** emitted through `on_token`, **stop strings** are the caller's · sampling is a caller-supplied closure · a token that was never emitted must not reach the KV cache. `moearc-server`'s `Generator` was written against exactly this shape. |
 | `profile.rs` | 101 | Zero-cost-when-off (one relaxed atomic load, no clock read); **phases do not nest, so the residue between their sum and the wall clock is host work nobody attributed**; `reset()` after warm-up; dropping on an early `?` is deliberate | ✅ — `llama_perf_context` may cover it; 101 lines either way. |
 
 ### `crates/moearc-engine/examples/` and `tests/`
 
 | file | lines | harvested as | verdict |
 |---|---:|---|---|
-| `hybrid_sweep.rs` | 254 | S1's **`busy` vs `wait` is the overlap measurement**; *"tok/s can fall while `wait` is near zero"*; C11's host-axis caveat | ✅ |
+| `hybrid_sweep.rs` | 254 | S1's **`busy` vs `wait` is the overlap measurement**; *"tok/s can fall while `wait` is near zero"*; C11's host-axis caveat | ⚠️ **This row said ✅ and was wrong: it is a shipped release binary.** `packaging/bundle.sh` staged it as `moearc-bench` and `bench/reproduce.sh` execs `./moearc-bench` from an installed tarball. bundle.sh no longer stages it (2026-09-09) — it cannot, without putting the retired engine back in the payload. ⬜ `bench/reproduce.sh` still names it and now reports that it cannot find its binary; re-point it at `moearc bench` before deleting this. |
 | `profile_decode.rs` | 231 | Throw away the first tokens (a cold pool would attribute staging to whichever phase ran first); **residency must be required, not defaulted** — on a model that does not fit, the defaults cannot be allocated and *"a profile of a configuration the caller did not choose is worse than no profile"* | ✅ |
 | `host_expert_bench.rs` | 221 | **S9** (410 µs artefact) + the three-numbers structure | ✅ |
 | `olmoe_generate.rs` | 80 | nothing — superseded exactly by `moearc-llama/examples/generate.rs` | ✅ |
@@ -1669,7 +1694,7 @@ Legend: ✅ harvested, safe to delete · ⚠️ harvested but **gated** on somet
 
 | file | lines | harvested as | verdict |
 |---|---:|---|---|
-| `src/tensors.rs` | 929 | **C7**'s expert-bank stride trap; the mmap-not-read rationale (a 20.6 GiB file read into a `Vec<u8>` is 20.6 GiB of RSS before a single token, on a machine whose GPU has 12); the tensor-name conventions incl. gpt-oss's `post_attention_norm` mismatch | ⚠️ **Land the tensor-name table somewhere first** if `moearc-llama` ever needs to reach for a tensor by name. Otherwise ✅. |
+| `src/tensors.rs` | 929 | **C7**'s expert-bank stride trap; the mmap-not-read rationale (a 20.6 GiB file read into a `Vec<u8>` is 20.6 GiB of RSS before a single token, on a machine whose GPU has 12); the tensor-name conventions incl. gpt-oss's `post_attention_norm` mismatch | ⚠️ **Land the tensor-name table somewhere first** if `moearc-llama` ever needs to reach for a tensor by name. Otherwise ✅ — **compiler-verified 2026-09-09**: only `moe.rs` reached it. `moearc-cli` uses `moearc_model::{gguf, quant, pull, ModelInfo}`, none of which is this file; the crate itself stays. Delete the `pub mod tensors;` line in `src/lib.rs` with it. |
 | `examples/map.rs` | 177 | The `VmRSS`-either-side-of-the-map measurement that **backs** the zero-copy claim | ⚠️ Cite the measurement before deleting the evidence for it. |
 | `examples/expert_probe.rs` | 94 | The independent-reader check on slice arithmetic (seek to `file_offset`, read `len`, compare) — *"the only way an off-by-one stride is ever going to be caught"* | ✅ after `tensors.rs` |
 | `tests/mapped_model.rs` | 158 | offsets only | ✅ after `tensors.rs` |

@@ -128,6 +128,7 @@ unsafe extern "C" {
     pub fn mla_vocab_bos(m: *const LlamaModel) -> i32;
 
     pub fn mla_decode(c: *mut LlamaContext, tokens: *const i32, n_tokens: i32) -> i32;
+    pub fn mla_get_logits_ith(c: *mut LlamaContext, i: i32) -> *const f32;
 
     pub fn mla_sampler_greedy() -> *mut LlamaSampler;
     pub fn mla_sampler_dist(seed: u32, top_k: i32, top_p: f32, temp: f32) -> *mut LlamaSampler;

@@ -449,6 +449,28 @@ impl<'m> Context<'m> {
         if code == 0 { Ok(()) } else { Err(Error::Decode { code, meaning: decode_meaning(code) }) }
     }
 
+    /// The logit row for output `idx`; `-1` is the last token of the last decode.
+    ///
+    /// Borrowed straight out of llama.cpp's output buffer -- no copy, which for a
+    /// 201k-token vocabulary is 800 KB saved per generated token. That buffer is
+    /// overwritten by the next [`Context::decode`], and the borrow checker is what
+    /// enforces it: this takes `&self`, `decode` takes `&mut self`, so a slice
+    /// handed out here cannot still be alive across a decode.
+    ///
+    /// `None` when llama.cpp computed no logits for that index.
+    #[must_use]
+    pub fn logits(&self, idx: i32) -> Option<&[f32]> {
+        let n = usize::try_from(self.model.vocab_len()).ok()?;
+        if n == 0 {
+            return None;
+        }
+        // SAFETY: the shim returns either NULL or a pointer to `n_vocab`
+        // contiguous f32 owned by this context. The lifetime is tied to `&self`,
+        // and `decode` -- the only thing that invalidates it -- needs `&mut self`.
+        let p = unsafe { ffi::mla_get_logits_ith(self.raw.as_ptr(), idx) };
+        (!p.is_null()).then(|| unsafe { std::slice::from_raw_parts(p, n) })
+    }
+
     /// Drop the KV cache so the context can be reused for a fresh sequence.
     pub fn reset(&mut self) {
         unsafe { ffi::mla_memory_clear(self.raw.as_ptr(), 1) };

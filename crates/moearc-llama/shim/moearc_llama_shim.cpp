@@ -370,6 +370,25 @@ int32_t mla_decode(struct llama_context * c, const int32_t * tokens, int32_t n_t
 }
 
 // ---------------------------------------------------------------------------
+// Logits
+// ---------------------------------------------------------------------------
+
+// The raw logit row for output `i` (-1 = the last token of the last batch).
+//
+// Returned as a borrowed pointer into llama.cpp's own output buffer rather than
+// copied: a vocabulary of 201k f32 is 800 KB, and a server that copies it once
+// per token pays that on every token for nothing. The buffer is overwritten by
+// the next llama_decode, which is why the Rust side ties the slice's lifetime to
+// a shared borrow of the context and takes an exclusive one to decode.
+//
+// NULL when no logits were computed for that index -- an out-of-range `i` is
+// answered rather than trapped, because a wrong index must not take the process
+// down inside a request handler.
+const float * mla_get_logits_ith(struct llama_context * c, int32_t i) {
+    return llama_get_logits_ith(c, i);
+}
+
+// ---------------------------------------------------------------------------
 // Sampling
 // ---------------------------------------------------------------------------
 

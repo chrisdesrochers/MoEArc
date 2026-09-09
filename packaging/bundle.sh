@@ -3,19 +3,34 @@
 #
 # Produces a directory tree that runs on a machine with an Arc card, an Intel GPU driver, and
 # nothing else -- specifically, no oneAPI. What makes that possible is documented in
-# docs/packaging.md; the two mechanical steps are here:
+# docs/packaging.md.
 #
-#   1. `elf-relocatable.py` shortens the kernel object's DT_SONAME (and the matching DT_NEEDED
-#      in every binary that links it) from this build tree's absolute OUT_DIR path down to the
-#      bare file name, so the loader searches for it instead of opening a path that will not
-#      exist on the target machine.
-#   2. The launcher puts the runtime directory on LD_LIBRARY_PATH before exec'ing the real
-#      binary, which is the only search path a dlopened UR adapter's own dependencies inherit.
+# 🔴 WHAT THIS DOES NOT BUILD, AS OF 2026-09-08
 #
-# By default the tarball contains no Intel binaries at all: `runtime/` is populated at install
-# time by fetch-runtime.py from Intel's published redistributable packages. `--with-runtime`
-# vendors them into the tarball instead, which is for air-gapped installs and carries a
-# licence position you should read in docs/packaging.md before publishing one.
+# Until today this ran `cargo build --features moearc-server/engine,moearc-engine/gpu` and then
+# asserted that `moearc-server` linked `libmoearc_kernels.so`. Both are gone. MoEArc's engine is
+# llama.cpp; the hand-written SYCL engine is retired, the project has said so publicly, and a
+# release that carries it in the payload contradicts the product shipped beside it. The
+# assertion has been kept and turned round: nothing staged here may link that object.
+#
+# Two consequences, stated here rather than discovered in a release:
+#
+#   1. `elf-relocatable.py` is no longer run. Its job was to shorten one absolute DT_SONAME --
+#      the kernel object's -- and no staged file has one. The guard that mattered is kept: no
+#      DT_NEEDED in any staged binary may contain a slash.
+#   2. ⬜ **llama.cpp's shared objects are not bundled yet.** `moearc serve` supervises
+#      `llama-server` and resolves it beside its own binary first, so a tarball that also
+#      carried `llama-server`, `libllama.so.0` and the `libggml*.so.0` family would be
+#      self-contained. Staging them is real work with a real licence obligation --
+#      packaging/THIRD-PARTY.md does not yet cover shipping MIT-licensed llama.cpp binaries --
+#      and it is tracked in docs/pivot-inventory.md under `packaging/`. Until it lands, the
+#      tarball needs a llama.cpp on the target machine.
+#
+# The launcher puts the runtime directory on LD_LIBRARY_PATH before exec'ing the real binary,
+# which is the only search path a dlopened UR adapter's own dependencies inherit. `runtime/` is
+# populated at install time by fetch-runtime.py from Intel's published redistributable packages;
+# `--with-runtime` vendors them into the tarball instead, which is for air-gapped installs and
+# carries a licence position you should read in docs/packaging.md before publishing one.
 
 set -euo pipefail
 
@@ -54,23 +69,28 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$do_build" = 1 ]; then
-    echo "==> cargo build --release (moearc-server/engine, moearc-engine/gpu)"
+    # No feature flags. Every one that used to be here (`moearc-server/engine`,
+    # `moearc-engine/gpu`) pulls the retired SYCL engine, and `--examples` built its
+    # benchmark harnesses. `moearc` is the product; it reaches Level Zero through
+    # moearc-device's dlopen and links no SYCL at all, which is the property that lets the
+    # tarball work on first unpack.
+    echo "==> cargo build --release -p moearc-cli -p moearc-server"
     ( cd "$repo" && CARGO_TARGET_DIR=$target_dir cargo build --release \
-        -p moearc-cli -p moearc-kernels -p moearc-server -p moearc-engine \
-        --features moearc-server/engine,moearc-engine/gpu --bins --examples )
+        -p moearc-cli -p moearc-server --bins )
 fi
 
 rel=$target_dir/release
-kernel_so=$(ls "$rel"/build/moearc-kernels-*/out/libmoearc_kernels.so 2>/dev/null | head -1 || true)
-
-[ -n "$kernel_so" ] || { echo "bundle.sh: no libmoearc_kernels.so under $rel/build -- build first, or pass --build" >&2; exit 1; }
 
 # name in the bundle : path in the build tree
+#
+# ⬜ `moearc-bench` (the retired engine's `hybrid_sweep`) and `moearc-selftest` (the kernel
+# object's dlopen smoke test) were both staged here and are both gone -- each existed only to
+# exercise the SYCL engine. `bench/reproduce.sh` is still installed below and still looks for
+# `./moearc-bench`; it will now report that it cannot find it, which is correct and loud. It
+# needs re-pointing at `moearc bench`, and that file is the benchmark owner's.
 declare -a payload=(
     "moearc:$rel/moearc"
     "moearc-server:$rel/moearc-server"
-    "moearc-bench:$rel/examples/hybrid_sweep"
-    "moearc-selftest:$rel/moearc-kernels-smoke"
 )
 
 for entry in "${payload[@]}"; do
@@ -78,14 +98,21 @@ for entry in "${payload[@]}"; do
     [ -x "$src" ] || { echo "bundle.sh: missing $src -- build first, or pass --build" >&2; exit 1; }
 done
 
-# `moearc-server` must actually link the kernels; built without --features engine it does not,
-# and the tarball would ship a server that cannot infer. Checking rather than trusting,
-# because that is the exact class of mistake docs/packaging.md records twice.
-if ! readelf -d "$rel/moearc-server" | grep -q 'libmoearc_kernels\.so'; then
-    echo "bundle.sh: $rel/moearc-server does not link libmoearc_kernels.so." >&2
-    echo "           It was built without --features moearc-server/engine. Rebuild with --build." >&2
-    exit 1
-fi
+# 🔴 This check used to assert the opposite: that `moearc-server` DID link
+# libmoearc_kernels.so, on the reasoning that a server which cannot infer must not ship. That
+# reasoning is now inverted, not abandoned. The engine is llama.cpp; the kernel object is the
+# retired one; and a stale `target/release` from a build that predates the pivot is exactly how
+# it would get into a release unnoticed. Checking rather than trusting, because that is the
+# exact class of mistake docs/packaging.md records twice.
+for entry in "${payload[@]}"; do
+    src=${entry#*:}
+    if readelf -d "$src" 2>/dev/null | grep -q 'libmoearc_kernels\.so'; then
+        echo "bundle.sh: $src links libmoearc_kernels.so -- the RETIRED SYCL engine." >&2
+        echo "           That build predates the pivot to llama.cpp. Delete $rel and rebuild" >&2
+        echo "           with --build; a release must not carry that engine." >&2
+        exit 1
+    fi
+done
 
 if [ -z "$version" ]; then
     v=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$repo/Cargo.toml" | head -1)
@@ -106,17 +133,15 @@ for entry in "${payload[@]}"; do
     install -m 0755 "$src" "$root/libexec/$dst"
     install -m 0755 "$here/launcher.sh" "$root/$dst"
 done
-install -m 0755 "$kernel_so" "$root/libexec/libmoearc_kernels.so"
 install -m 0755 "$here/fetch-runtime.py" "$root/libexec/fetch-runtime.py"
 install -m 0644 "$here/runtime.lock.json" "$root/share/moearc/runtime.lock.json"
 
-echo "==> making the kernel object relocatable"
-python3 "$here/elf-relocatable.py" "$root/libexec/libmoearc_kernels.so" \
-    "$root/libexec/moearc" "$root/libexec/moearc-server" \
-    "$root/libexec/moearc-bench" "$root/libexec/moearc-selftest"
-
-# A path left in DT_NEEDED is the failure this whole step exists to prevent, and it is silent
-# until someone unpacks the tarball on another machine. Assert it.
+# `elf-relocatable.py` is not run: it rewrites one absolute DT_SONAME into a bare file name,
+# and the only object that ever had one was the retired kernel build's. The *guard* it existed
+# to satisfy is what matters and is kept below.
+#
+# A path left in DT_NEEDED is the failure that step existed to prevent, and it is silent until
+# someone unpacks the tarball on another machine. Assert it.
 for f in "$root"/libexec/moearc*; do
     case $f in *.py) continue ;; esac
     if readelf -d "$f" 2>/dev/null | awk '/NEEDED/ {print $NF}' | grep -q '/'; then
@@ -157,12 +182,16 @@ source_date_epoch=${SOURCE_DATE_EPOCH:-$(cd "$repo" && git log -1 --format=%ct 2
     echo "commit:      $(cd "$repo" && git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "dirty:       $(cd "$repo" && { git diff --quiet 2>/dev/null && echo no || echo YES; })"
     echo "rustc:       $(rustc --version 2>/dev/null || echo unknown)"
-    echo "icpx:        $("${ONEAPI_ROOT:-/opt/intel/oneapi}/compiler/latest/bin/icpx" --version 2>/dev/null | head -1 || echo unknown)"
     echo "build glibc: $(ldd --version 2>/dev/null | head -1 || echo unknown)"
     echo "runtime:     $([ "$with_runtime" = 1 ] && echo vendored || echo 'fetched at install time')"
+    # No `icpx:` line. Nothing in this payload is compiled by it any more, and a version string
+    # for a compiler that touched none of these bytes is provenance that describes the wrong
+    # machine. The engine's provenance is llama.cpp's, and llama.cpp is not in this tarball.
+    echo "engine:      llama.cpp, supervised as a child process -- NOT BUNDLED (see the header)"
+    echo "moearc-server: stub unless rebuilt with --features engine against a linked llama.cpp"
     echo
     echo "minimum target glibc (max GLIBC_ symbol version required by the shipped binaries):"
-    for f in "$root"/libexec/moearc* "$root/libexec/libmoearc_kernels.so"; do
+    for f in "$root"/libexec/moearc*; do
         case $f in *.py) continue ;; esac
         printf '  %-24s %s\n' "$(basename "$f")" \
             "$(objdump -p "$f" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"
@@ -181,9 +210,20 @@ echo
 echo "==> $out_dir/$name.tar.gz  ($(du -h --apparent-size "$out_dir/$name.tar.gz" | cut -f1))"
 cat "$root/share/moearc/BUILD-INFO.txt"
 
+echo
+echo "==> what is NOT in this tarball"
+echo "    * no inference engine. \`moearc serve\` supervises llama.cpp's \`llama-server\`, and"
+echo "      finds it beside itself, via \$MOEARC_LLAMA_SERVER, or on \$PATH. A target machine"
+echo "      needs one. ⬜ Bundling llama.cpp's binaries is tracked in docs/pivot-inventory.md"
+echo "      and needs packaging/THIRD-PARTY.md written first."
+echo "    * no libmoearc_kernels.so, no moearc-bench, no moearc-selftest -- all three belong to"
+echo "      the retired SYCL engine, and the check above fails the build if one comes back."
+echo "    * bench/reproduce.sh is installed but has no bench binary to run until it is"
+echo "      re-pointed at \`moearc bench\`."
+
 # A tarball whose provenance reads `unknown` is not evidence of anything, and the way to get
-# one is undramatic: run bundle.sh in a shell where rustc or icpx is not on PATH and every
-# field quietly falls back. Said out loud here rather than discovered in a release.
+# one is undramatic: run bundle.sh in a shell where rustc is not on PATH and every field
+# quietly falls back. Said out loud here rather than discovered in a release.
 if grep -qE ': +unknown|^dirty: +YES' "$root/share/moearc/BUILD-INFO.txt"; then
     echo
     echo "bundle.sh: ⚠️  this build is not release-grade -- BUILD-INFO.txt above has an" >&2

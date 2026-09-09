@@ -4,9 +4,10 @@
 //!
 //! Everything above this module — routing, chat templating, SSE framing, stop sequences,
 //! usage accounting — talks to [`Generator`] and nothing else. There is no dependency here on
-//! `moearc-engine`, `moearc-kernels` or `moearc-model`, by design: the serving layer had to be
-//! finishable and testable while those three were still being written, and a server wired
-//! directly to a half-built engine cannot be tested at all.
+//! any engine, by design: the serving layer had to be finishable and testable while the engine
+//! was still being written, and a server wired directly to a half-built engine cannot be
+//! tested at all. That property is what made swapping the engine underneath it a change to one
+//! file.
 //!
 //! **Swapping the stub for the real engine is one line.** In
 //! [`crate::state::ServerState::new`], the `Arc<dyn Generator>` handed in is
@@ -15,11 +16,14 @@
 //! one `impl`:
 //!
 //! ```ignore
-//! impl Generator for moearc_engine::Session {
+//! impl Generator for EngineGenerator {
 //!     fn generate(&self, prompt_tokens: &[u32], params: &SamplingParams,
 //!                 on_token: &mut dyn FnMut(u32) -> bool) -> Result<GenerationStats> { .. }
 //! }
 //! ```
+//!
+//! It should not write the token loop itself. [`drive`] is that loop, and the clauses below
+//! are what it implements.
 //!
 //! # Contract the engine must honour
 //!
@@ -105,6 +109,74 @@ pub trait Generator: Send + Sync {
     /// cannot accidentally inherit "this is fake".
     fn is_stub(&self) -> bool {
         false
+    }
+}
+
+/// The token loop the contract above describes, written once.
+///
+/// A real generator differs from another only in how it turns tokens into logits, so that is
+/// the only thing this asks for: `advance` feeds tokens to the model and returns the logits
+/// that follow the last of them. It is called once with the whole prompt, and then **once per
+/// accepted token** — never with anything else.
+///
+/// That last sentence is the point of the function.
+///
+/// 🔴 **A token that is never emitted must not reach the KV cache.** Sampling produces a
+/// candidate; three things can happen next that mean the client will never see it — it is a
+/// stop token, `on_token` returned `false` (a stop string matched, or the client hung up), or
+/// the token budget is spent. In each case generation ends *before* `advance` is called
+/// again, so the model's state stops exactly where the client's last-seen token left it.
+/// Advancing first and deciding afterwards produces a sequence one token ahead of the
+/// transcript, which is not an error anywhere — it is drift that shows up as wrong text some
+/// distance later, in a different request, on a reused context. It has no symptom at the
+/// point of the bug, which is why the rule gets one implementation and a test rather than a
+/// comment in each generator.
+pub fn drive(
+    prompt_tokens: &[u32],
+    params: &SamplingParams,
+    rng: &mut Rng,
+    advance: &mut dyn FnMut(&[u32]) -> anyhow::Result<Vec<f32>>,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> anyhow::Result<GenerationStats> {
+    if prompt_tokens.is_empty() {
+        anyhow::bail!("a prompt needs at least one token");
+    }
+
+    let mut history: Vec<u32> = prompt_tokens.to_vec();
+    let mut stats = GenerationStats {
+        prompt_tokens: prompt_tokens.len(),
+        completion_tokens: 0,
+        stop_reason: StopReason::Length,
+    };
+
+    // The prompt is processed even when no tokens are wanted. `max_tokens = 0` is a legitimate
+    // request — it is how a client asks what a prompt costs — and reporting `prompt_tokens` for
+    // a prompt that was never run would be a usage figure with nothing behind it.
+    let mut logits = advance(prompt_tokens)?;
+    if params.max_tokens == 0 {
+        return Ok(stats);
+    }
+
+    loop {
+        let token = sample(&logits, &history, params, rng);
+
+        if params.stop_tokens.contains(&token) {
+            stats.stop_reason = StopReason::EndOfTurn;
+            return Ok(stats);
+        }
+        history.push(token);
+        stats.completion_tokens += 1;
+        if !on_token(token) {
+            stats.stop_reason = StopReason::Cancelled;
+            return Ok(stats);
+        }
+        if stats.completion_tokens >= params.max_tokens {
+            stats.stop_reason = StopReason::Length;
+            return Ok(stats);
+        }
+
+        // Only here, and only for a token the caller has already seen.
+        logits = advance(&[token])?;
     }
 }
 
@@ -237,6 +309,119 @@ mod tests {
             })
             .unwrap();
         (out, stats)
+    }
+
+    /// A model whose next token is whatever the script says, which records every token it
+    /// was ever fed. What it is fed *is* the KV cache, so the recording is the assertion.
+    struct Scripted {
+        script: Vec<u32>,
+        step: usize,
+        fed: Vec<Vec<u32>>,
+    }
+
+    impl Scripted {
+        fn new(script: &[u32]) -> Self {
+            Self { script: script.to_vec(), step: 0, fed: Vec::new() }
+        }
+
+        fn advance(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+            self.fed.push(tokens.to_vec());
+            let mut logits = vec![0.0f32; 16];
+            if let Some(&t) = self.script.get(self.step) {
+                logits[t as usize] = 10.0;
+            }
+            self.step += 1;
+            Ok(logits)
+        }
+    }
+
+    fn greedy(max_tokens: usize, stop_tokens: Vec<u32>) -> SamplingParams {
+        SamplingParams { temperature: 0.0, max_tokens, stop_tokens, ..Default::default() }
+    }
+
+    /// Run `drive` against a scripted model, returning what was emitted, what reached the
+    /// model, and the stats.
+    fn run(
+        script: &[u32],
+        prompt: &[u32],
+        params: &SamplingParams,
+        mut keep_going: impl FnMut(usize) -> bool,
+    ) -> (Vec<u32>, Vec<Vec<u32>>, GenerationStats) {
+        let mut model = Scripted::new(script);
+        let mut rng = Rng::seed_from_u64(0);
+        let mut out = Vec::new();
+        let stats = drive(prompt, params, &mut rng, &mut |t| model.advance(t), &mut |t| {
+            out.push(t);
+            keep_going(out.len())
+        })
+        .unwrap();
+        (out, model.fed, stats)
+    }
+
+    /// 🔴 The load-bearing clause. The stop token is sampled, is not emitted, and must not
+    /// have been fed to the model either.
+    #[test]
+    fn a_stop_token_never_reaches_the_kv_cache() {
+        let params = greedy(10, vec![3]);
+        let (out, fed, stats) = run(&[1, 2, 3, 4], &[7, 8, 9], &params, |_| true);
+        assert_eq!(out, vec![1, 2]);
+        assert_eq!(fed, vec![vec![7, 8, 9], vec![1], vec![2]]);
+        assert!(!fed.iter().any(|f| f.contains(&3)), "the stop token was fed to the model");
+        assert_eq!(stats.stop_reason, StopReason::EndOfTurn);
+        assert_eq!(stats.completion_tokens, 2);
+    }
+
+    /// The same clause on the cancellation path, and it is the subtler half: token 2 *was*
+    /// emitted, the callback then said stop, and it must still not have been fed back.
+    #[test]
+    fn a_cancelled_token_is_emitted_but_never_fed_back() {
+        let params = greedy(10, vec![]);
+        let (out, fed, stats) = run(&[1, 2, 3, 4], &[7], &params, |n| n < 2);
+        assert_eq!(out, vec![1, 2]);
+        assert_eq!(fed, vec![vec![7], vec![1]]);
+        assert_eq!(stats.stop_reason, StopReason::Cancelled);
+        assert_eq!(stats.completion_tokens, 2);
+    }
+
+    /// And on the budget path: the last token of a completion is emitted, never fed.
+    #[test]
+    fn the_final_token_of_a_full_budget_is_not_fed_back() {
+        let params = greedy(2, vec![]);
+        let (out, fed, stats) = run(&[1, 2, 3, 4], &[7], &params, |_| true);
+        assert_eq!(out, vec![1, 2]);
+        assert_eq!(fed, vec![vec![7], vec![1]]);
+        assert_eq!(stats.stop_reason, StopReason::Length);
+    }
+
+    #[test]
+    fn each_accepted_token_is_fed_exactly_once_in_order() {
+        let params = greedy(4, vec![]);
+        let (out, fed, _) = run(&[1, 2, 3, 4, 5], &[7, 8], &params, |_| true);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+        assert_eq!(fed, vec![vec![7, 8], vec![1], vec![2], vec![3]]);
+    }
+
+    /// `max_tokens = 0` still runs the prompt: the usage figure has to describe work that
+    /// actually happened.
+    #[test]
+    fn a_zero_budget_still_processes_the_prompt() {
+        let params = greedy(0, vec![]);
+        let (out, fed, stats) = run(&[1, 2], &[7, 8, 9], &params, |_| true);
+        assert!(out.is_empty());
+        assert_eq!(fed, vec![vec![7, 8, 9]]);
+        assert_eq!(stats.prompt_tokens, 3);
+        assert_eq!(stats.completion_tokens, 0);
+    }
+
+    #[test]
+    fn an_empty_prompt_is_refused_before_the_model_is_touched() {
+        let mut model = Scripted::new(&[1]);
+        let mut rng = Rng::seed_from_u64(0);
+        let params = greedy(4, vec![]);
+        let err = drive(&[], &params, &mut rng, &mut |t| model.advance(t), &mut |_| true)
+            .expect_err("an empty prompt must not be generated from");
+        assert!(err.to_string().contains("at least one token"), "{err}");
+        assert!(model.fed.is_empty());
     }
 
     #[test]
