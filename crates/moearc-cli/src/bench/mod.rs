@@ -114,6 +114,7 @@ pub fn run(cli: &Cli, sources: &Sources, args: &BenchArgs) -> Result<ExitCode> {
         zfs_arc: probe::zfs_arc(),
         model: model_path.as_deref().and_then(probe::model_facts),
         engine_threads: None,
+        host_policy: None,
         incumbent: None,
         build: probe::build_facts(),
         device,
@@ -122,18 +123,69 @@ pub fn run(cli: &Cli, sources: &Sources, args: &BenchArgs) -> Result<ExitCode> {
     };
 
     let intent = if want_absolutes { guard::Intent::ABSOLUTES } else { guard::Intent::SHAPE };
+
+    // 🔴 The same settle the sweep uses, applied before the sweep, for the same reason and so
+    // the rule reads the same way in both places. Without it the second of two back-to-back
+    // runs refuses at the pre-flight with `the box is busy` and no hint that the busy process
+    // was the first one: measured here, a run that finished at load 15 refused the next
+    // invocation four minutes later. `--load-settle 0` refuses at once, as before.
+    if want_absolutes && !args.check && !args.force && args.load_settle > 0 {
+        let limit = thresholds.load_refuse(reading.logical_cpus);
+        if reading.load1.is_some_and(|l| l > limit) {
+            eprintln!(
+                "moearc bench: load is above {limit:.2}; waiting up to {}s for the box to go \
+                 quiet (--load-settle)",
+                args.load_settle
+            );
+            let _ = wait_for_quiet(limit, args.load_settle);
+            reading.load1 = probe::load1();
+        }
+    }
+
     let preflight = guard::evaluate(&reading, &thresholds, intent);
     let refused_before_work = guard::Verdict::of(&preflight) == guard::Verdict::Refused;
 
     let mut not_measured: Vec<String> = Vec::new();
     let mut absolutes: Vec<timed::TimedPoint> = Vec::new();
     let mut incumbent_result = None;
+    // Findings that only the run itself can produce: what the page-cache warm-up did, and
+    // whether the box had to be waited on between invocations.
+    let mut run_findings: Vec<guard::Finding> = Vec::new();
 
     // 🔴 The shape results are a deterministic replay: no clock, no device. They are produced
     // whatever the pre-flight said, because refusing them for load average would be theatre —
     // and a refused absolutes run is exactly when a user most wants the part that still holds.
     let shape_result = if want_shape {
-        Some(measure_shape(cli, sources, args, &reading)?)
+        let s = measure_shape(cli, sources, args, &reading)?;
+        // 🔴 The shape half is what this tool calls *the result* — §0, and the table at the top
+        // of `docs/bench.md`. A run that replayed nothing of it still reported
+        // `VERDICT: trusted`, with a headline bullet reading "**Shape (reproduces anywhere).**
+        // no trace was replayed": an absence formatted as a finding, over a verdict that says
+        // it can be cited. Every skipped file already names its own reason below; what was
+        // missing was the verdict noticing that the total was zero. Measured by running
+        // `--all --model olmoe-…` on this repository, whose captures are all from other models.
+        if s.traces.is_empty() {
+            run_findings.push(guard::Finding {
+                level: guard::Level::Warn,
+                code: "shape-empty",
+                rule: "§0",
+                headline: format!(
+                    "no routing trace was replayed — {} capture(s) were found and all were \
+                     skipped",
+                    s.skipped.len()
+                ),
+                detail: "§0 makes the shape results the headline and the absolutes an artefact \
+                         of one machine, so a run that replayed no trace has not produced the \
+                         thing it calls its result. Each skipped file is named with its reason \
+                         in the Shape section — most often that it was captured from a \
+                         different model, which §9 forbids transferring, or that it is a \
+                         prefill capture. Pass --all-traces to replay them regardless, --trace \
+                         <FILE> to name one, or drop --model to compare hit rates without the \
+                         byte columns."
+                    .to_string(),
+            });
+        }
+        Some(s)
     } else {
         not_measured.push(
             "the shape results (dynamic-versus-static and the slots curve) — not requested"
@@ -159,12 +211,18 @@ pub fn run(cli: &Cli, sources: &Sources, args: &BenchArgs) -> Result<ExitCode> {
             let model = model_path
                 .clone()
                 .context("--absolutes needs --model: there is nothing to time without one")?;
-            let (points, threads) = measure_absolutes(args, &model)?;
+            run_findings.push(warm_page_cache(&reading, &model, args));
+            let (points, threads, mut produced) = measure_absolutes(args, &model)?;
+            run_findings.append(&mut produced);
             reading.engine_threads = Some(threads);
+            reading.host_policy = Some(args.host_policy.clone());
             absolutes = points;
 
             if let Some(bin) = &args.llama_bench {
                 let (result, _raw) = run_incumbent(args, bin, &model)?;
+                // `_raw` is the same text, already carried inside `result.raw_output`; it is
+                // returned separately only so a caller that wants it need not reach through
+                // the parsed struct.
                 reading.incumbent = Some(result.facts.clone());
                 incumbent_result = Some(result);
             } else {
@@ -192,6 +250,7 @@ pub fn run(cli: &Cli, sources: &Sources, args: &BenchArgs) -> Result<ExitCode> {
 
     // Post-flight: the questions that could only be asked once the run had produced output.
     let mut findings = guard::evaluate(&reading, &thresholds, intent);
+    findings.append(&mut run_findings);
     for p in &absolutes {
         findings.push(p.cold.dispersion(&thresholds));
         findings.push(p.warm.dispersion(&thresholds));
@@ -363,10 +422,127 @@ pub fn parse_policy(s: &str) -> Result<Policy, String> {
 // Absolutes
 // ---------------------------------------------------------------------------------------
 
+/// §4 — read the model into page cache before anything is timed.
+///
+/// 🔴 This exists because of a measurement taken on the reference box, not a preference. The
+/// first `--absolutes` invocation against an uncached model returned cold values of **29.63,
+/// 103.43, 104.17 tok/s** — a stddev 54% of the mean, refused under §5 — having faulted
+/// **3.4 GiB** off NVMe inside the first child. The identical command a minute later returned
+/// **103.22 ± 0.89**. Without a warm-up the first run on any machine refuses, and it refuses
+/// citing the *spread* rather than the cause; §4 asks that the storage confound be removed
+/// where it can be and stated loudly where it cannot.
+fn warm_page_cache(reading: &guard::Reading, model: &Path, args: &BenchArgs) -> guard::Finding {
+    use std::io::Read;
+
+    let f = |level, headline: String, detail: String| guard::Finding {
+        level,
+        code: "warm-cache",
+        rule: "§4",
+        headline,
+        detail,
+    };
+    let Some(m) = &reading.model else {
+        return f(guard::Level::Pass, "no model to warm".into(), String::new());
+    };
+    if args.no_warm_cache {
+        return f(
+            guard::Level::Warn,
+            "the page-cache warm-up was skipped by request".into(),
+            "--no-warm-cache was given, so the first invocation's cold pass may include the \
+             cost of faulting the model off the drive. The disk-read column is the evidence."
+                .to_string(),
+        );
+    }
+    let (ceiling, source) = guard::cache_ceiling(reading);
+    if ceiling == 0 || m.bytes > ceiling {
+        return f(
+            guard::Level::Warn,
+            format!(
+                "the model cannot be warmed into cache — {} vs a {} ceiling",
+                crate::format::bytes(m.bytes),
+                crate::format::bytes(ceiling)
+            ),
+            format!(
+                "Reading it in would evict as much as it caches, so it was not attempted \
+                 ({source}). Every invocation will fault some of the model off the drive and \
+                 the disk-read column beside each row is what says how much. PROTOCOL §4: \
+                 this is stated rather than fixed, because the model this project exists for \
+                 is 3.7x its ARC and refusing it would make the tool useless for its own \
+                 headline case."
+            ),
+        );
+    }
+    let started = std::time::Instant::now();
+    let mut buf = vec![0u8; 8 << 20];
+    let mut read = 0u64;
+    match std::fs::File::open(model) {
+        Err(e) => f(
+            guard::Level::Warn,
+            "the model could not be opened to warm the cache".into(),
+            format!("{e}. The run continues; the first cold pass may be storage-bound."),
+        ),
+        Ok(mut fh) => {
+            while let Ok(n) = fh.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                read += n as u64;
+            }
+            let secs = started.elapsed().as_secs_f64();
+            f(
+                guard::Level::Pass,
+                format!("model warmed into cache — {} in {secs:.1}s", crate::format::bytes(read)),
+                format!(
+                    "Read sequentially before the first timed child so that no invocation \
+                     pays for faulting it off the drive, and so the cold/warm split describes \
+                     the *expert pool* rather than the page cache. Ceiling {} ({source}). \
+                     Suppress with --no-warm-cache.",
+                    crate::format::bytes(ceiling)
+                ),
+            )
+        }
+    }
+}
+
+/// Wait for the 1-minute load average to come back under the refusal threshold.
+///
+/// 🔴 Without this the tool aborts its own sweep. §3 asks for the load average immediately
+/// before **every** timed run, which is right — but our own previous invocation is not another
+/// tenant, and a 1-minute average does not forget it. Measured from a quiet box at load
+/// **0.99**: one `--host-policy frac:0.5` invocation put 19 host threads on the machine and
+/// the next pre-run reading was **2.51**, over the 2.50 refusal. The sweep stopped at its
+/// second row, deterministically, on nothing but its own decay.
+///
+/// Waiting preserves the rule and removes the self-collision. `Ok(seconds)` once the box is
+/// under the threshold, `Err(last_reading)` if it never got there — which means something
+/// *else* is on the machine, and that is the case §3 is actually about.
+fn wait_for_quiet(limit: f64, budget_secs: u64) -> Result<f64, Option<f64>> {
+    let started = std::time::Instant::now();
+    let mut slept = false;
+    loop {
+        match probe::load1() {
+            None => return Err(None),
+            // Zero, not the microseconds it took to read `/proc/loadavg`: a box that was
+            // already quiet was not waited on, and reporting "waited 0s before 3 of the
+            // invocations" reads as a wait that happened.
+            Some(l) if l <= limit => {
+                return Ok(if slept { started.elapsed().as_secs_f64() } else { 0.0 });
+            }
+            Some(l) => {
+                if started.elapsed().as_secs_f64() >= budget_secs as f64 {
+                    return Err(Some(l));
+                }
+                slept = true;
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+    }
+}
+
 fn measure_absolutes(
     args: &BenchArgs,
     model: &Path,
-) -> Result<(Vec<timed::TimedPoint>, guard::ThreadPin)> {
+) -> Result<(Vec<timed::TimedPoint>, guard::ThreadPin, Vec<guard::Finding>)> {
     let exe = probe::self_exe().context("could not find this binary to re-execute")?;
     let ids = args.prompt_ids.clone().context(
         "--absolutes needs --prompt-ids <FILE>. PROTOCOL §8: use real text, not a repeated \
@@ -374,6 +550,24 @@ fn measure_absolutes(
          commit the exact token ids so the run is reproducible from the repo. \
          `bench/references/*.ids` holds the committed ones.",
     )?;
+    // 🔴 Asked here, in the parent, before a single child is launched. The check exists in the
+    // worker too, but reaching it meant spawning a process, failing it, and surfacing the
+    // reason wrapped in `bench worker exited exit status: 1` — and it is not an exotic case:
+    // the default `--depths 128,512` is longer than four of the five prompt files this
+    // repository ships, so the invocation printed in `docs/bench.md` failed immediately.
+    let available = timed::read_ids(&ids)?.len();
+    if let Some(&too_deep) = args.depths.iter().find(|&&d| d as usize > available) {
+        bail!(
+            "--depths asks for {too_deep} prompt tokens but {} holds {available}. \
+             PROTOCOL §8 requires real committed text, so the prompt is never padded or \
+             tiled to reach a depth — a tiled prompt revisits the same experts and flatters \
+             the hit rate. Either lower --depths to at most {available}, or point \
+             --prompt-ids at a longer committed capture: `bench/references/` holds one \
+             (`gpt-oss-120b.longctx.ids`, 16,384 ids) built for depth work, and the \
+             `*.capital.ids` files are short correctness prompts of 60-64 ids.",
+            ids.display()
+        );
+    }
     let threads = args.threads.unwrap_or_else(|| probe::logical_cpus().saturating_sub(1).max(1));
     let disk = args
         .disk_dev
@@ -383,27 +577,56 @@ fn measure_absolutes(
     let mut points = Vec::new();
     let mut reported: Option<usize> = None;
     let mut disagreed = false;
+    let mut produced: Vec<guard::Finding> = Vec::new();
+    let mut waited_total = 0.0f64;
+    let mut waits = 0usize;
 
-    for &depth in &args.depths {
+    'sweep: for &depth in &args.depths {
         let mut results = Vec::new();
         for i in 0..args.repeats.max(1) {
-            // 🔴 §3: read the load average immediately before *every* timed run, not once for
-            // the sweep. The child reads it too, from inside itself; this one is the parent's
-            // record of what it launched into.
-            let before = probe::load1();
+            // 🔴 §3: the load average is judged immediately before *every* timed run, not
+            // once for the sweep. The child reads it again from inside itself and reports it,
+            // which is the reading the artefact prints beside each invocation.
             let thresholds = args.thresholds();
-            if let Some(l) = before {
-                if l > thresholds.load_refuse(probe::logical_cpus()) && !args.force {
-                    bail!(
-                        "load rose to {l:.2} before invocation {} of depth {depth}, above the \
-                         {:.2} threshold. Stopping rather than finishing a sweep whose later \
-                         rows are not comparable with its earlier ones.",
-                        i + 1,
-                        thresholds.load_refuse(probe::logical_cpus())
-                    );
+            let limit = thresholds.load_refuse(probe::logical_cpus());
+            if !args.force {
+                match wait_for_quiet(limit, args.load_settle) {
+                    Ok(w) => {
+                        if w > 0.0 {
+                            waited_total += w;
+                            waits += 1;
+                        }
+                    }
+                    Err(last) => {
+                        produced.push(guard::Finding {
+                            level: guard::Level::Refuse,
+                            code: "load-settle",
+                            rule: "§3",
+                            headline: match last {
+                                Some(l) => format!(
+                                    "the box did not go quiet — load {l:.2} after waiting {}s, \
+                                     refusing above {limit:.2}",
+                                    args.load_settle
+                                ),
+                                None => {
+                                    "the load average stopped being readable mid-sweep".to_string()
+                                }
+                            },
+                            detail: format!(
+                                "Stopped before invocation {} of depth {depth}, so the rows \
+                                 already taken are kept and the rest were not attempted. \
+                                 §3: a sweep at load 9.50 on this 20-thread box reported the \
+                                 opposite of the truth, reproducibly, so finishing a sweep \
+                                 whose later rows are not comparable with its earlier ones is \
+                                 worse than stopping. The wait is --load-settle; something \
+                                 other than this benchmark is using the machine.",
+                                i + 1
+                            ),
+                        });
+                        break 'sweep;
+                    }
                 }
             }
-
             let mut cmd = Command::new(&exe);
             cmd.arg("bench-run")
                 .arg("--model")
@@ -462,9 +685,30 @@ fn measure_absolutes(
         ));
     }
 
+    if waits > 0 {
+        produced.push(guard::Finding {
+            level: guard::Level::Pass,
+            code: "load-settle",
+            rule: "§3",
+            headline: format!(
+                "waited {waited_total:.0}s in total for the box to go quiet, before {waits} of \
+                 the invocations"
+            ),
+            detail: "🔴 The wait is almost always this benchmark waiting for itself: a \
+                     1-minute load average does not forget the 19-thread invocation that just \
+                     finished, and on this project's own box one host-offload run takes a \
+                     quiet 0.99 to 2.51 — over the 2.50 refusal. §3's threshold is there to \
+                     detect *another* tenant, so the tool waits for its own contribution to \
+                     decay rather than refusing itself. Set --load-settle 0 to refuse at once \
+                     instead."
+                .to_string(),
+        });
+    }
+
     Ok((
         points,
         guard::ThreadPin { requested: threads, reported: if disagreed { None } else { reported } },
+        produced,
     ))
 }
 
@@ -523,6 +767,8 @@ fn device_facts(d: &crate::source::DeviceRow) -> guard::DeviceFacts {
         driver: d.driver.clone(),
         driver_build: d.driver_build,
         budget_source: d.budget_source.map(str::to_string),
+        total_bytes: d.total_bytes,
+        free_bytes: d.free_bytes,
     }
 }
 
@@ -576,7 +822,10 @@ fn headline_for(
         return None;
     }
     let mut lines = Vec::new();
-    if let Some(s) = shape {
+    // An empty shape half contributes no bullet: `verdict_line()` renders "no trace was
+    // replayed", which under a "**Shape (reproduces anywhere).**" label reads as a result. The
+    // `shape-empty` finding says it instead, where a reader looks for what went wrong.
+    if let Some(s) = shape.filter(|s| !s.traces.is_empty()) {
         lines.push(format!("**Shape (reproduces anywhere).** {}", s.verdict_line()));
         for t in &s.traces {
             if let Some(k) = t.knee_slots {
@@ -647,6 +896,21 @@ mod tests {
         // so the default has to match the spelling the user typed.
         assert_eq!(parse_policy("tinylfu").unwrap().name(), "tinylfu");
         assert_eq!(parse_policy("w-tinylfu").unwrap().name(), "w-tinylfu");
+    }
+
+    #[test]
+    fn an_empty_shape_half_contributes_no_headline_bullet() {
+        // 🔴 It used to contribute `**Shape (reproduces anywhere).** no trace was replayed`,
+        // under a `trusted` verdict. The `shape-empty` finding is what says it now.
+        let empty = shape::ShapeResult {
+            policy: "lru".to_string(),
+            knee_definition: String::new(),
+            ladder_definition: String::new(),
+            model_context: None,
+            traces: Vec::new(),
+            skipped: vec![("a.ndjson".to_string(), "another model".to_string())],
+        };
+        assert!(headline_for(guard::Verdict::Qualified, Some(&empty), &[], &[]).is_none());
     }
 
     #[test]

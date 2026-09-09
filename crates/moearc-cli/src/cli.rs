@@ -250,6 +250,29 @@ pub struct BenchArgs {
     #[arg(long, default_value = "level_zero", value_name = "NAME")]
     pub expect_backend: String,
 
+    /// Seconds to wait for the 1-minute load average to fall back under the threshold
+    /// before each timed invocation.
+    ///
+    /// 🔴 Not a way around §3 — it is what stops the tool tripping over *itself*. Measured on
+    /// the reference box from a genuinely quiet start of load 0.99: one `--host-policy
+    /// frac:0.5` invocation drives 19 host threads, and the pre-run reading for the very next
+    /// invocation is 2.51, over the 2.50 refusal. A sweep aborted at its second row every
+    /// time, on nothing but the decay of its own previous one. The threshold exists to detect
+    /// *another* tenant; waiting for our own contribution to decay keeps that meaning. Every
+    /// wait is recorded in the artefact. `0` restores the old behaviour of refusing at once.
+    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+    pub load_settle: u64,
+
+    /// Do not read the model into page cache before the first timed invocation.
+    ///
+    /// 🔴 The warm-up exists because of a measurement, not a preference: the first
+    /// `--absolutes` run against an uncached model returned cold values of 29.63, 103.43 and
+    /// 104.17 tok/s — a stddev 54% of the mean, refused under §5 — having faulted 3.4 GiB off
+    /// NVMe inside the first child, while the identical command a minute later returned
+    /// 103.22 ± 0.89. That is §4's confound landing on every user's first run.
+    #[arg(long)]
+    pub no_warm_cache: bool,
+
     /// Override the 1-minute load average above which a timed run is refused.
     ///
     /// The default is one eighth of the machine's logical CPUs with a floor of 2.0; `moearc
@@ -482,6 +505,8 @@ mod tests {
         assert_eq!(a.repeats, 3);
         assert_eq!(a.policy, "lru");
         assert_eq!(a.expect_backend, "level_zero");
+        assert_eq!(a.load_settle, 300);
+        assert!(!a.no_warm_cache);
         assert!(a.prompt_ids.is_none());
         assert!(a.max_load.is_none());
     }

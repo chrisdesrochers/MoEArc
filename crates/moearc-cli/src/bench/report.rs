@@ -169,7 +169,17 @@ fn machine(s: &mut String, a: &Artefact) {
                 },
             );
             if let Some(src) = &d.budget_source {
-                row("free VRAM figure", src.clone());
+                // 🔴 The numbers, not only their provenance. A run on this box passed its
+                // quiet-box check while another engine held 5.0 GiB of the card, and the one
+                // reading that would have shown it was taken, used, and then not recorded.
+                row(
+                    "device memory",
+                    format!(
+                        "{} free of {} ({src})",
+                        crate::format::bytes(d.free_bytes),
+                        crate::format::bytes(d.total_bytes)
+                    ),
+                );
             }
         }
         None => row("device", "none detected".to_string()),
@@ -392,13 +402,34 @@ fn absolutes(s: &mut String, a: &Artefact) {
             },
         ));
     }
+    // 🔴 The caption has to agree with the table above it. It used to end "Both coming back
+    // near zero is a result [...] this run measured the engine" *unconditionally*, and printed
+    // that sentence directly beneath a row reading `12.9 GiB` — a favourable interpretation
+    // asserted regardless of the numbers it was interpreting. Which sentence applies is a
+    // property of the run, so it is decided from the run.
+    let faulted: u64 = a.absolutes.iter().filter_map(|p| p.disk_read_bytes()).sum();
     s.push_str(
         "\nA large `disk read` column means the run faulted the model off the drive and \
          measured the storage rather than the engine (PROTOCOL §4). `ARC miss` is the ZFS \
          cache's own miss rate over the same window, machine-wide — the second, independent \
-         reading §4 asks for. Both coming back near zero is a result, not an absence: it says \
-         staging read from RAM, and that this run measured the engine.\n\n",
+         reading §4 asks for. ",
     );
+    if faulted >= (1 << 30) {
+        s.push_str(&format!(
+            "🔴 **This run faulted {} off the drive**, so its cold figures include storage \
+             time and the first invocation of each point pays the most of it — compare the \
+             individual values below. §4's own example is a model 3.7x its cache ceiling \
+             giving 17.59 ± 5.56 where a cached triplicate gave 28.5 ± 0.2. The warm figures \
+             are the ones least contaminated by it, and they are reported separately for \
+             exactly this reason.\n\n",
+            format::bytes(faulted)
+        ));
+    } else {
+        s.push_str(
+            "Both coming back near zero is a result, not an absence: it says staging read \
+             from RAM, and that this run measured the engine.\n\n",
+        );
+    }
 
     s.push_str("Every individual invocation, so the spread is visible:\n\n");
     for p in &a.absolutes {
@@ -447,6 +478,16 @@ fn incumbent(s: &mut String, a: &Artefact) {
             "\nQuoted at its best configuration, **-t {best}** — PROTOCOL §1 requires the \
              baseline be swept and quoted at its best, not its first.\n"
         ));
+    }
+    if !inc.raw_output.trim().is_empty() {
+        // 🔴 §2's failure was invisible in every field but one. The table above is this tool's
+        // reading of the incumbent's output; this is the output, so the reading can be checked
+        // rather than trusted.
+        s.push_str(
+            "\n<details>\n<summary>every llama-bench invocation, verbatim</summary>\n\n```\n",
+        );
+        s.push_str(inc.raw_output.trim());
+        s.push_str("\n```\n\n</details>\n");
     }
     s.push('\n');
 }

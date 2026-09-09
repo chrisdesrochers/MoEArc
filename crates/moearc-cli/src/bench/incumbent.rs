@@ -125,6 +125,14 @@ pub struct IncumbentResult {
     pub points: Vec<IncumbentPoint>,
     /// The best configuration, per §1: the incumbent is quoted at its best, never its first.
     pub best_threads: Option<usize>,
+    /// Every invocation's own stdout, verbatim, command line included.
+    ///
+    /// 🔴 Kept rather than summarised because §2's failure was invisible in every field except
+    /// one: a Vulkan build 4.8x slower than SYCL produced real CSV, plausible numbers and exit
+    /// 0, and only the `backends` column revealed it. The parsed table above is this tool's
+    /// reading of that output; this is the output, so a reader of the artefact can check the
+    /// reading rather than trust it.
+    pub raw_output: String,
 }
 
 /// How to invoke it.
@@ -277,6 +285,7 @@ pub fn run(inv: &Invocation) -> Result<(IncumbentResult, String)> {
             facts,
             points,
             best_threads,
+            raw_output: raw.clone(),
         },
         raw,
     ))
@@ -316,6 +325,9 @@ fn facts_from(binary: &Path, row: &Row, requested: usize) -> IncumbentFacts {
         backends: row.get("backends").map(str::to_string),
         threads: ThreadPin { requested, reported: row.num::<usize>("n_threads") },
         model_filename: row.get("model_filename").map(str::to_string),
+        // ⚠️ Recorded, never inferred from. `backends` says the build is SYCL; only this says
+        // which SYCL backend the runtime was pointed at, and llama-bench prints neither.
+        device_selector: std::env::var("ONEAPI_DEVICE_SELECTOR").ok().filter(|v| !v.is_empty()),
     }
 }
 
@@ -369,6 +381,7 @@ n_depth,test_time,avg_ns,stddev_ns,avg_ts,stddev_ts\n\
         // Ask for 16, and the CSV agrees.
         let f = facts_from(Path::new("/opt/llama-bench"), &rows[0], 16);
         assert_eq!(f.threads, ThreadPin { requested: 16, reported: Some(16) });
+        assert_eq!(f.device_selector, std::env::var("ONEAPI_DEVICE_SELECTOR").ok());
         // Ask for 16 against a process that ran 4 — §1's failure, and it is visible here.
         let f = facts_from(Path::new("/opt/llama-bench"), &rows[0], 4);
         assert_eq!(f.threads.requested, 4);

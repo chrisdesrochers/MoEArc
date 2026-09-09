@@ -26,11 +26,36 @@ our numbers does not have to know any of them. The short version:
 ```sh
 moearc bench                       # the shape results. Deterministic, no GPU, no model needed.
 moearc bench --check --absolutes   # what would stop a timed run on this box right now
-moearc bench --all --model <M> --prompt-ids bench/references/<M>.ids
+moearc bench --all --model /models/gpt-oss-120b-MXFP4.gguf \
+    --prompt-ids bench/references/gpt-oss-120b.longctx.ids
 ```
 
 Run it from the repository root, or pass `--traces <DIR>`: the shape half replays the captures
 in `bench/traces`, and they are what make it reproducible.
+
+🔴 **`--absolutes` needs a binary built with `--features gpu`, and that is not the same flag
+as `--features moearc-engine/gpu`.**
+
+```sh
+cargo build --release -p moearc-cli --features gpu     # <- this one
+```
+
+`moearc-cli` has its own `gpu` feature, which forwards to `moearc-engine/gpu`. Enabling the
+engine's feature directly enables it for *the engine*, and `moearc`'s own timed worker stays
+compiled out — the resulting binary does not even link `libmoearc_kernels.so`, and
+`--absolutes` refuses with **`this binary has no GPU backend compiled in`**. The refusal is
+correct; the flag that provokes it merely looks correct. Check a binary you did not build
+yourself with `readelf -d $(which moearc) | grep kernels`, or read the `features` field the
+artefact prints in its **Machine** table — it says `[gpu]` on a binary that can measure and
+`[none]` on one that cannot.
+
+⚠️ **`--depths` must fit the prompt file.** §8 forbids padding or tiling a prompt to reach a
+depth, so the tool refuses rather than inventing tokens, *before* it launches anything. The
+committed prompts are not interchangeable: `bench/references/gpt-oss-120b.longctx.ids` holds
+**16,384** ids and is the one built for depth work, while the `*.capital.ids` files are
+**60-64**-id correctness prompts chosen for their wide greedy margins. The default
+`--depths 128,512` therefore only runs against the long one; with a `capital` prompt, pass
+something like `--depths 16,60`.
 
 ⚠️ **Build release.** The replay is a tight loop over hundreds of thousands of cache
 operations, and `moearc-engine` is a workspace member, so a `cargo run` debug build does not
@@ -238,9 +263,37 @@ timed         --model M · --prompt-ids FILE · --depths N,... · --tokens N · 
               --threads N · --residency SPEC · --host-policy SPEC · --ctx N · --attribution
 incumbent     --llama-bench PATH · --llama-bench-threads N,... · --llama-bench-arg ARG
               --llama-bench-inner-repeats N
-checks        --expect-backend NAME · --max-load LOAD · --disk-dev DEV
+checks        --expect-backend NAME · --max-load LOAD · --load-settle SECONDS
+              --no-warm-cache · --disk-dev DEV
 output        --out FILE · --json
 ```
+
+`--expect-backend` is matched against **each engine's own vocabulary**, not as a substring.
+MoEArc names the Level Zero driver `level_zero`; llama.cpp's `backends` column carries
+`ggml_backend_reg_name`, and it registers the same path as **`SYCL`**. A run therefore passes
+on `SYCL` and refuses on `Vulkan`, and `ONEAPI_DEVICE_SELECTOR` is recorded beside the result
+because `backends` cannot say which SYCL backend the runtime then chose — llama-bench does not
+print it, and inferring it would be exactly the kind of confident guess §2 is about.
+
+`--load-settle` (default **300 s**) is how long the tool waits for the 1-minute load average to
+come back under the threshold before each invocation. 🔴 It is not a way around §3; it is what
+stops the tool refusing *itself*. From a genuinely quiet start of load 0.99 on the reference
+box, one `--host-policy frac:0.5` invocation puts 19 host threads on the machine and the next
+pre-run reading is 2.51 — over the 2.50 refusal — so a sweep aborted at its second row every
+time, on nothing but the decay of its own previous one. A 1-minute average does not forget the
+run that just finished, and our own previous invocation is not another tenant. Every wait is
+reported in the artefact; `--load-settle 0` restores refusing at once, and a wait that runs out
+is a **refusal** that still writes the artefact, because at that point something else really is
+on the machine.
+
+`--no-warm-cache` suppresses the sequential read of the model that precedes the first timed
+child. 🔴 The warm-up is there because of a measurement: the first `--absolutes` run against an
+uncached model returned cold values of **29.63, 103.43, 104.17 tok/s** — stddev 54% of the
+mean, refused under §5 — having faulted **3.4 GiB** off NVMe inside the first child, where the
+identical command a minute later returned **103.22 ± 0.89**. Without it, §4's confound lands on
+every user's first run and the refusal names the spread rather than the cause. A model too
+large to cache is **not** warmed and the artefact says so; the disk-read column is the evidence
+there.
 
 `--policy` accepts `lru` (default), `lfu`, `lru-k:<k>`, `slru:<pct>`, `2q:<kin>:<kout>`,
 `w-tinylfu:<window>:<protected>`, `phase-lru` and `optimal`. A static split is deliberately not

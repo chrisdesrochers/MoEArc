@@ -137,6 +137,14 @@ pub struct IncumbentFacts {
     pub backends: Option<String>,
     pub threads: ThreadPin,
     pub model_filename: Option<String>,
+    /// `ONEAPI_DEVICE_SELECTOR` as the incumbent was launched with it.
+    ///
+    /// ⚠️ Recorded because the `backends` column **cannot** answer the question it looks like
+    /// it answers. `SYCL` says the build targets Intel's oneAPI stack; which SYCL backend the
+    /// runtime then picked — Level Zero or OpenCL — is this variable's decision at run time,
+    /// and `llama-bench` does not print it. Printing the value in force is honest; inferring
+    /// Level Zero from `SYCL` would not be.
+    pub device_selector: Option<String>,
 }
 
 /// How this binary was built.
@@ -169,6 +177,17 @@ pub struct DeviceFacts {
     /// Where the free-VRAM figure came from: measured on the device, or installed capacity
     /// assumed idle.
     pub budget_source: Option<String>,
+    /// The device's installed memory.
+    pub total_bytes: u64,
+    /// Free device memory as the driver reported it, when it could be measured.
+    ///
+    /// 🔴 In the artefact because of a contaminated run on this box: `moearc bench` passed its
+    /// `box quiet — load 1.29` check while another agent's `llama-server` held **5.0 GiB of
+    /// the 11.33 GiB card** with the same model loaded. Load average cannot see that — a
+    /// second inference engine spends its time waiting on a GPU queue, not on CPUs — and the
+    /// one figure that could have revealed it was read, used for planning, and then left out
+    /// of the record entirely.
+    pub free_bytes: u64,
 }
 
 /// Everything the guards look at, as data.
@@ -183,6 +202,11 @@ pub struct Reading {
     pub zfs_arc: Option<ZfsArc>,
     pub model: Option<ModelUnderTest>,
     pub engine_threads: Option<ThreadPin>,
+    /// The `--host-policy` the timed children ran under, or `None` when nothing was timed.
+    ///
+    /// 🔴 The §1 guard needs this to tell a pin that failed from a pool that was never asked
+    /// for. See [`host_offload_enabled`].
+    pub host_policy: Option<String>,
     pub incumbent: Option<IncumbentFacts>,
     pub build: BuildFacts,
     pub device: Option<DeviceFacts>,
@@ -216,6 +240,9 @@ pub struct Thresholds {
     pub cv_refuse: f64,
     /// Independent invocations below which a stddev is not worth quoting.
     pub min_invocations: usize,
+    /// Fraction of the card's memory that may already be allocated before a timed run is
+    /// refused for sharing the device. See [`device_idle`].
+    pub vram_occupied_refuse: f64,
 }
 
 impl Default for Thresholds {
@@ -228,6 +255,10 @@ impl Default for Thresholds {
             cv_warn: 0.10,
             cv_refuse: 0.20,
             min_invocations: 3,
+            // A desktop compositor's framebuffer on a card this size is a small fraction of
+            // it; the second inference engine that provoked this guard held 44%. The value is
+            // printed in the artefact so it can be argued with rather than discovered.
+            vram_occupied_refuse: 0.10,
         }
     }
 }
@@ -304,6 +335,7 @@ pub fn evaluate(reading: &Reading, thresholds: &Thresholds, intent: Intent) -> V
     }
     if intent.device {
         out.extend(backend(reading));
+        out.push(device_idle(reading, thresholds));
     }
     out
 }
@@ -358,7 +390,7 @@ pub fn load(reading: &Reading, t: &Thresholds) -> Finding {
 /// On ZFS, file data is cached in the ARC and **`zfs_arc_max` is the cap** — a 96 GB box with
 /// `c_max` at 16 GiB cannot cache a 59 GiB model no matter how much memory is free. Everywhere
 /// else the ordinary page cache applies and `MemAvailable` is the kernel's own answer.
-fn cache_ceiling(reading: &Reading) -> (u64, &'static str) {
+pub fn cache_ceiling(reading: &Reading) -> (u64, &'static str) {
     match (&reading.model, reading.zfs_arc) {
         (Some(m), Some(arc)) if m.filesystem == "zfs" => (arc.c_max_bytes, "zfs_arc_max"),
         _ => (reading.mem_available_bytes, "MemAvailable"),
@@ -440,7 +472,12 @@ pub fn page_cache(reading: &Reading, t: &Thresholds) -> Finding {
 pub fn threads(reading: &Reading) -> Vec<Finding> {
     let mut out = Vec::new();
     if let Some(pin) = reading.engine_threads {
-        out.push(pin_finding("threads-moearc", "moearc host pool", pin));
+        let offload = reading.host_policy.as_deref().unwrap_or("off");
+        out.push(if host_offload_enabled(offload) {
+            pin_finding("threads-moearc", "moearc host pool", pin)
+        } else {
+            host_pool_disabled(offload, pin)
+        });
     }
     if let Some(inc) = &reading.incumbent {
         out.push(pin_finding("threads-incumbent", "llama-bench", inc.threads));
@@ -455,6 +492,52 @@ pub fn threads(reading: &Reading) -> Vec<Finding> {
         ));
     }
     out
+}
+
+/// Whether a `--host-policy` spec builds a host expert pool at all.
+///
+/// 🔴 `off` is the **default**, and under it `ResidencyReport::host_threads` is `0` by
+/// construction — `Session` builds no `HostExecutor` to report a thread count from. Comparing
+/// that zero against the requested pin made §1 refuse *every default `--absolutes` run*, on a
+/// correctly built binary and a quiet box: measured here as
+/// `moearc host pool ran on 0 threads, not the 19 asked for`, on a run whose figures were
+/// otherwise clean at 0.9% spread. A pin on a pool that does not exist is vacuous, not broken,
+/// and refusing it made the tool unable to produce its own headline.
+pub fn host_offload_enabled(spec: &str) -> bool {
+    !matches!(spec.trim(), "" | "off" | "frac:0" | "frac:0.0" | "frac:0.00")
+}
+
+/// §1 where there is deliberately no host pool to pin.
+fn host_pool_disabled(spec: &str, pin: ThreadPin) -> Finding {
+    match pin.reported {
+        Some(0) => Finding::new(
+            Level::Pass,
+            "threads-moearc",
+            "§1",
+            "moearc ran GPU-only — no host pool to pin",
+            format!(
+                "`--host-policy {spec}` builds no host expert pool, so the engine reports 0 \
+                 host threads by construction and the {} that were pinned were never drawn \
+                 on. §1's failure was *accepting that a flag took*; here there is nothing for \
+                 it to take. What this configuration compares is a GPU-only MoEArc against \
+                 whatever the incumbent was given, and the host policy is printed beside every \
+                 row so that asymmetry travels with the number.",
+                pin.requested
+            ),
+        ),
+        Some(n) => Finding::new(
+            Level::Refuse,
+            "threads-moearc",
+            "§1",
+            format!("moearc reported {n} host threads with offload disabled"),
+            format!(
+                "`--host-policy {spec}` should build no host pool, yet the engine reported {n} \
+                 threads. The configuration did not take, and a run whose host policy is not \
+                 the one that was asked for is not the run that was requested."
+            ),
+        ),
+        None => pin_finding("threads-moearc", "moearc host pool", pin),
+    }
 }
 
 fn pin_finding(code: &'static str, who: &str, pin: ThreadPin) -> Finding {
@@ -548,40 +631,191 @@ pub fn backend(reading: &Reading) -> Vec<Finding> {
     }
 
     if let Some(inc) = &reading.incumbent {
-        match &inc.backends {
-            Some(b) if b.to_ascii_lowercase().contains(&want) => out.push(Finding::new(
-                Level::Pass,
-                "incumbent-backend",
-                "§2",
-                format!("{} reports backends `{b}`", inc.binary),
-                format!(
-                    "Read out of the tool's own `-o csv`, build {}. Never chosen by glob: the \
-                     binary path was given explicitly.",
-                    inc.build_commit.as_deref().unwrap_or("unknown")
-                ),
-            )),
-            Some(b) => out.push(Finding::new(
-                Level::Refuse,
-                "incumbent-backend",
-                "§2",
-                format!("{} is a `{b}` build, not `{want}`", inc.binary),
-                "This is §2's failure verbatim. The wrong build runs cleanly and reports \
-                 plausible numbers; only this field tells you."
-                    .to_string(),
-            )),
-            None => out.push(Finding::new(
-                Level::Refuse,
-                "incumbent-backend",
-                "§2",
-                format!("{} did not report a backend", inc.binary),
-                "`llama-bench -o csv` carries a `backends` column. Its absence means the \
-                 output was not understood, and an unverified build is not a baseline."
-                    .to_string(),
-            )),
-        }
+        out.push(incumbent_backend(inc, &want));
     }
 
     out
+}
+
+/// The `llama.cpp` backend names that correspond to a MoEArc backend.
+///
+/// 🔴 These are two different naming systems, and conflating them made §2's check a
+/// **tautology**. `--expect-backend` names what `moearc-device` enumerates — a Level Zero
+/// driver — while `llama-bench`'s `backends` column carries `ggml_backend_reg_name`, and
+/// llama.cpp registers Intel's oneAPI path as **`SYCL`**. A substring comparison therefore
+/// refused the correct build with the same sentence as the wrong one: measured on this box,
+/// the SYCL build was refused as ``is a `SYCL` build, not `level_zero` `` and the Vulkan build
+/// as ``is a `Vulkan` build, not `level_zero` ``. A check that refuses everything detects
+/// nothing, and would have told a stranger their working build was broken.
+///
+/// An unmapped name returns an empty slice, which is reported as *unknown* rather than as a
+/// pass or a refusal: this project does not invent a correspondence it has not verified.
+pub fn incumbent_backends_for(expected: &str) -> &'static [&'static str] {
+    match expected {
+        "level_zero" => &["sycl", "level_zero"],
+        "opencl" => &["opencl"],
+        "cpu" => &["cpu"],
+        _ => &[],
+    }
+}
+
+/// §2 for the incumbent's build, judged on its own registry's names.
+fn incumbent_backend(inc: &IncumbentFacts, want: &str) -> Finding {
+    let code = "incumbent-backend";
+    let Some(raw) = &inc.backends else {
+        return Finding::new(
+            Level::Refuse,
+            code,
+            "§2",
+            format!("{} did not report a backend", inc.binary),
+            "`llama-bench -o csv` carries a `backends` column. Its absence means the output \
+             was not understood, and an unverified build is not a baseline."
+                .to_string(),
+        );
+    };
+    let selector = match inc.device_selector.as_deref() {
+        Some(v) => format!("`ONEAPI_DEVICE_SELECTOR={v}`"),
+        None => "`ONEAPI_DEVICE_SELECTOR` was unset".to_string(),
+    };
+    let accept = incumbent_backends_for(want);
+    if accept.is_empty() {
+        return Finding::new(
+            Level::Warn,
+            code,
+            "§2",
+            format!("no llama.cpp backend is known to correspond to `{want}`"),
+            format!(
+                "{} reports backends `{raw}`. `--expect-backend {want}` has no mapping onto \
+                 `ggml_backend_reg_name`, so there is nothing to compare it against and this \
+                 check says so rather than passing or refusing on a guess.",
+                inc.binary
+            ),
+        );
+    }
+    let found: Vec<String> =
+        raw.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+    match found.iter().find(|f| accept.contains(&f.as_str())) {
+        Some(hit) => Finding::new(
+            Level::Pass,
+            code,
+            "§2",
+            format!("{} is a `{raw}` build — the `{want}` counterpart", inc.binary),
+            format!(
+                "Read out of the tool's own `-o csv`, build {}. Never chosen by glob: the \
+                 binary path was given explicitly. llama.cpp calls this backend `{hit}` and \
+                 MoEArc calls it `{want}`; the names differ because they come from two \
+                 different registries, not because the builds differ. ⚠️ This field does not \
+                 say which SYCL backend the runtime then selected — that is decided at run \
+                 time and llama-bench does not print it, so the value in force is recorded \
+                 instead of inferred: {selector}.",
+                inc.build_commit.as_deref().unwrap_or("unknown")
+            ),
+        ),
+        None => Finding::new(
+            Level::Refuse,
+            code,
+            "§2",
+            format!("{} is a `{raw}` build, not the `{want}` counterpart", inc.binary),
+            format!(
+                "This is §2's failure verbatim: `ls build*/bin/llama-bench | head -1` once \
+                 selected a Vulkan build 4.8x slower than SYCL — real CSV, plausible numbers, \
+                 exit 0, and only this column revealed it. Expected one of `{}`, found \
+                 `{raw}`. {selector}.",
+                accept.join("`, `")
+            ),
+        ),
+    }
+}
+
+/// §3 — is the card itself idle?
+///
+/// 🔴 The failure, measured on this box on 2026-09-09 rather than reasoned about: a
+/// `--absolutes` run passed **`box quiet — load 1.29`** and ran for sixteen minutes against
+/// gpt-oss-120B while another agent's `llama-server` held the same model on the same card.
+/// The 1-minute load average is blind to it — a second engine spends its life waiting on a GPU
+/// queue and contributed about 0.4 — and `bench/PROTOCOL.md` §3's own words are *"never run
+/// two engines, or two agents' benchmarks, concurrently"*, a rule nothing enforced. The tool's
+/// job is to enforce the protocol so a user does not have to know it.
+///
+/// The reading is the device's own, and both ends of it were measured on the same card within
+/// half an hour: with the second engine up, **6.33 GiB free of 11.33 GiB installed** — 44%
+/// spoken for; with it gone, **11.3 GiB free of 11.3 GiB** — nothing held at all, on a box
+/// running a desktop session. So the threshold is not separating a busy card from a
+/// theoretically perfect one, it is separating 44% from 0%, and the 10% default sits an order
+/// of magnitude from the measured idle case in one direction and a factor of four from the
+/// measured failure in the other. It refuses above a stated fraction rather than at any
+/// occupancy because a compositor's framebuffer is a legitimate tenant, and the value in force
+/// is printed like every other threshold.
+///
+/// ⚠️ An *unmeasurable* free figure is a warning, not a refusal: on a device with no memory of
+/// its own there is nothing to measure and refusing would be refusing the wrong thing. The
+/// guard says what it could not determine instead of assuming the card was free.
+pub fn device_idle(reading: &Reading, t: &Thresholds) -> Finding {
+    let code = "device-busy";
+    let Some(d) = &reading.device else {
+        return Finding::new(
+            Level::Pass,
+            code,
+            "§3",
+            "no device to check for other tenants",
+            "There is no device reading, so the backend guard has already refused.".to_string(),
+        );
+    };
+    if d.budget_source.as_deref() != Some("measured free VRAM") || d.total_bytes == 0 {
+        return Finding::new(
+            Level::Warn,
+            code,
+            "§3",
+            "whether another process holds the card could not be determined".to_string(),
+            format!(
+                "Free device memory was not measured on {} ({}), so this run cannot say the \
+                 card was idle when it started. §3 asks that two engines never share a box, \
+                 and the check for it here is the device's own free-memory figure.",
+                d.name,
+                d.budget_source.as_deref().unwrap_or("no budget source reported"),
+            ),
+        );
+    }
+    let occupied = d.total_bytes.saturating_sub(d.free_bytes);
+    let frac = occupied as f64 / d.total_bytes as f64;
+    let detail = format!(
+        "{} of {} on {} was already allocated when this run started — {:.0}% of the card. \
+         Refuse above {:.0}%. 🔴 Measured failure: a run on this box passed `box quiet — load \
+         1.29` and measured for sixteen minutes while another agent's `llama-server` held \
+         5.0 GiB of the same card with the same model; a second engine waits on a GPU queue \
+         rather than on CPUs, so the load average never moved. PROTOCOL §3: never run two \
+         engines, or two agents' benchmarks, concurrently.",
+        format::bytes(occupied),
+        format::bytes(d.total_bytes),
+        d.name,
+        frac * 100.0,
+        t.vram_occupied_refuse * 100.0,
+    );
+    if frac > t.vram_occupied_refuse {
+        Finding::new(
+            Level::Refuse,
+            code,
+            "§3",
+            format!(
+                "the card is not idle — {} of {} already allocated",
+                format::bytes(occupied),
+                format::bytes(d.total_bytes)
+            ),
+            detail,
+        )
+    } else {
+        Finding::new(
+            Level::Pass,
+            code,
+            "§3",
+            format!(
+                "card idle — {} free of {}",
+                format::bytes(d.free_bytes),
+                format::bytes(d.total_bytes)
+            ),
+            detail,
+        )
+    }
 }
 
 /// The Level Zero runtime build, as a caution and never as a gate.
@@ -687,6 +921,7 @@ pub(crate) fn quiet_reading() -> Reading {
             filesystem: "zfs".to_string(),
         }),
         engine_threads: Some(ThreadPin { requested: 19, reported: Some(19) }),
+        host_policy: Some("frac:0.75".to_string()),
         incumbent: None,
         build: BuildFacts {
             commit: Some("4056ebc".to_string()),
@@ -696,6 +931,8 @@ pub(crate) fn quiet_reading() -> Reading {
             features: vec!["gpu"],
         },
         device: Some(DeviceFacts {
+            total_bytes: 12_168_933_376,
+            free_bytes: 12_000_000_000,
             name: "Intel(R) Arc(TM) B580 Graphics".to_string(),
             backend: "level_zero".to_string(),
             driver: "xe / L0 build 37020".to_string(),
@@ -847,8 +1084,42 @@ mod tests {
             backends: Some("SYCL".to_string()),
             threads: ThreadPin { requested: 16, reported: Some(4) },
             model_filename: Some("gpt-oss-120b-MXFP4.gguf".to_string()),
+            device_selector: Some("level_zero:0".to_string()),
         });
         assert_eq!(find(&threads(&r), "threads-incumbent").level, Level::Refuse);
+    }
+
+    // --- §3, another engine on the card -----------------------------------------------
+
+    #[test]
+    fn a_card_another_engine_is_already_holding_is_refused() {
+        // 🔴 The measured failure, as numbers: 6.33 GiB free of 11.33 GiB installed while a
+        // second engine held the rest, on a box whose load average read 1.29.
+        let mut r = quiet_reading();
+        if let Some(d) = r.device.as_mut() {
+            d.free_bytes = 6_794_121_216;
+        }
+        let f = device_idle(&r, &Thresholds::default());
+        assert_eq!(f.level, Level::Refuse, "{}", f.headline);
+        assert!(f.detail.contains("44%"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_compositors_framebuffer_does_not_refuse_the_run() {
+        let mut r = quiet_reading();
+        if let Some(d) = r.device.as_mut() {
+            d.free_bytes = d.total_bytes - (300 << 20);
+        }
+        assert_eq!(device_idle(&r, &Thresholds::default()).level, Level::Pass);
+    }
+
+    #[test]
+    fn an_unmeasurable_free_figure_warns_rather_than_assuming_the_card_is_free() {
+        let mut r = quiet_reading();
+        if let Some(d) = r.device.as_mut() {
+            d.budget_source = Some("installed capacity, assumed idle".to_string());
+        }
+        assert_eq!(device_idle(&r, &Thresholds::default()).level, Level::Warn);
     }
 
     // --- §2, the wrong build ----------------------------------------------------------
@@ -863,8 +1134,73 @@ mod tests {
             backends: Some("Vulkan".to_string()),
             threads: ThreadPin { requested: 16, reported: Some(16) },
             model_filename: None,
+            device_selector: Some("level_zero:0".to_string()),
         });
         assert_eq!(find(&backend(&r), "incumbent-backend").level, Level::Refuse);
+    }
+
+    #[test]
+    fn the_correct_sycl_incumbent_is_not_refused_alongside_the_vulkan_one() {
+        // 🔴 The regression this exists for. `--expect-backend level_zero` was compared as a
+        // substring against llama.cpp's own `backends` column, so `SYCL` — the *correct*
+        // build — was refused with the same sentence as `Vulkan`. The check refused every
+        // build and therefore detected none of them.
+        let mut r = quiet_reading();
+        r.incumbent = Some(IncumbentFacts {
+            binary: "/zfs/swift/projects/llama.cpp/build/bin/llama-bench".to_string(),
+            build_commit: Some("e107984".to_string()),
+            backends: Some("SYCL".to_string()),
+            threads: ThreadPin { requested: 16, reported: Some(16) },
+            model_filename: None,
+            device_selector: Some("level_zero:0".to_string()),
+        });
+        let findings = backend(&r);
+        let f = find(&findings, "incumbent-backend");
+        assert_eq!(f.level, Level::Pass, "{}", f.headline);
+        // And it must not claim more than the field can support.
+        assert!(f.detail.contains("ONEAPI_DEVICE_SELECTOR"), "{}", f.detail);
+    }
+
+    #[test]
+    fn a_multi_backend_incumbent_is_read_as_a_list_not_a_substring() {
+        let mut r = quiet_reading();
+        r.incumbent = Some(IncumbentFacts {
+            binary: "llama-bench".to_string(),
+            build_commit: None,
+            backends: Some("SYCL,BLAS,RPC".to_string()),
+            threads: ThreadPin { requested: 16, reported: Some(16) },
+            model_filename: None,
+            device_selector: None,
+        });
+        assert_eq!(find(&backend(&r), "incumbent-backend").level, Level::Pass);
+    }
+
+    // --- §1, the default host policy --------------------------------------------------
+
+    #[test]
+    fn the_default_host_policy_has_no_pool_to_pin_and_is_not_refused_for_it() {
+        // 🔴 The other regression. `off` is the default; under it the engine reports 0 host
+        // threads by construction, and comparing that to the pin refused every default run.
+        let mut r = quiet_reading();
+        r.host_policy = Some("off".to_string());
+        r.engine_threads = Some(ThreadPin { requested: 19, reported: Some(0) });
+        assert_eq!(find(&threads(&r), "threads-moearc").level, Level::Pass);
+    }
+
+    #[test]
+    fn a_host_pool_that_appeared_with_offload_off_is_still_refused() {
+        let mut r = quiet_reading();
+        r.host_policy = Some("off".to_string());
+        r.engine_threads = Some(ThreadPin { requested: 19, reported: Some(19) });
+        assert_eq!(find(&threads(&r), "threads-moearc").level, Level::Refuse);
+    }
+
+    #[test]
+    fn offload_on_still_demands_the_pin_take() {
+        let mut r = quiet_reading();
+        r.host_policy = Some("frac:0.5".to_string());
+        r.engine_threads = Some(ThreadPin { requested: 19, reported: Some(0) });
+        assert_eq!(find(&threads(&r), "threads-moearc").level, Level::Refuse);
     }
 
     #[test]
@@ -876,6 +1212,7 @@ mod tests {
             backends: None,
             threads: ThreadPin { requested: 16, reported: Some(16) },
             model_filename: None,
+            device_selector: None,
         });
         assert_eq!(find(&backend(&r), "incumbent-backend").level, Level::Refuse);
     }
