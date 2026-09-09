@@ -173,6 +173,25 @@ for f in "$repo"/bench/references/*.ids; do
     [ -e "$f" ] && install -D -m 0644 "$f" "$root/bench/references/$(basename "$f")"
 done
 
+# 🔴 THE TRACES SHIP. Without them the release contains a `moearc bench` that cannot run
+# either half of itself: no traces means no shape results, and the timed half needs a build
+# this tarball deliberately does not contain (see below). A stranger who unpacked Friday's
+# tarball and ran the command in the README would have got `no trace directory at
+# bench/traces` -- the headline claim, unreproducible, from the tool written to make claims
+# reproducible.
+#
+# Decode captures only. The prefill `.ndjson` files are staged out because `shape::discover`
+# finds them, cannot replay them, and reports each one as a skipped file with a reason -- so
+# shipping them buys a paragraph of noise under every run. `capture.sh` and the llama.cpp
+# eval-callback patch go with them: they are 11 KB and they are how somebody captures a trace
+# from their own model rather than trusting ours.
+for f in "$repo"/bench/traces/*.decode.ndjson "$repo"/bench/traces/*.generated.txt \
+         "$repo"/bench/traces/README.md "$repo"/bench/traces/*.patch; do
+    [ -e "$f" ] && install -D -m 0644 "$f" "$root/bench/traces/$(basename "$f")"
+done
+[ -f "$repo/bench/traces/capture.sh" ] && \
+    install -D -m 0755 "$repo/bench/traces/capture.sh" "$root/bench/traces/capture.sh"
+
 if [ "$with_runtime" = 1 ]; then
     echo "==> vendoring the Intel SYCL runtime into the tarball"
     python3 "$here/fetch-runtime.py" --dest "$root/runtime" --lock "$here/runtime.lock.json"
@@ -234,8 +253,9 @@ echo "      the retired SYCL engine, and the check above fails the build if one 
 echo "    * no moearc-server. Built without a linked llama.cpp it is an ECHO STUB, and a"
 echo "      stub that speaks fluent OpenAI does not belong in a release. \`moearc serve\`"
 echo "      is the server, and it does not use that binary."
-echo "    * bench/reproduce.sh is installed but has no bench binary to run until it is"
-echo "      re-pointed at \`moearc bench\`."
+echo "    * no timed half of \`moearc bench\`. \`--absolutes\` needs the retired engine"
+echo "      compiled in, which the check above forbids, so it refuses with exit 3 and says so."
+echo "      The shape half -- the headline -- runs from the traces staged beside it."
 
 # A tarball whose provenance reads `unknown` is not evidence of anything, and the way to get
 # one is undramatic: run bundle.sh in a shell where rustc is not on PATH and every field

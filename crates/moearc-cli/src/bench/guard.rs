@@ -590,10 +590,18 @@ pub fn backend(reading: &Reading) -> Vec<Finding> {
             "build-no-gpu",
             "§2",
             "this binary has no GPU backend compiled in",
-            "`moearc-engine`'s device half is behind the `gpu` feature. Rebuild with \
-             `--features gpu` (and an oneAPI toolchain on PATH) to take absolutes. Reporting a \
-             throughput figure from a binary that cannot reach the card would be §2's failure \
-             in its purest form."
+            "Reporting a throughput figure from a binary that cannot reach the card would be \
+             §2's failure in its purest form, so this is a refusal rather than a caveat.\n\n\
+             🔴 If this is a RELEASE build, that is expected and there is nothing to rebuild. \
+             `--absolutes` is still bound to the retired SYCL engine, which lives behind the \
+             `gpu` feature — and `packaging/bundle.sh` refuses to ship any binary that links \
+             it, because MoEArc's engine is llama.cpp now. So absolutes are developer-only \
+             this release. Rewiring the timed path onto `moearc-llama` is what changes that; \
+             until it lands, do not rebuild with `--features gpu` expecting a shippable \
+             binary, because you will get one the packaging rejects.\n\n\
+             The shape results are the headline either way — §0 calls absolutes an artefact \
+             of one machine — and they need no GPU, no model and no features. Run \
+             `moearc bench` without `--absolutes`."
                 .to_string(),
         ));
     }
