@@ -58,8 +58,14 @@ curl -fsSL https://raw.githubusercontent.com/chrisdesrochers/MoEArc/main/packagi
 
 One static binary, no Python, no conda, no oneAPI to install. The SYCL runtime is fetched at
 install time against SHA-256 pins in [`packaging/runtime.lock.json`](packaging/runtime.lock.json).
-The only thing you must already have is the kernel-side GPU driver (`xe` or `i915`), which ships
-with your kernel.
+
+🔴 **You need two things this installer does not give you.** The kernel-side GPU driver (`xe` or
+`i915`), which ships with your kernel — and **a llama.cpp build with the SYCL backend**, which
+does not. MoEArc is a wrapper: llama.cpp is the engine, and the tarball does not carry it yet
+(bundling somebody else's binaries is a licence question, tracked in
+[`packaging/THIRD-PARTY.md`](packaging/THIRD-PARTY.md)). `moearc` itself — the device report,
+the catalog, `moearc info` — runs with neither. Everything that computes needs `llama-server`
+on `$PATH`, beside the `moearc` binary, or named by `$MOEARC_LLAMA_SERVER`.
 
 ```sh
 moearc                         # what card you have, and what will fit on it
@@ -81,9 +87,26 @@ llama-server -m gpt-oss-120b-mxfp4.gguf -ngl 99 -ncmoe 36 -t 16 -c <planned> \
 Arc card is what the profiles are measured on; the tool runs and reports honestly on anything
 Level Zero can see.
 
-⚠️ **`moearc serve` is not wired yet.** It plans and prints, then tells you nothing is
-listening. Today MoEArc gives you the command and you run `llama-server` yourself. Wiring it is
-the next piece of work — see *Status*.
+**`moearc serve` runs it for you**, which is the point of the tuning being a product rather
+than a table you read:
+
+```sh
+moearc serve gpt-oss-120b
+#   device confirmed — SYCL0 = Intel(R) Arc(TM) B580 Graphics (12216 MiB, 11753 MiB free)
+#   model loaded in 37s   (59.0 GiB, -ngl 99 -ncmoe 36 -t 16 -c 86016 -fa on -dev SYCL0)
+#   listening on http://127.0.0.1:8080/v1
+```
+
+A 59 GiB model on a 12 GB card, answering OpenAI-format requests, with no flags typed. It
+supervises `llama-server` with the resolved argv, so **the command it prints is the command it
+runs** — verified by checking 64 token ids against the same command launched by hand. It pins
+`-dev SYCL0` and confirms that against the child's own device block before loading, which is
+what closes the trap where a run silently lands on the iGPU and succeeds anyway.
+
+⚠️ Two caveats on that output. It needs a `llama-server` on the machine — see the note under
+*Install*. And `-c 86016` is **derived**, not measured: the planner computes it from free VRAM
+after the experts are placed, and the largest context actually benchmarked on this card is 32K.
+A derived `-c` is a claim about capacity, not about throughput at that depth.
 
 ---
 
@@ -228,7 +251,8 @@ the two and publishes none. Full analysis, including its own correction:
   on the one box we have.
 - **The MXFP4 rule comes from two models on one backend.** A third MXFP4 model inherits a
   direction nobody measured for it. It stays badged `derived` for exactly that reason.
-- **`moearc serve` is not wired**, and quantised KV is not offered on Arc.
+- **`moearc serve` has been exercised on one card by one person**, and quantised KV is not
+  offered on Arc (q8_0 measured a 19% *loss* here).
 - **`-t` between 14 and 18 on the flagship is unknown.** Two attempts were page-cache-bound and
   disagreed, so both were withdrawn rather than averaged. They remain in the tree with their
   disk counters so the discard is auditable.
@@ -270,13 +294,14 @@ stand behind**.
 ## Status
 
 Working today: device detection and the "what will fit" report; the model catalog and
-downloader; the tuning resolver with provenance badging on every flag; `moearc bench`; and the
-seven measured profiles compiled into the binary, so a shipped build tunes without the
-repository beside it.
+downloader; the tuning resolver with provenance badging on every flag; `moearc bench`;
+`moearc serve`, which supervises `llama-server` with the resolved argv; and the seven measured
+profiles compiled into the binary, so a shipped build tunes without the repository beside it.
 
-Not yet: `moearc serve`; prefill tuning; profiles for any card but the B580; and a published
-release tag, until which `install.sh` will tell you plainly that there is nothing to download
-and point you at building locally.
+Not yet: **llama.cpp is not bundled**, so every computing path needs one already on the
+machine; prefill tuning; profiles for any card but the B580; and a published release tag, until
+which `install.sh` will tell you plainly that there is nothing to download and point you at
+building locally.
 
 The repository also contains a research engine — a Rust/SYCL MoE runtime with dynamic expert
 residency, which generates text on the B580 and matches llama.cpp token for token. It is what
@@ -300,6 +325,8 @@ or vendored.** Inspired by, not derived from —
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The published tarball contains no
-third-party binaries; Intel's SYCL runtime is fetched from Intel on your machine at install
-time. [`packaging/THIRD-PARTY.md`](packaging/THIRD-PARTY.md) is the full position.
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The published tarball is a single
+binary and contains no third-party code at all; Intel's SYCL runtime is fetched from Intel on
+your machine at install time, and llama.cpp is yours to install.
+[`packaging/THIRD-PARTY.md`](packaging/THIRD-PARTY.md) is the full position, including what
+changes the day llama.cpp's binaries are shipped alongside.
