@@ -43,23 +43,54 @@
 //! This mirrors what the engine's planner does with a budget once it has one: refuse in
 //! arithmetic, before an allocation, with a typed error that names the number.
 //!
-//! ## ⬜ For callers — this crate refuses; the CLI does not yet
+//! ## For callers — the CLI refuses too now, and this is where that is held
 //!
-//! `moearc-device-report` (this crate's own binary) uses [`inference_target`] and exits 1 with
-//! the refusal. **`moearc-cli` still does not**, so the packaged `moearc` command continues to
-//! print `✓ Intel(R) Graphics is ready — 85.6 GiB free right now` on a stale stack. Two edits
-//! close it, both in `crates/moearc-cli/src/detect.rs`, which is where the fallback lives:
+//! 🔴 This section was a to-do list for as long as the refusal stopped at this crate's own
+//! boundary. `moearc-device-report` called [`inference_target`] and exited 1; the packaged
+//! `moearc` command did not, and went on printing
+//! `✓ Intel(R) Graphics is ready — 85.6 GiB free right now` on a stale stack. 📌 That is this
+//! module's own failure repeated one layer up: the rule was written, measured, tested and
+//! correct, and the binary a user actually runs never consulted it. A rule enforced in the
+//! library and skipped at the seam buys nothing at all, and it reads as *fixed* the entire
+//! time it is doing so.
 //!
-//! - Replace `let free = match live_free { Some(f) => f.min(d.total_memory_bytes), None =>
-//!   d.total_memory_bytes };` with [`vram_budget`], and drop the row — or mark it refused —
-//!   when it returns `Err`. The comment above that `match` already describes this exact
-//!   hazard; the code then does it anyway.
-//! - Have `Verdict::for_devices` take the refusals, so `CpuOnlyCause::UnsupportedDevice` (which
-//!   exists, and is `#[allow(dead_code)]`) can carry [`Unusable`]'s sentence instead of a
-//!   generic one.
+//! All three edits landed. In `crates/moearc-cli/src/detect.rs` every row's budget now comes
+//! from [`vram_budget`], with the Sysman reading joined by UUID through [`reading_for`]; the
+//! `match` that fell back to the device's reported total whenever the live figure was missing
+//! — the shape that produced the 85.6 GiB — is gone. The outcome is carried onto the row
+//! rather than flattened: `free_bytes` is **zero** for a device with no pool of its own, which
+//! is the literal truth; `budget_source` says whether the figure was measured or assumed; and
+//! `unusable` carries [`Unusable`]'s own sentence, numbers included. `Verdict::for_devices`
+//! then ranks a refusal above "no GPU found", so `CpuOnlyCause::UnsupportedDevice` — which
+//! this section once noted existed only as `#[allow(dead_code)]` — is constructed, and the
+//! attribute is gone with it. Without that ranking, the machine that provoked all of this
+//! would have been told "the oneAPI runtime is not on this shell's path": a remedy that sends
+//! the user to fix a path which was already correct, and that says nothing about the number
+//! that was wrong. The third edit landed too — `detect.rs` builds its row from
+//! [`crate::GpuDevice::driver_build`] and holds no second copy of the masking, nor of the
+//! corroboration table behind it.
 //!
-//! `driver_build` in that file duplicates [`crate::GpuDevice::driver_build`], with the same
-//! corroboration written out twice; folding it onto the shared one would be a third edit.
+//! Where the guarantee lives now, so the next reader can find it rather than re-derive it:
+//!
+//! | what is held | test |
+//! | --- | --- |
+//! | a refused device is never ready, and the headline carries the measurement | `moearc-cli` `detect.rs`: `a_device_with_no_pool_of_its_own_is_never_ready` |
+//! | a refusal outranks the generic "runtime is not on your path" | `moearc-cli` `detect.rs`: `a_refusal_outranks_the_generic_no_gpu_message` |
+//! | the sentence never reaches the screen | `moearc-cli` `tui/view.rs`: `an_integrated_gpu_is_never_rendered_as_ready_with_host_ram_as_its_vram` |
+//! | a refused device is not a tuning target either | `moearc-cli` `tuning/resolve.rs`: `an_integrated_gpu_is_not_a_planning_target` |
+//!
+//! The CLI's own device fixture was corrected alongside them: its integrated row now carries
+//! `free_bytes: 0` and a refusal. Keeping it there as a *usable* row is what let every screen
+//! be developed against the lie in the first place.
+//!
+//! ⬜ **The fix covers both output paths; the assertions cover one.** `plain.rs` and the TUI
+//! read the same two values — the row's `free_bytes` and the `Verdict` — computed once in
+//! `detect.rs`, so neither recomputes a budget and neither can print the old sentence; the
+//! plain table renders the cell as `0 B / 85.6 GiB`, where the number survives only as a
+//! *total*, correctly labelled. But only the rendered TUI frame is asserted on. `plain.rs`
+//! carries no tests at all, and it is the path `--plain` and every `bench` invocation take.
+//! What is missing there is a test rather than a fix — and 📌 that is the same shape as the
+//! gap above it: an invariant proven on one side of a seam and assumed on the other.
 
 use std::fmt::Write as _;
 use std::path::Path;

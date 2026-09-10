@@ -30,10 +30,23 @@ written, the tarball carries no engine and `moearc serve` expects a llama.cpp on
 is unchanged by their departure — all four were MoEArc's own Apache-2.0 work — but the row is
 corrected because a manifest that lists files a tarball does not contain is not a manifest.
 
-## What is fetched at install time, and why it is fetched rather than shipped
+## What is fetched rather than shipped, when it is fetched at all
 
 `runtime/` is populated by `packaging/fetch-runtime.py` from Intel's own published packages,
 pinned by version and SHA-256 in `packaging/runtime.lock.json`.
+
+⚠️ **Nothing populates it by default any more, and this section is about a directory most
+installs will not have.** Until 2026-09-09 this heading read "What is fetched at install time",
+and `install.sh` did fetch on every install — 209 MB pulled from the index, 82 MB kept — for a
+runtime that **no binary in the tarball loads**: the payload is one binary, `moearc`, which
+reaches the card through a `dlopen`ed Level Zero and links no SYCL at all. Today it is fetched
+only when asked for (`MOEARC_FETCH_RUNTIME=1`), by `packaging/launcher.sh`'s lazy path when
+something in the bundle needs it, or by `bundle.sh --with-runtime`.
+
+**The licence position below is unchanged by that, and is why the machinery stays.** It governs
+what MoEArc may *redistribute*, which is a question about the tarball's contents and not about
+how often the fetcher runs. The day llama.cpp's SYCL objects are bundled, the fetch becomes
+load-bearing again and every word below applies exactly as written.
 
 | library | project | licence | redistributable by us? |
 | --- | --- | --- | --- |
@@ -74,9 +87,9 @@ toolkits installed"* — and it is the same arrangement PyTorch's XPU builds use
 accepts Intel's terms from Intel, as they would have if they had installed the runtime
 themselves, and MoEArc's tarball stays wholly Apache-2.0.
 
-The cost is honest and small: an install-time download, and a machine with no network needs
-one manual step (see `docs/packaging.md`, *Installing without a network*). An honest
-dependency beats a licence violation.
+The cost is honest and small: a download when somebody asks for the runtime, and a machine with
+no network needs one manual step (see `docs/packaging.md`, *Installing without a network*). An
+honest dependency beats a licence violation.
 
 ### The escape hatch, and its condition
 

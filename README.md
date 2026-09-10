@@ -56,8 +56,12 @@ Sources: [`docs/strategy.md`](docs/strategy.md), [`docs/dependencies.md`](docs/d
 curl -fsSL https://raw.githubusercontent.com/chrisdesrochers/MoEArc/main/packaging/install.sh | sh
 ```
 
-One static binary, no Python, no conda, no oneAPI to install. The SYCL runtime is fetched at
-install time against SHA-256 pins in [`packaging/runtime.lock.json`](packaging/runtime.lock.json).
+One static binary, no Python, no conda, no oneAPI to install — and, since 2026-09-09, nothing
+downloaded behind your back either. Earlier installs fetched Intel's SYCL runtime every time;
+that is opt-in now (`MOEARC_FETCH_RUNTIME=1`, pinned by SHA-256 in
+[`packaging/runtime.lock.json`](packaging/runtime.lock.json)), because nothing in the payload
+loads it: `moearc` reaches your card through Level Zero and links no SYCL at all. Set the flag
+if your own llama.cpp SYCL build has no oneAPI beside it.
 
 🔴 **You need two things this installer does not give you.** The kernel-side GPU driver (`xe` or
 `i915`), which ships with your kernel — and **a llama.cpp build with the SYCL backend**, which
@@ -93,7 +97,7 @@ than a table you read:
 ```sh
 moearc serve gpt-oss-120b
 #   device confirmed — SYCL0 = Intel(R) Arc(TM) B580 Graphics (12216 MiB, 11753 MiB free)
-#   model loaded in 37s   (59.0 GiB, -ngl 99 -ncmoe 36 -t 16 -c 86016 -fa on -dev SYCL0)
+#   model loaded          (59.0 GiB, -ngl 99 -ncmoe 36 -t 16 -c 86016 -fa on -dev SYCL0)
 #   listening on http://127.0.0.1:8080/v1
 ```
 
@@ -103,10 +107,19 @@ runs** — verified by checking 64 token ids against the same command launched b
 `-dev SYCL0` and confirms that against the child's own device block before loading, which is
 what closes the trap where a run silently lands on the iGPU and succeeds anyway.
 
-⚠️ Two caveats on that output. It needs a `llama-server` on the machine — see the note under
-*Install*. And `-c 86016` is **derived**, not measured: the planner computes it from free VRAM
-after the experts are placed, and the largest context actually benchmarked on this card is 32K.
-A derived `-c` is a claim about capacity, not about throughput at that depth.
+⚠️ Three caveats on that block, and the third is about the block itself.
+
+- It needs a `llama-server` on the machine — see the note under *Install*.
+- `-c 86016` is **derived**, not measured: the planner computes it from free VRAM after the
+  experts are placed, and the largest context actually benchmarked on this card is 32K. A
+  derived `-c` is a claim about capacity, not about throughput at that depth.
+- 🔴 **It is a summary of what `serve` prints, not a paste of it** — the real screen puts the
+  flags in a provenance table above these lines, and prints a load time. **That load time is
+  withdrawn.** This README quoted `37s` and [`docs/serve.md`](docs/serve.md) quoted `12s` for
+  the same command, same model, same flags and same card; they are the same measurement by
+  construction, so one of them is wrong and nothing on record says which. Neither is replaced —
+  see [`docs/serve.md`](docs/serve.md) §4.2 for what was and was not established, and the rule
+  under *What this costs you, honestly* for why a second guess would be worse than no number.
 
 ---
 
@@ -256,6 +269,11 @@ the two and publishes none. Full analysis, including its own correction:
 - **`-t` between 14 and 18 on the flagship is unknown.** Two attempts were page-cache-bound and
   disagreed, so both were withdrawn rather than averaged. They remain in the tree with their
   disk counters so the discard is auditable.
+- **How long the 59 GiB model takes to load is unknown**, for the same reason and with less
+  excuse: two figures for the same command disagreed by 3×, one of them in this file, neither
+  taken under §4 of the protocol — no page-cache ratio, no disk counters, no repeat. Both are
+  withdrawn. Loading is a storage question on a file three and a half times the size of this
+  box's ZFS ARC, and a number taken without saying what the cache held is not an answer.
 
 The rule the project runs on: **when two attempts disagree, withdraw — do not replace.**
 Publishing a second wrong number to correct the first is the worse error
@@ -326,7 +344,7 @@ or vendored.** Inspired by, not derived from —
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The published tarball is a single
-binary and contains no third-party code at all; Intel's SYCL runtime is fetched from Intel on
-your machine at install time, and llama.cpp is yours to install.
+binary and contains no third-party code at all; llama.cpp is yours to install, and Intel's SYCL
+runtime — if you ask for it — is fetched from Intel, on your machine, against pinned digests.
 [`packaging/THIRD-PARTY.md`](packaging/THIRD-PARTY.md) is the full position, including what
 changes the day llama.cpp's binaries are shipped alongside.

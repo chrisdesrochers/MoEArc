@@ -3,9 +3,13 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/chrisdesrochers/MoEArc/main/packaging/install.sh | sh
 #
-# Unpacks a release into a prefix, fetches the Intel SYCL runtime once, and links the
-# commands onto PATH. `docs/ux.md` allows exactly one thing to be asked of the user, and it
-# is the kernel GPU driver; if that is missing this says so by name and stops.
+# Unpacks a release into a prefix and links the command onto PATH. `docs/ux.md` allows exactly
+# one thing to be asked of the user, and it is the kernel GPU driver; if that is missing this
+# says so by name and stops.
+#
+# It used to fetch Intel's SYCL runtime here as well, and does not any more: nothing in the
+# payload loads it. The block above the symlinks carries the measurement, and the two ways to
+# get the runtime anyway.
 #
 # 🔴 One artefact name, for every tag. `releases/latest/download/<name>` only works when the
 # asset name is fixed — a versioned filename cannot be resolved through it — so the tarball is
@@ -186,14 +190,48 @@ rm -rf "$PREFIX"
 mkdir -p "$(dirname "$PREFIX")"
 mv "$src" "$PREFIX"
 
-# Runtime up front rather than on first serve: an install that finishes is a better promise
-# than one that downloads 230 MB the first time someone is trying to run a model.
-if command -v python3 >/dev/null 2>&1; then
-    python3 "$PREFIX/libexec/fetch-runtime.py" --dest "$PREFIX/runtime" \
-        --lock "$PREFIX/share/moearc/runtime.lock.json"
+# 🔴 THE SYCL RUNTIME IS NOT FETCHED BY DEFAULT ANY MORE, AND THE JUSTIFICATION THAT STOOD
+# HERE OUTLIVED THE PAYLOAD IT WAS WRITTEN FOR. It read: "Runtime up front rather than on first
+# serve: an install that finishes is a better promise than one that downloads 230 MB the first
+# time someone is trying to run a model." Three separate things in that are now false.
+#
+#   * Nothing in this tarball loads it. The payload is one binary -- `moearc` -- and
+#     packaging/launcher.sh's own dispatch says `moearc) needs_runtime=0`: the device report
+#     reaches the card through moearc-device's dlopen'd Level Zero and links no SYCL at all.
+#     The three names that set needs_runtime=1 -- `moearc-server`, `moearc-bench`,
+#     `moearc-selftest` -- left the payload with the retired SYCL engine, so the only binary
+#     that ships is the one declaring it does not need this. The fetch was for
+#     `libmoearc_kernels.so`, which packaging/bundle.sh now fails the build for carrying.
+#   * There is no "first serve" it was getting ahead of. `moearc serve` supervises the user's
+#     own `llama-server`, which links the user's own runtime; ours is not on that path.
+#   * 230 MB was never the number. Measured against the pinned digests on 2026-09-09: six
+#     wheels, 199.5 MiB downloaded, of which runtime.lock.json's basename allowlist keeps
+#     78.6 MiB in 13 files -- the bulk it discards is libsycl-jit.so. (The lock file's own
+#     "73 MB" is not the number either.) So the old default spent 200 MiB of somebody's
+#     bandwidth, every install, on a directory nothing in the bundle opens.
+#
+# The machinery is kept rather than deleted: packaging/README.md's open item says to settle
+# `runtime/` when llama.cpp's shared objects are bundled, not by ripping it out first. Two
+# ways to still get it -- `MOEARC_FETCH_RUNTIME=1` here for someone staging it deliberately,
+# and packaging/launcher.sh's lazy fetch, which fires by itself the day a needs_runtime=1 name
+# is back in the bundle.
+#
+# The opt-in is not hypothetical. A user whose own llama.cpp SYCL build has no oneAPI beside it
+# can resolve against ours, because the launcher puts `runtime/` on LD_LIBRARY_PATH and the
+# supervised `llama-server` inherits it. packaging/README.md is right to call that a side
+# effect rather than a design -- nobody has measured it across an ABI skew -- and that is
+# exactly why it is a flag someone chooses rather than a download everybody pays for.
+if [ "${MOEARC_FETCH_RUNTIME:-0}" = 1 ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        python3 "$PREFIX/libexec/fetch-runtime.py" --dest "$PREFIX/runtime" \
+            --lock "$PREFIX/share/moearc/runtime.lock.json"
+    else
+        say "MOEARC_FETCH_RUNTIME=1, but python3 is not installed -- nothing was fetched."
+        say "fetch-runtime.py is standard-library only, so any python3 is enough."
+    fi
 else
-    say "python3 not found -- skipping the SYCL runtime for now."
-    say "'moearc' (device report) works without it; running a model does not."
+    say "no SYCL runtime fetched: nothing in this bundle loads one. Running a model needs your"
+    say "own llama.cpp 'llama-server', which links its own -- MOEARC_FETCH_RUNTIME=1 stages ours."
 fi
 
 mkdir -p "$BINDIR"

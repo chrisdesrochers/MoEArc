@@ -4,6 +4,31 @@
 things to go install. That promise has to survive contact with three native dependencies. This
 records how, and what is actually decided versus still open.
 
+🔴 **Read this before the rest — most of this document is history now, and each section says
+which part of it is.** It was written while MoEArc's engine was our own SYCL kernel object, and
+it is the record of packaging *that*. The engine is llama.cpp now. `packaging/bundle.sh` was
+rewritten on 2026-09-08 and the payload is **exactly one binary**:
+
+```sh
+declare -a payload=(
+    "moearc:$rel/moearc"
+)
+```
+
+`moearc-server`, `moearc-bench` and `moearc-selftest` all left that list — each for its own
+reason, which `bundle.sh` writes out at the point it stopped shipping them — and
+`libmoearc_kernels.so` left with them. The assertion that used to demand the kernel object be
+present has been **kept and turned round**: staging any binary that still links it now *fails
+the build*, because a stale `target/release` from before the pivot is exactly how a retired
+engine reaches a release unnoticed.
+
+The sections below are kept rather than deleted, for two reasons. The findings about *this
+hardware* — the driver floor, the adapter set, the licence position — did not become false when
+our engine changed; and the reasoning behind a retired decision is the only thing that stops the
+next person rediscovering it the expensive way. Every section describing something that is no
+longer shipped now opens with a status line. What is true today, collected in one place, is
+**What is still not true** at the bottom.
+
 Technique reference: [Vendoring C/C++ dependencies in
 Rust](https://blog.veeso.dev/blog/en/vendoring-c-cpp-dependencies-in-rust/), whose `-src` /
 `-sys` / public three-crate split and `include_bytes!` + `libloading` fallback are the two
@@ -13,11 +38,18 @@ patterns we lean on.
 
 | | what it is | can it be statically linked? | approach |
 | --- | --- | --- | --- |
-| **SYCL kernels** | our own C++/SYCL, compiled with DPC++ | no — needs the SYCL runtime | build on our machine, embed the `.so` |
+| **SYCL kernels** — 💀 *retired 2026-09-08* | our own C++/SYCL, compiled with DPC++ | no — needs the SYCL runtime | was: build on our machine, ship the `.so` beside the binary. **No longer in the payload at all** |
 | **Level Zero loader** | `libze_loader.so`, the ICD loader | no by design — it *is* a loader | embed, extract, `dlopen` |
 | **TLS trust roots** | CA certificates for Hub downloads | n/a — data, not code | see below |
 
 ### SYCL kernels — build here, ship the artifact
+
+💀 **Retired. Nothing in this subsection is shipped any more**, and it is kept because the
+three-crate split and the `icpx`-does-the-link finding below are what any future native
+dependency here will have to repeat. `moearc-kernels{,-src,-sys}` are still in the tree;
+`packaging/bundle.sh` builds none of them (`--build` runs `cargo build --release -p moearc-cli`
+with **no feature flags** — every flag that used to be there pulled this engine in) and refuses
+to stage anything that links the resulting object.
 
 The kernels cannot be Rust. They are compiled with `icpx -fsycl` on a machine with oneAPI
 installed, which is **our** machine, not the user's. That distinction matters and was nearly
@@ -100,6 +132,14 @@ CA store is administered, and overriding it silently is its own bad behaviour.
 **Status: fixed 2026-09-05. Nothing has to be set to start a binary that links the kernels —
 not `LD_LIBRARY_PATH`, not anything else.**
 
+💀 **Moot since 2026-09-08: no shipped binary links the kernels.** Two things outlived it and
+are worth carrying forward. The first is the finding itself — `cargo:rustc-link-arg` does not
+propagate downstream, and a suite can be entirely green while covering none of it. The second
+is concrete and still executed: `bundle.sh` still asserts that **no `DT_NEEDED` in any staged
+binary contains a slash**. That guard was written for this object and it now guards the payload
+against a class of mistake rather than against one file, which is why it was kept when the
+step that motivated it was dropped.
+
 The history is worth keeping, because the obvious fix is the one that does not work.
 
 `moearc-kernels`' `build.rs` used to emit an rpath via `cargo:rustc-link-arg`. **That directive
@@ -175,6 +215,14 @@ and says why.
 
 ## ✅ Closed: the SYCL runtime no longer needs `setvars.sh` to find a GPU
 
+⚠️ **Half of the transcript below can no longer be re-run.** `moearc-selftest` is not in the
+tarball — it existed only to `dlopen` the retired kernel object — so the second command is a
+record, not a check anybody can repeat today. The *first* half is still exercised on every
+release: `packaging/verify-clean.sh` runs `moearc --no-tui` in this same container, once
+normally and once under `env -i`, and fails if the Arc card is not named. What it can no longer
+do is prove that anything **computes** there; it prints `NOT PROVEN` rather than a clean PASS
+that covers less than it used to.
+
 **Status: fixed 2026-09-05, and verified where it could not have been faked** — Ubuntu 24.04
 in a container with no `/opt/intel`, an empty environment, and glibc 2.39 rather than the build
 host's 2.43:
@@ -205,8 +253,19 @@ work; the rpath work has no solution and the process-wide path does.
 
 ### The set, and why each member is in it
 
-Eleven libraries, 78 MiB installed. Discovered by `ldd` on our own object and on each adapter, plus
-the adapters themselves, which nothing links and `SYCL_UR_TRACE=1` names:
+🔴 **Nothing in today's payload links any of these, and that is not the same as saying they are
+unnecessary.** `moearc` reaches Level Zero through `moearc-device`'s `dlopen` and links no SYCL
+at all — which is precisely the property that lets the tarball work on first unpack, before
+anything has been fetched. `launcher.sh` encodes it directly: `case $self in moearc)
+needs_runtime=0`, so the shipped binary never triggers the fetch. What still needs this set is
+the thing that computes, and that is now **llama.cpp's SYCL build, which the user supplies**.
+The launcher still prepends `runtime/` to `LD_LIBRARY_PATH`, and `serve` spawns `llama-server`
+without clearing the environment, so a fetched runtime *is* inherited by the engine — read out
+of `launcher.sh` and `serve.rs`, **not tested**, and version-coupling to somebody else's build
+of llama.cpp is exactly the question this document warns about two sections down.
+
+Eleven libraries, 78 MiB installed. Discovered by `ldd` on our own object *(as it then was)* and
+on each adapter, plus the adapters themselves, which nothing links and `SYCL_UR_TRACE=1` names:
 
 | | why |
 | --- | --- |
@@ -239,6 +298,13 @@ library has to agree with:
 - **The SYCL/oneAPI runtime is version-coupled to our compiler.** It has to agree with
   `libmoearc_kernels.so`, which we built. We ship the pin. It goes first on `LD_LIBRARY_PATH`
   and wins over a system oneAPI if one exists.
+  🔴 **The premise of that bullet is gone and the conclusion has not been re-derived.** There is
+  no `libmoearc_kernels.so` any more, so the runtime is no longer coupled to a compiler *we*
+  ran; it is coupled to whatever compiled the user's `llama-server`. Winning over a system
+  oneAPI was the right answer when the object it had to match was ours. Whether a pinned runtime
+  should still go first when the binary that consumes it is somebody else's build is an **open
+  question nobody has measured**, and it is recorded as open rather than answered by leaving the
+  old sentence standing.
 - **The Level Zero loader and GPU driver are version-coupled to the user's kernel.**
   `libze_loader.so.1` and `libze_intel_gpu.so.1` have to agree with the `xe`/`i915` module
   running on that machine, and a distribution ships them together for that reason. We use
@@ -279,6 +345,14 @@ and name.
 Found by running an actual model in the clean container rather than stopping at the selftest,
 and it is the most useful thing this packaging work turned up.
 
+⚠️ **The finding stands; the instrument that produced it does not ship, and nothing has
+replaced it.** The third column below came from `moearc-bench` loading a model in the container,
+and `moearc-bench` left the payload with the retired engine. `packaging/verify-clean.sh` says so
+in its own verdict — a PASS there now means *the card is found*, not that it computes — so the
+middle row of this table, the stack that passes every detection check and then cannot load a
+model, is **currently unguarded by the release gate**. It comes back the day llama.cpp is
+bundled and a forward pass can be run in the clean room again.
+
 | driver stack (all on a B580, no oneAPI) | device report | SYCL queue | model load + decode |
 | --- | --- | --- | --- |
 | Ubuntu 24.04 stock, `libze-intel-gpu1` build 27642 | ❌ enumerates the **iGPU** | — | — |
@@ -314,28 +388,55 @@ Full detail in [`packaging/THIRD-PARTY.md`](../packaging/THIRD-PARTY.md). The sh
 because it determined the shape of everything above:
 
 `libimf`, `libsvml`, `libintlc` and `libirng` are Intel's proprietary compiler runtime, they
-have no open-source counterpart, and they are in the `DT_NEEDED` of both our kernel object and
-*Intel's own* Level Zero adapter — so they cannot be dropped. Intel's EULA grants redistribution
+have no open-source counterpart, and they are in the `DT_NEEDED` of *Intel's own* Level Zero
+adapter — so they cannot be dropped. ✅ **Half of that sentence has expired and the conclusion
+survives it.** They were in the `DT_NEEDED` of our kernel object *as well*, and that object is
+no longer built or shipped; the adapter alone is enough to require them. What changed is who
+does the requiring — today it is a llama.cpp the user installed, not anything in this tarball. Intel's EULA grants redistribution
 of "Redistributables", defined as the files listed in a `redist.txt` — **and no such file exists
 anywhere in the oneAPI 2026.1 installation we build against.** The grant is real and we cannot
 show it covers any particular file. Two of its conditions would also propagate to our users:
 a no-reverse-engineering clause, and a prohibition on SaaS use — which is one of the things an
 inference server is for.
 
-So the default tarball contains **no third-party binaries at all**. `packaging/fetch-runtime.py`
+So the default tarball contains **no third-party binaries at all** — and since the payload
+became one binary it contains no third-party *code* at all either, which is a stronger and
+simpler statement than the one this section was written to defend. `packaging/fetch-runtime.py`
 downloads Intel's runtime, on the user's machine, from Intel's own channel — packages Intel
 publishes precisely so that "executables can be deployed to hosts without the oneAPI
 development toolkits" — pinned by SHA-256 in `packaging/runtime.lock.json`. The user accepts
 Intel's terms from Intel. The tarball stays Apache-2.0. An honest dependency beats a licence
 violation.
 
-`bundle.sh --with-runtime` vendors it anyway, for air-gapped installs — a 29 MB tarball against
-the default 4.8 MB, verified under `podman --network none` with `MOEARC_NO_FETCH=1`. That
-archive is **not** Apache-2.0 and must not be published as though it were.
+🔴 **Since 2026-09-09 that download does not happen unless it is asked for.** `install.sh` ran
+it on every install, and stopped: nothing in the payload opens the directory it produces. It is
+`MOEARC_FETCH_RUNTIME=1` now, and `launcher.sh` keeps its lazy fetch for the day a
+`needs_runtime=1` name is back in the bundle. The licence position above is unchanged by that
+and is what makes the opt-in safe to keep offering — what changed is that a default install no
+longer spends somebody's bandwidth on a runtime nothing in the bundle loads.
+
+`bundle.sh --with-runtime` vendors it anyway, for air-gapped installs, verified under
+`podman --network none` with `MOEARC_NO_FETCH=1`. That archive is **not** Apache-2.0 and must
+not be published as though it were.
+
+⚠️ **Two tarball sizes used to be quoted here — 29 MB vendored against 4.8 MB default — and
+both were wrong from the day the payload became one binary.** They were measured when it was
+four executables and a shared object. Neither is restated here: the default has since been
+re-measured and `packaging/RELEASE.md` carries that figure beside the artefact it describes,
+which is the right place for a number that changes with every build; the vendored figure has
+**not** been re-taken and is simply withdrawn. `bundle.sh` prints the size of what it just
+produced, and that is the only one true by construction. `bench/PROTOCOL.md` §9 is the rule
+underneath both halves — when a figure stops describing what ran, withdraw it; a replacement
+nobody measured is the worse error.
 
 ## Installing without a network
 
-The fetch is the one step that needs the internet. On a machine that has none:
+The runtime fetch used to be the one step that needed the internet, and it is now opt-in
+(`MOEARC_FETCH_RUNTIME=1`) precisely because no binary in today's payload consumes what it
+fetches — `moearc` runs on a machine that has never seen either. What follows therefore matters
+for staging a runtime a *user's own* `llama-server` will resolve against, which the launcher
+makes possible by putting `runtime/` on `LD_LIBRARY_PATH` that the child inherits. On a machine
+with no network:
 
 ```sh
 # on a machine that does, with the same tarball unpacked:
@@ -347,6 +448,14 @@ python3 libexec/fetch-runtime.py --dest ./runtime --lock share/moearc/runtime.lo
 firewalled resolver.
 
 ## The kernel object is relocatable now, without `patchelf`
+
+💀 **`packaging/elf-relocatable.py` is no longer run.** It shortened exactly one absolute
+`DT_SONAME` — the kernel object's — and no staged file has one, so `bundle.sh` dropped the step
+and says so in its header. The script stays in the tree; the technique is the interesting part
+and it is written down below. **The guard it existed to satisfy was kept**: any `DT_NEEDED` with
+a slash in it still fails the build. That is deliberate — the step was the mechanism, the
+assertion is the requirement, and a requirement should outlive the mechanism that happened to
+satisfy it.
 
 The section above records that the soname carries an absolute `OUT_DIR` path, that this is the
 only channel reaching a downstream binary, and that the artefact is therefore **not
@@ -375,16 +484,68 @@ its purpose was never vendoring — it is how the loader-is-missing path gets te
 
 ## What is still not true
 
+**Rewritten 2026-09-09**, against `packaging/bundle.sh`, `packaging/launcher.sh` and
+`crates/moearc-cli/src/serve.rs` as they stand. Two entries here had gone false in the direction
+that flatters nobody — they understated the product and overstated the payload — and they are
+corrected in place rather than deleted, because a limitations list that quietly loses a wrong
+entry teaches the next reader nothing.
+
 - 🔴 **glibc 2.39 or newer.** `moearc` requires `GLIBC_2.39`, inherited from building on Ubuntu
-  26.04; the other three binaries need only 2.34. That is Ubuntu 24.04, Fedora 40, Debian 13 or
-  newer — and it silently excludes Debian 12 and RHEL 9. `share/moearc/BUILD-INFO.txt` in every
-  tarball states the measured floor per binary. Lowering it means building on an older host or
-  in a manylinux container; nothing else here needs to change.
+  26.04. That is Ubuntu 24.04, Fedora 40, Debian 13 or newer — and it silently excludes Debian 12
+  and RHEL 9. `share/moearc/BUILD-INFO.txt` in every tarball states the measured floor, computed
+  from the shipped binary rather than asserted.
+  ✅ *Corrected:* this used to read "…the other three binaries need only 2.34", which made the
+  tarball's floor sound like a property of one component among several. There are no other three
+  binaries. The floor of the payload is the floor of `moearc`, and nothing softens it.
 - 🔴 **x86-64 Linux only.** No aarch64, no Windows.
-- ⬜ `moearc serve` is still a fixture — the CLI's device report is real and its model list,
-  downloads and serving stats are not. The tarball ships `moearc-server` (real, links the
-  kernels) and `moearc-bench` beside it, so nothing in the bundle is a fixture *only*, but the
-  four-command journey in `docs/ux.md` is not yet walkable end to end.
+- 🔴 **The payload is one binary, and it is not an inference engine.** `moearc serve` supervises
+  llama.cpp's own `llama-server` as a child process with the argv the tuning resolver produced,
+  so **a machine that unpacks this tarball still needs a llama.cpp with the SYCL backend on it.**
+  `serve` looks for one beside its own executable first, then `$MOEARC_LLAMA_SERVER`, then the
+  usual build directories, and `$PATH` last — deliberately last, because a `llama-server` earlier
+  in someone's `PATH` may be a Vulkan build that runs, answers correctly and is **4.8× slower**,
+  with nothing in the file name to say so.
+  ⬜ Bundling llama.cpp's `llama-server`, `libllama.so.0` and the `libggml*.so.0` family would
+  close this. It is real work with a real licence obligation — `packaging/THIRD-PARTY.md` does
+  not yet cover redistributing MIT-licensed llama.cpp binaries — and it is tracked in
+  `docs/pivot-inventory.md`.
+- ✅ **`moearc serve` is not a fixture, and the entry that said so was the stalest line in this
+  document.** It read: *"`moearc serve` is still a fixture … the tarball ships `moearc-server`
+  (real, links the kernels) and `moearc-bench` beside it."* Every clause of that is now false.
+  `serve` starts the engine, pins the card by name and confirms the pin against the child's own
+  device block *before* 59 GiB is read, and it was checked by running 64 tokens through it
+  against the same argv hand-launched with no `moearc` in the picture — identical token ids. And
+  the tarball ships none of those binaries: `moearc-bench` and `moearc-selftest` existed
+  only to exercise the retired SYCL engine, and `moearc-server` was dropped because **without
+  llama.cpp linked in it is an echo stub** that answers OpenAI-format requests with the prompt
+  read back, over the real routing and SSE path — indistinguishable from a model to anyone not
+  reading `/health`. The right thing to have in the tree, the wrong thing to have in a release.
+  📌 The general lesson is the one this file keeps relearning: **the payload is a list, and a
+  list that shrinks silently is how a release ships something nobody meant to ship.** `bundle.sh`
+  now writes out, at the point of the list, why each departed name departed.
+- ⬜ **The serving *screen* is still a fixture, which is the true half of the old entry.**
+  `source.rs`'s `ServeStats` and the TUI's serving view still draw from fabricated numbers;
+  `kv_utilisation` and `expert_hit_rate` have no llama.cpp source at all. `moearc serve <model>`
+  on the command line is the wired path — `docs/serve.md` §5 is the standing list.
+- ⬜ **The clean-room gate proves less than it did, and prints `NOT PROVEN` rather than absorbing
+  it.** Three of its four gates ran binaries that have left the payload, so
+  `packaging/verify-clean.sh` can no longer show that a model loads or that tokens come out
+  right on a machine with no oneAPI. It still shows the thing it was written for — that the Arc
+  card is found from an empty environment on a distro that has never had the toolkit. A PASS
+  today means **the card is found, not that it computes.**
+- ⬜ **Nothing in the payload consumes the Intel SYCL runtime, and as of 2026-09-09 a default
+  install no longer downloads one.** `moearc` links no SYCL, and `launcher.sh` says so by name:
+  `case $self in moearc) needs_runtime=0`. The three names that set `needs_runtime=1` all left
+  with the retired engine, so the fetch was serving a payload that no longer exists — it is
+  `MOEARC_FETCH_RUNTIME=1` now, and `launcher.sh`'s lazy fetch still fires by itself the day a
+  `needs_runtime=1` name comes back. **The machinery was made opt-in rather than deleted**, and
+  the distinction is the point: the question of what `runtime/` is for gets settled when
+  llama.cpp's shared objects are bundled, not by ripping it out first.
+  ⬜ There is one real use for the opt-in and it is **untested**: a user whose own llama.cpp
+  SYCL build has no oneAPI beside it can resolve against ours, because the launcher puts
+  `runtime/` on `LD_LIBRARY_PATH` and the supervised `llama-server` inherits it. Nobody has run
+  that across an ABI skew. It is a side effect that happens to work, not a design — which is
+  exactly why it is a flag somebody chooses rather than a download everybody pays for.
 - ⬜ `install.sh` points at a GitHub release that does not exist yet, and `moearc.dev` is still
   unregistered. `MOEARC_TARBALL=/path/to/tarball` installs a local build in the meantime, and
   that is the path that was actually exercised end to end in the clean container.
@@ -414,4 +575,11 @@ its purpose was never vendoring — it is how the loader-is-missing path gets te
   correct mechanism and an rpath is not an option that was skipped.
 - **Publish nothing that has not run where the toolkit cannot be reached.**
   `packaging/verify-clean.sh` is the gate, and it is a container rather than a test because the
-  bug it exists to catch is *the environment*.
+  bug it exists to catch is *the environment*. 🔴 **A gate that loses coverage says so in its own
+  verdict.** When three of its four checks left with the binaries they ran, the answer was to
+  print `NOT PROVEN` beside the PASS, not to narrow the definition of passing until the script
+  looked healthy again.
+- **A payload is a list, and it is written down with its reasons.** Every name that leaves it
+  leaves for a stated reason, at the point in `bundle.sh` where it stopped being staged. A build
+  that silently produces a smaller tarball is indistinguishable from one that produces the right
+  one.

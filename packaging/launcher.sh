@@ -63,8 +63,12 @@ if [ -d "$runtime" ]; then
     LD_LIBRARY_PATH="$runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export LD_LIBRARY_PATH
 fi
-# The kernel object sits beside the binaries and is found by name once
-# packaging/elf-relocatable.py has shortened its DT_SONAME.
+# `libexec` goes on the front as well. The object this line was written for --
+# `libmoearc_kernels.so`, whose absolute DT_SONAME packaging/elf-relocatable.py shortened to a
+# bare name -- is retired, and that script is not run any more (packaging/bundle.sh says why),
+# so today it holds one ELF binary and a Python script, and no shared object at all. It is kept
+# rather than removed: it is the search path for anything the bundle ships beside its own
+# binaries, which is what llama.cpp's SYCL build needs the day it is bundled.
 LD_LIBRARY_PATH="$root/libexec${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH
 

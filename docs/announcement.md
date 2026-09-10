@@ -47,6 +47,18 @@ I want to be exact about the scope of that claim. It is one CPU, one box, one ll
 wrongly — should generalise to other Arrow Lake and Meteor Lake parts. Whether it does on yours
 is a question I would like answered by people who are not me.
 
+<!-- ⬜ UNVERIFIED FROM THIS REPO, for the author to decide before posting. Nothing in this
+     repository references an upstream filing for the thread-count defect: `grep -rn 28625`
+     returns only this comment, and docs/calibration.md:120 says only "Reported upstream — see
+     the project issue tracker for the filing" about a different (XMX) defect. If llama.cpp
+     issue #28625 is the filing for this one, a reader will ask, and one sentence here — "filed
+     upstream as ggml-org/llama.cpp#28625" — answers it. Left out of the body rather than
+     guessed, because a wrong issue number in a public post is worse than no number. Note also
+     that this post, the README and packaging/release-notes-0.1.0.md all name the function
+     `common_cpu_get_num_math()`, while the upstream report is understood to concern
+     `cpu_count_math_cpus()` (the helper it calls, which hardcodes SMT = 2). If both names are
+     going to appear in public, they should agree. -->
+
 ### The reason this is a project and not a bug report
 
 Here is the same knob on a different model:
@@ -88,17 +100,18 @@ Two more that cost people real throughput:
 - **The `-ncmoe` OOM floor is a function of context, not of the model.** Qwen3-30B needs 18
   blocks offloaded at depth 0, 21 at 8K and **28 at 32K**. Publish a single number and you OOM
   every long-context user *after* they have waited for tens of gigabytes to load.
-- **Sitting on that floor is a bad trade, and it is what everyone does.** The obvious value for
-  the flagship is `-ncmoe 31`, the lowest that loads. `-ncmoe 36` measures 1.9% different —
-  inside the noise floor — and leaves **9,416 MiB of VRAM free instead of 1,327**. Same speed,
-  8.1 GiB back, and that VRAM is what makes 32K context reachable on the card at all.
+- **Sitting on that floor is a bad trade, and it is the obvious thing to do — this project
+  published it that way itself.** The obvious value for the flagship is `-ncmoe 31`, the lowest
+  that loads. `-ncmoe 36` measures 1.9% different — inside the noise floor — and leaves
+  **9,416 MiB of VRAM free instead of 1,327**. Same speed, 8.1 GiB back, and that VRAM is what
+  makes 32K context reachable on the card at all.
 
 ### What the tuned settings actually get you
 
 `gpt-oss-120b` — **59.02 GiB of weights** — on an Arc B580 with **11.7 GiB of free VRAM**:
 **29.56 ± 0.16 tok/s** at depth 0, 28.52 at 8K, 26.83 at 32K, with 9.4 GiB of card still unused.
-Seven models are profiled this way, from a 3.9 GiB OLMoE through Qwen3-30B, Qwen3-Coder-30B,
-Qwen3.6-35B and Llama-4-Scout up to that 59 GiB flagship.
+Seven models are profiled this way, from a 3.9 GiB OLMoE through gpt-oss-20b, Qwen3-30B,
+Qwen3-Coder-30B, Qwen3.6-35B and Llama-4-Scout up to that 59 GiB flagship.
 
 ### What MoEArc is
 
@@ -109,20 +122,34 @@ this exact card and model, extrapolated from a neighbour, or derived from arithm
 card's free VRAM. On hardware nobody has benchmarked it says so, on screen, rather than handing
 you a confident number.
 
+It will also run that command for you. `moearc serve` supervises `llama-server` as a child
+process, built from the same resolved flags `moearc info` prints — so the command it shows is
+the command it runs — and it pins the discrete card and confirms that against the child's own
+device block before a byte of the model loads. `moearc serve gpt-oss-120b` puts 59.02 GiB of
+weights on a 12 GB card and answers OpenAI-format requests with no flags typed.
+
+🔴 **It does not ship llama.cpp.** MoEArc is a wrapper; the tarball is one binary and contains
+no third-party code at all. You supply your own `llama-server` built with the SYCL backend —
+named by `$MOEARC_LLAMA_SERVER`, sitting beside the `moearc` binary, or on `$PATH`. The device
+report, the catalog and `moearc info` work without one; everything that computes does not.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/chrisdesrochers/MoEArc/main/packaging/install.sh | sh
 moearc                      # your card, and what will fit
+moearc pull gpt-oss-120b    # or any Hugging Face repo id
 moearc info gpt-oss-120b    # the command, and where every flag came from
+moearc serve gpt-oss-120b   # or just run it, tuned, on the pinned device
 ```
 
 ### 🔴 What I am not claiming
 
 **MoEArc is not faster than llama.cpp. MoEArc is llama.cpp.** Every multiplier above is
 tuned-vs-default *on the same engine, the same binary, the same commit* — not one engine against
-another. There is no MoEArc-vs-llama.cpp benchmark in the repository, deliberately, and
-`bench/PROTOCOL.md` §1 is the standing rule about why: give the baseline the whole machine, pin
-the thread count on both sides, read it back from the tool's own output, and quote its best
-configuration rather than its first.
+another. No MoEArc-vs-llama.cpp head-to-head is published anywhere in this project,
+deliberately — the withdrawn attempts are still in `bench/baselines/`, each under a banner
+saying why — and `bench/PROTOCOL.md` §1 is the standing rule about why: give the baseline the
+whole machine, pin the thread count on both sides, read it back from the tool's own output, and
+quote its best configuration rather than its first.
 
 The project exists because Intel Arc owners have nowhere good to go. Intel's own `ipex-llm` was
 archived in January with no community fork, and Ollama on Arc falls back to Vulkan — on this box
@@ -138,7 +165,23 @@ SYCL backend is the good option. It just ships one bad default and expects you t
 - Every figure is decode. Prefill is untuned and unmeasured.
 - Throughput falls with prompt depth by very different amounts per model — 1.01× for Qwen3.6-35B
   from d0 to 8K, 1.65× for Llama-4-Scout.
-- `moearc serve` is not wired yet; today it prints the command and you run `llama-server`.
+- **llama.cpp is not bundled.** You need your own SYCL-backend `llama-server` on the machine;
+  the tarball is one binary and every computing path goes through yours.
+- **`moearc serve` has been exercised on one card by one person.** It runs — it supervises
+  `llama-server` with the resolved argv and pins the card — and the check behind that is one
+  regression test: 64 token ids from `serve` against the same command launched by hand,
+  identical. One check is not a soak test.
+<!-- Corrected 2026-09-09. This bullet previously read: "`moearc serve` is not wired yet; today
+     it prints the command and you run `llama-server`." That has been false since serve landed:
+     it supervises llama-server with the resolved argv, confirms the pinned device against the
+     child's own device block, and serves gpt-oss-120b (59.02 GiB) on the 12 GB B580 with no
+     flags typed (docs/serve.md §4.2, §4.3). The README carried the identical stale sentence and
+     was corrected on 2026-09-09; this was the same error surviving in a second document. -->
+- **The timed half of `moearc bench` is developer-only in this release.** `--absolutes` reaches
+  the card through a backend the release payload does not carry, so on the shipped binary it
+  **refuses with exit 3** — `this binary has no GPU backend compiled in` — rather than printing
+  a number. The absolute throughput above therefore cannot be reproduced from the tarball. The
+  deterministic half can, and does.
 - `-t` between 14 and 18 on the flagship is unknown. Two attempts were page-cache-bound and
   disagreed with each other, so both were withdrawn rather than averaged. They are still in the
   tree with their disk counters.
@@ -147,8 +190,12 @@ Raw CSV, load-average guards, `/proc/diskstats` deltas and ARC counters for ever
 committed. Apache-2.0.
 
 **What I would most like:** numbers from Arc hardware that is not a B580, and from hybrid Intel
-CPUs that are not Arrow Lake. `moearc bench` writes a single self-describing artefact meant to
-be pasted into an issue.
+CPUs that are not Arrow Lake — starting with the `n_threads` line out of your own `llama-server`
+startup log, and that default measured against a thread count you pin yourself, on a model you
+already run. `moearc bench` writes a single self-describing artefact meant to be pasted into an
+issue; its deterministic half is a replay of the committed routing traces — no GPU, no clock, no
+model — and should come out identical on your box, so a disagreement in any digit is a real one.
+Its timed half is the one that refuses on a shipped binary, per the limits above.
 
 github.com/chrisdesrochers/MoEArc
 
@@ -164,7 +211,8 @@ that picks its flags for you.
 The 2.09× in the post is **tuned-vs-default on the same engine**: same binary, same commit,
 `-t 4` against `-t 16`, arms interleaved in one sweep. It is not one engine against another.
 
-There is also no MoEArc-vs-llama.cpp head-to-head in the repo, deliberately. A fair one is
+There is also no MoEArc-vs-llama.cpp head-to-head published, deliberately — the withdrawn
+attempts are still in `bench/baselines/`, each under a banner saying why. A fair one is
 harder than it looks on this hardware, and both traps are in the post: any comparison that
 leaves the baseline on its 4-thread default is measuring the default, not the engine; and once
 that is pinned, a 59 GiB model against 16 GiB of page cache means you can end up measuring the
@@ -174,6 +222,7 @@ wrong number to correct the first is the worse error. So there is no number ther
 `bench/PROTOCOL.md` has the full protocol.
 
 What I'm actually shipping is the tuning: measured profiles for seven models on an Arc B580, the
-per-model `-ncmoe` floor (which moves with context), and the `-t` value that makes llama.cpp use
-your whole CPU. If you already know your flags, you don't need this. Most people don't, and the
-defaults are worse than they look.
+per-model `-ncmoe` floor (which moves with context), the `-t` value that makes llama.cpp use
+your whole CPU — and a `serve` that launches your `llama-server` with those flags instead of
+making you paste them. If you already know your flags, you don't need this. Most people don't,
+and the defaults are worse than they look.

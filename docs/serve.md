@@ -4,7 +4,13 @@ Written 2026-09-08. Everything quoted below is real output from CHARA's Arc B580
 the two runs are labelled so nobody has to guess which model produced which line.
 **No throughput claim is made anywhere in this document.** The box was not quiet by
 `bench/PROTOCOL.md`'s standard and no timed run was taken; the numbers that do appear
-are token ids and load times, neither of which is a benchmark.
+are token ids, which are not a benchmark.
+
+🔴 **Amended 2026-09-09: the load times are withdrawn.** They were published here as
+"evidence that a load happened", which is a weaker claim than a benchmark — and a figure
+does not get to be quoted loosely because its claim is modest. Two of them, for the same
+command on the same model, disagreed across this repository's own documents. §4.2 records
+what was measured, what was not, and why nothing replaced them.
 
 This closes the last gap in the product story. Every other link existed:
 `moearc` explains the machine, `moearc ls` finds the models, `moearc info` prints the
@@ -88,17 +94,25 @@ It needs a second executable. Three things make that smaller than it sounds, and
 thing genuinely has to change.
 
 - **It is not a `PATH` dependency.** `find_binary()` looks beside the `moearc`
-  executable **first**, which is the layout `packaging/bundle.sh` already produces —
-  four executables under `libexec/`, each behind `launcher.sh`. `PATH` is the last
-  resort, not the mechanism.
+  executable **first**, which is the layout `packaging/bundle.sh` produces — executables
+  under `libexec/`, each behind `launcher.sh`. `PATH` is the last resort, not the
+  mechanism.
+  ✅ *Amended 2026-09-09:* this said "four executables", which was true when it was
+  written and stopped being true the same week. `moearc-server`, `moearc-bench` and
+  `moearc-selftest` left the payload with the retired SYCL engine, so `libexec/` holds
+  **one** binary today. The argument is unaffected — a directory beside the binary is
+  where `llama-server` goes whether it has three neighbours or none.
 - **The payload does not grow by a library.** Under the llama.cpp architecture the
   tarball must ship `libllama.so.0` and the `libggml-*.so.0` family *regardless* of which
   design is chosen, because `moearc-llama` links them either way. `llama-server` is one
   more ELF in a directory that already has to exist.
-- 🔴 **`bundle.sh` must still be rewritten, and would have had to be anyway.** Lines 64,
-  66 and 84 are hard-wired to a single `libmoearc_kernels.so`.
-  `docs/pivot-inventory.md` §`packaging/` already flags all three as required work,
-  independent of this module. What this decision adds to that list is one file name.
+- ✅ **`bundle.sh` was rewritten on 2026-09-08, and it went the other way.** The three
+  lines hard-wired to a single `libmoearc_kernels.so` are gone; the payload is a list
+  with one entry, and the assertion that used to *require* that object now **fails the
+  build if any staged binary still links it**. What remains outstanding is the item this
+  bullet was really about: llama.cpp's `llama-server`, `libllama.so.0` and the
+  `libggml*.so.0` family are still not staged, so a machine that unpacks the tarball
+  needs its own. `docs/packaging.md` carries the current list.
 
 ---
 
@@ -182,9 +196,16 @@ followed by the pasteable command, any overrides, the resolver's caveats, and th
   starting the engine…
   ✓ device confirmed — SYCL0 = Intel(R) Arc(TM) B580 Graphics (12216 MiB, 11680 MiB free)
     (2 other device(s) were visible and are not being used: SYCL1 = Intel(R) Graphics …)
-  ✓ model loaded in 4s
+  ✓ model loaded in ⟨withdrawn⟩
   ✓ listening on http://127.0.0.1:8080/v1
 ```
+
+📌 **That second block is the shape of the screen rather than a transcript of one run, and
+it was not labelled as one** — in a document whose own opening paragraph promises that the
+runs are labelled so nobody has to guess. It cannot be the gpt-oss-120b run whose plan is
+quoted above it: that run is in §4.2, on a different port, with a different load figure.
+Which run it *is* from is not recorded anywhere, which is the whole problem — so the figure
+is struck rather than attributed, for the reason §4.2 gives.
 
 Three properties of that screen are deliberate.
 
@@ -338,7 +359,7 @@ this run; what followed it:
     (2 other device(s) were visible and are not being used:
      SYCL1 = Intel(R) Graphics (77945 MiB, 17340 MiB free);
      CPU   = Intel(R) Core(TM) Ultra 7 265K (93705 MiB, 93705 MiB free))
-  ✓ model loaded in 12s
+  ✓ model loaded in ⟨withdrawn — see the note below⟩
   ✓ listening on http://127.0.0.1:18104/v1
 
 $ curl -s …/v1/chat/completions -d '{"model":"gpt-oss-120b","messages":[…],
@@ -364,8 +385,40 @@ scratchpad to the user.
 ⚠️ **No throughput figure from this run is quoted, here or anywhere.** The box was not
 quiet — a background container fleet, and the one-minute load average moved from 1.11
 before to 6.52 during — and `bench/PROTOCOL.md` §5 does not call a single unpinned run a
-measurement. The load times above are reported as evidence that a load happened, not as
-results.
+measurement.
+
+#### 🔴 The load time is withdrawn, and it disagreed with itself in public first
+
+This section originally reported that this model loaded in **12s**. The repository's own
+README reported the same command, the same model, the same flags and the same card at
+**37s**. Both were published, three days before a release, and neither knew about the other.
+
+**They are the same measurement, so this is not a units problem and not a definitions
+problem.** `serve` starts the clock immediately before it forks the child and stops it on
+the first `GET /health` that answers `200` — `await_ready` in
+`crates/moearc-cli/src/serve.rs` — so there is no room for one figure to be
+time-to-first-token and the other weights-loaded, and both runs resolved the same
+`-ncmoe 36 -c 86016 -t 16`. Two different runs, one number each, 3× apart.
+
+Cold versus warm page cache is the obvious candidate and a good one on this box:
+`bench/PROTOCOL.md` §4 exists *because* this exact 59.03 GiB file against a 16 GiB ZFS ARC
+`c_max` once returned **17.59 ± 5.56** where a repeat returned **28.5 ± 0.2**, on nothing
+but what happened to be resident. But a candidate is all it is. Neither run recorded disk
+read bytes, ARC hits or the page-cache ratio §4 requires; neither was repeated; no artefact
+of either survives outside the sentence that quoted it; and the load average, which §4.2
+*did* record, is blind to storage. Writing "12s warm, 37s cold" would be inventing the
+qualifier that makes the contradiction disappear — the qualifier is a measurement too, and
+nobody took it.
+
+So both figures go, under §9 — **when two attempts disagree, withdraw, do not replace** —
+and neither is restated in this document or in the README. What is *not* withdrawn is the
+claim this section exists to make, because it never depended on the number: **the 59 GiB
+model loaded on the 11.33 GiB card and answered.** The transcript is evidence of that.
+
+⬜ **Taking one properly is cheap and worth doing.** Several independent invocations with
+the cache state stated on both sides and `/proc/diskstats` deltas around each, reported warm
+and cold separately as §6 requires. `serve --json` already emits `load_seconds`, so what is
+missing is the collection, not the instrument.
 
 ### 4.3 🔴 It changes nothing about what the engine produces
 
@@ -446,3 +499,8 @@ Stated plainly, because a gap nobody wrote down is a gap somebody will trip over
   in this module changes that, and `serve` should not be read as closing it.
 - **No throughput number is produced or quoted by `serve`.** It reports a load time,
   which is not a benchmark, and points at `moearc bench` for anything that is.
+- 🔴 **The load time it reports is not a measurement either, and is not published.** It is
+  one unrepeated invocation with no record of what the page cache held, on a file three and
+  a half times the size of this box's ARC. `serve` is right to print it — it is telling the
+  user what just happened on their machine — and a document is wrong to quote it as a
+  property of the model. See §4.2.

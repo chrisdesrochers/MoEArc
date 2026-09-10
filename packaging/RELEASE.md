@@ -82,14 +82,25 @@ character you want in a URL or a filename people type.
 This produces:
 
 ```
-dist/moearc-0.1.0-linux-x86_64.tar.gz         ~4.8 MB
+dist/moearc-0.1.0-linux-x86_64.tar.gz         ~3.8 MB
 dist/moearc-0.1.0-linux-x86_64.tar.gz.sha256
 ```
 
-**It contains no third-party binaries.** Intel's SYCL runtime is fetched from Intel, on the
-user's machine, at install time, pinned by SHA-256 in `runtime.lock.json`. The tarball is
-Apache-2.0. `packaging/THIRD-PARTY.md` is why; read it before you consider `--with-runtime`,
-which produces a 29 MB archive that is **not** Apache-2.0 and must not be published as one.
+⚠️ **That figure was `~4.8 MB` until 2026-09-09 and had been wrong since the pivot.** The
+payload became a single binary when `moearc-server`, `moearc-bench` and `moearc-selftest` left
+it; built from the worktree at commit `da645a6`, with the traces staged, the archive measures
+**3,889,176 bytes**. Read the size `bundle.sh` prints beside the artefact path rather than this
+line — that one is measured and this one is copied, and the exact byte count moves under any
+packaging change, because `launcher.sh` is itself installed into the archive as `moearc`.
+
+**It contains no third-party binaries.** Intel's SYCL runtime is not in it and is no longer
+downloaded at install time either: nothing in the payload loads it, so `install.sh` fetches it
+only when asked, with `MOEARC_FETCH_RUNTIME=1`, pinned by SHA-256 in `runtime.lock.json`. The
+tarball is Apache-2.0. `packaging/THIRD-PARTY.md` is why; read it before you consider
+`--with-runtime`, which vendors the runtime into the archive and produces something that is
+**not** Apache-2.0 and must not be published as one. (⚠️ `--with-runtime`'s "29 MB" was
+measured before the payload shrank and nobody has re-measured it; the fetched runtime is
+78.6 MiB on disk, so expect it to dominate whatever the number is now.)
 
 ### Reproducibility — what is and is not claimed
 
@@ -133,6 +144,11 @@ MOEARC_RUNTIME_CACHE=/tmp/moearc-runtime-cache \
 
 It must print **`clean-environment verification PASSED`**. Anything else is not a release. It
 will also print a `NOT PROVEN` line; that is expected, and 4b is what covers it.
+
+⚠️ `MOEARC_RUNTIME_CACHE` is inert here and is left in the command only because it costs
+nothing. `verify-clean.sh` unpacks the tarball directly — it never runs `install.sh` — and the
+one binary in the tarball is the one that needs no SYCL runtime, so there is no fetch for the
+cache to save. It becomes load-bearing again the day something in the payload needs one.
 
 **4b — a real model, on a machine with llama.cpp.** Not a clean room — the point is the
 inference, not the environment — so run it from the unpacked tarball on a box with an Arc card
@@ -182,8 +198,17 @@ From a machine that is **not** the build host, and with nothing set:
 curl -fsSL https://raw.githubusercontent.com/chrisdesrochers/MoEArc/main/packaging/install.sh | sh
 ```
 
-Expect, in order: the download, `sha256 verified against the published checksum`, the runtime
-fetch, `installed to …`, and then the device report. If `install.sh` says
+Expect, in order: the download, `sha256 verified against the published checksum`, the two-line
+note that **no SYCL runtime was fetched**, `installed to …`, and then the device report.
+
+🔴 **That note is not a warning and the release does not wait on it.** Until 2026-09-09 this
+step expected a runtime fetch in that slot, and the installer performed one — 199.5 MiB pulled
+from the index on every install, into a `runtime/` directory that nothing in the payload opens
+(`packaging/install.sh` carries the measurement). What a stranger needs in order to run a model
+is their own llama.cpp `llama-server`, which links its own runtime; step 4b is where that is
+checked. `MOEARC_FETCH_RUNTIME=1` puts the old behaviour back for one install.
+
+If `install.sh` says
 **"MoEArc has no published release yet"** the assets did not attach under the expected names —
 re-check step 6 rather than editing the installer.
 
@@ -228,7 +253,8 @@ MOEARC_TARBALL=dist/moearc-*-linux-x86_64.tar.gz sh packaging/install.sh
 | `MOEARC_VERSION` | a tag, e.g. `v0.1.0`. Default `latest`. |
 | `MOEARC_TARBALL` | install this local file instead of downloading. Skips the checksum step. |
 | `MOEARC_PREFIX` | where the bundle lands. Default `~/.local/share/moearc`. |
-| `MOEARC_BINDIR` | where the four commands are linked. Default `~/.local/bin`. |
+| `MOEARC_BINDIR` | where the command is linked. Default `~/.local/bin`. One name, `moearc`; it was four before the pivot, and linking a name with nothing behind it leaves a dangling symlink on `PATH`. |
+| `MOEARC_FETCH_RUNTIME` | `1` fetches Intel's SYCL runtime into `$MOEARC_PREFIX/runtime` (199.5 MiB down, 78.6 MiB kept). **Off by default** — nothing in the payload loads it. Set it if your own llama.cpp SYCL build has no oneAPI beside it, or to stage the runtime for a machine that will be offline. |
 
 `MOEARC_PREFIX` is `rm -rf`'d before the new tree is moved in; the installer refuses `/`, `$HOME`
 and the empty string, and nothing else. Point it at a directory MoEArc owns.

@@ -29,8 +29,12 @@ and `docs/packaging.md` measured that those are different questions: a driver st
 detection and still fail inference. The script prints `NOT PROVEN` for exactly that, and the
 gate returns when llama.cpp is bundled.
 
-`MOEARC_CLEAN_BASE` picks the distro to test against; `MOEARC_RUNTIME_CACHE` points at a
-directory to reuse between runs so the 230 MB fetch happens once.
+`MOEARC_CLEAN_BASE` picks the distro to test against. `MOEARC_RUNTIME_CACHE` points at a
+directory to reuse between runs, and ⬜ **today it saves nothing**: it was there so Intel's
+runtime was fetched once rather than per run, and neither half of that still happens here —
+`verify-clean.sh` unpacks the tarball itself instead of running `install.sh`, and the one
+binary in the tarball is the one that needs no runtime. Harmless to pass, and it comes back
+into use when the payload contains something that loads a SYCL runtime.
 
 ## Files
 
@@ -41,7 +45,7 @@ directory to reuse between runs so the 230 MB fetch happens once.
 | `launcher.sh` | sets `LD_LIBRARY_PATH` and execs the real binary in `libexec/`. This is what closes the dlopen gap. Installed under one name now, having been installed under four. |
 | `fetch-runtime.py` | downloads Intel's published SYCL runtime, verified against pinned digests. Standard library only; no `pip`. |
 | `runtime.lock.json` | the pins. Versions, SHA-256, per-package file allowlist, licences. |
-| `install.sh` | the `curl \| sh` entry point: download, unpack, fetch the runtime, link onto `PATH`. Publishes nothing itself — it expects the assets `RELEASE.md` names, and says exactly that when they are not there. |
+| `install.sh` | the `curl \| sh` entry point: download, unpack, link onto `PATH`. It does **not** fetch the runtime any more — nothing in the payload loads one — and `MOEARC_FETCH_RUNTIME=1` asks for it. Publishes nothing itself: it expects the assets `RELEASE.md` names, and says exactly that when they are not there. |
 | `RELEASE.md` | the owner's checklist for cutting a release. One asset name for every tag, and why. |
 | `Containerfile.clean` | Ubuntu 24.04 + the Intel GPU driver + nothing else. `DRIVER=distro` reproduces the too-old-driver case deliberately. |
 | `verify-clean.sh` | runs a tarball in that container and asserts, by name, that the Arc card is found. |
@@ -55,7 +59,8 @@ moearc-<version>-linux-x86_64/
   libexec/
     moearc              <- the real ELF binary
     fetch-runtime.py
-  runtime/            <- Intel's SYCL runtime: fetched at install, or vendored with --with-runtime
+  runtime/            <- Intel's SYCL runtime. Absent unless asked for: MOEARC_FETCH_RUNTIME=1
+                         at install, the launcher's lazy fetch, or bundle.sh --with-runtime
   share/moearc/       <- runtime.lock.json, BUILD-INFO.txt
   share/doc/moearc/   <- LICENSE, NOTICE, THIRD-PARTY.md
   bench/              <- reproduce.sh and the reference token ids
@@ -72,10 +77,20 @@ to work before anything has been downloaded, and it has to be able to explain a 
 the GPU stack is broken. So `moearc` runs immediately after unpacking.
 
 ⬜ **Which leaves `runtime/` with no consumer inside the bundle today.** It was fetched for
-`libmoearc_kernels.so`, which is retired. `install.sh` still fetches it, and a user's own
-llama.cpp SYCL build can resolve against it through the launcher, but that is a side effect
-rather than a design. This resolves either way once llama.cpp is bundled — decide it then,
-not by deleting the machinery now.
+`libmoearc_kernels.so`, which is retired. A user's own llama.cpp SYCL build can resolve against
+it through the launcher, but that is a side effect rather than a design. This resolves either
+way once llama.cpp is bundled — decide it then, not by deleting the machinery now.
+
+🔴 **So `install.sh` stopped fetching it by default on 2026-09-09, and that is the only part
+of the machinery that changed.** It had been downloading 199.5 MiB from the index on every
+install — keeping 78.6 MiB of it — for a directory nothing in the payload opens, on the
+reasoning that this beat "downloading 230 MB the first time someone is trying to run a model".
+There is no such moment: `moearc serve` supervises the user's own `llama-server`, which links
+the user's own runtime. `fetch-runtime.py`, the pins, `--with-runtime`, `MOEARC_RUNTIME_DIR`
+and the launcher's lazy fetch are all untouched; `MOEARC_FETCH_RUNTIME=1` asks the installer
+for it, and the lazy path fires by itself the day a `needs_runtime=1` name is back in the
+bundle. (230 MB was never the figure, and `runtime.lock.json`'s own "73 MB" is not it either;
+the two numbers in this paragraph are measured from the pinned digests.)
 
 **Passing a container all of `/dev/dri` makes Intel's driver abort at teardown.** The workload
 succeeds, prints its result, and *then* dies with

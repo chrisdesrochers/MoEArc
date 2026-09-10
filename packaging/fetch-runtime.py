@@ -8,8 +8,15 @@ libraries required to deploy executables on systems without the Intel oneAPI dev
 toolkits installed" -- verifies each against a pinned SHA-256, and extracts a named set of
 files into one directory.
 
-The user never types this. `packaging/install.sh` runs it once, and the launcher runs it if a
-tarball is unpacked without it.
+The user never types this. `packaging/install.sh` runs it when `MOEARC_FETCH_RUNTIME=1` asks
+for it, and `packaging/launcher.sh` runs it if a bundle needs the runtime and does not have it.
+
+⚠️ It ran on **every** install until 2026-09-09, and that is the line this paragraph used to
+carry. It stopped because nothing in the payload loads what it downloads: the tarball is one
+binary, `moearc`, and the launcher's own dispatch says `moearc) needs_runtime=0`. So this
+script is now correct and idle -- 209 MB of somebody's bandwidth that no longer moves by
+default. `packaging/install.sh` carries the measurement; `packaging/README.md` records why the
+machinery is kept rather than deleted.
 
 # What it is not
 
